@@ -1,11 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# Load environment variables if .env exists
+# Load only S3_BUCKET from .env to avoid leaking other credentials to subprocesses
 if [[ -f "../.env" ]]; then
-    set -a
-    . "../.env"
-    set +a
+    _s3_val="$(grep -E '^S3_BUCKET=' "../.env" | head -1 | cut -d= -f2-)"
+    [[ -n "${_s3_val}" ]] && S3_BUCKET="${_s3_val}"
+    unset _s3_val
 fi
 
 INPUT_DIR="../decrypt"
@@ -50,10 +50,6 @@ TRASH_DIR="../.trash/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$TRASH_DIR"
 log "Moving processed encrypted files to $TRASH_DIR..."
 find "$INPUT_DIR" -type f -exec mv {} "$TRASH_DIR/" \; 2>/dev/null || true
-
-# Sync code directory
-log "Syncing code directory to S3..."
-aws s3 sync ../code "s3://${S3_BUCKET}/code"
 
 log "Decryption workflow completed successfully"
 log "Decrypted files are in: $OUTPUT_DIR"
