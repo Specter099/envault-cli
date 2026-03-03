@@ -12,14 +12,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import re
+
 import click
+from botocore.exceptions import BotoCoreError, ClientError
 from rich.console import Console
 from rich.progress import track
 from rich.table import Table
 
 from envault.config import Config
 from envault.crypto import decrypt_file, encrypt_file
-from envault.exceptions import AlreadyEncryptedError, ConfigurationError
+from envault.exceptions import AlreadyEncryptedError, ConfigurationError, EnvaultError, MigrationError
 from envault.s3 import S3Store
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
@@ -413,7 +416,7 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
                     record, operation="ENCRYPT", correlation_id="migrated-from-output-json"
                 )
             imported += 1
-        except Exception as exc:
+        except (json.JSONDecodeError, KeyError, ValueError, MigrationError) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
 
@@ -569,7 +572,7 @@ def rotate_key(
             store.put_current_state(record)
             store.put_event(record, operation="ROTATE_KEY", correlation_id=correlation_id)
             rotated += 1
-        except Exception as exc:
+        except (EnvaultError, ClientError, BotoCoreError) as exc:
             console.print(f"[red]Error rotating {record.file_name}: {exc}[/red]")
             errors += 1
         finally:
@@ -585,6 +588,10 @@ def rotate_key(
 # ---------------------------------------------------------------------------
 
 
+_TAG_KEY_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+_TAG_VALUE_MAX_LEN = 256
+
+
 def _collect_files(path: Path) -> list[Path]:
     if path.is_file():
         return [path]
@@ -598,7 +605,18 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
             console.print(f"[yellow]Ignoring invalid tag '{t}' (expected KEY=VALUE)[/yellow]")
             continue
         k, _, v = t.partition("=")
-        tags[k.strip()] = v.strip()
+        k = k.strip()
+        v = v.strip()
+        if not _TAG_KEY_RE.match(k):
+            raise click.UsageError(
+                f"Invalid tag key {k!r}: must be 1–64 characters, "
+                "alphanumeric, underscore, or hyphen only."
+            )
+        if len(v) > _TAG_VALUE_MAX_LEN:
+            raise click.UsageError(
+                f"Tag value for {k!r} exceeds {_TAG_VALUE_MAX_LEN} characters."
+            )
+        tags[k] = v
     return tags
 
 

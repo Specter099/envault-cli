@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from envault.cli import _parse_output_json_entry, _secure_delete
+import click
+import pytest
+
+from envault.cli import _parse_output_json_entry, _parse_tags, _secure_delete
 
 
 def _make_entry(input_path: str) -> dict:
@@ -69,3 +72,33 @@ def test_secure_delete_zero_length_file(tmp_path: Path):
     p.write_bytes(b"")
     _secure_delete(p)
     assert not p.exists()
+
+
+def test_parse_tags_valid():
+    result = _parse_tags(("project=finance", "env=prod"))
+    assert result == {"project": "finance", "env": "prod"}
+
+
+def test_parse_tags_invalid_key_raises():
+    """Tag keys with special characters must raise UsageError."""
+    with pytest.raises(click.UsageError, match="Invalid tag key"):
+        _parse_tags(("bad key!=value",))
+
+
+def test_parse_tags_key_too_long_raises():
+    """Tag key longer than 64 chars must raise UsageError."""
+    long_key = "k" * 65
+    with pytest.raises(click.UsageError, match="Invalid tag key"):
+        _parse_tags((f"{long_key}=value",))
+
+
+def test_parse_tags_value_too_long_raises():
+    """Tag value longer than 256 chars must raise UsageError."""
+    long_val = "v" * 257
+    with pytest.raises(click.UsageError, match="exceeds"):
+        _parse_tags((f"key={long_val}",))
+
+
+def test_parse_tags_empty_key_raises():
+    with pytest.raises(click.UsageError, match="Invalid tag key"):
+        _parse_tags(("=value",))
