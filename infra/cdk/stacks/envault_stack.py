@@ -105,16 +105,6 @@ class EnvaultStack(Stack):
             projection_type=dynamodb.ProjectionType.ALL,
         )
 
-        # GSI: query by tag key (tag_key, tag_value stored as separate attributes)
-        # Note: DynamoDB doesn't support map-key GSIs; tags are denormalized as
-        # tag_key/tag_value on the record for this GSI.
-        table.add_global_secondary_index(
-            index_name="tag-index",
-            partition_key=dynamodb.Attribute(name="tag_key", type=dynamodb.AttributeType.STRING),
-            sort_key=dynamodb.Attribute(name="tag_value", type=dynamodb.AttributeType.STRING),
-            projection_type=dynamodb.ProjectionType.KEYS_ONLY,
-        )
-
         # ------------------------------------------------------------------ #
         # IAM Managed Policy (least-privilege)                                 #
         # ------------------------------------------------------------------ #
