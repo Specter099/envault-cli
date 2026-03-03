@@ -3,8 +3,8 @@
 Client-side envelope encryption for files using AWS KMS, with DynamoDB state tracking and a full audit trail.
 
 [![CI](https://github.com/Specter099/envault-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Specter099/envault-cli/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/envault)](https://pypi.org/project/envault/)
-[![Python](https://img.shields.io/pypi/pyversions/envault)](https://pypi.org/project/envault/)
+[![PyPI](https://img.shields.io/pypi/v/envault-cli)](https://pypi.org/project/envault-cli/)
+[![Python](https://img.shields.io/pypi/pyversions/envault-cli)](https://pypi.org/project/envault-cli/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 ---
@@ -21,7 +21,7 @@ Client-side envelope encryption for files using AWS KMS, with DynamoDB state tra
 ## Installation
 
 ```bash
-pip install envault
+pip install envault-cli
 ```
 
 Requires Python 3.10+.
