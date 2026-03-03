@@ -55,5 +55,8 @@ htmlcov/
 # Security reports
 docs/security/SECURITY-REPORT-*.md
 
+# CDK
+cdk.out/
+
 # detect-secrets baseline
 .secrets.baseline
