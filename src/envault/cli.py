@@ -209,6 +209,13 @@ def decrypt(
 
     SHA256_HASH is the hash of the original plaintext file (shown by envault status).
     """
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256_hash):
+        console.print(
+            f"[red]Invalid SHA256 hash: {sha256_hash!r}. "
+            "Expected 64 lowercase hexadecimal characters.[/red]"
+        )
+        sys.exit(1)
+
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())

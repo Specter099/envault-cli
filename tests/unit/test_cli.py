@@ -6,7 +6,9 @@ from pathlib import Path
 import click
 import pytest
 
-from envault.cli import _parse_output_json_entry, _parse_tags, _secure_delete
+from click.testing import CliRunner
+
+from envault.cli import _parse_output_json_entry, _parse_tags, _secure_delete, main
 
 
 def _make_entry(input_path: str) -> dict:
@@ -102,3 +104,24 @@ def test_parse_tags_value_too_long_raises():
 def test_parse_tags_empty_key_raises():
     with pytest.raises(click.UsageError, match="Invalid tag key"):
         _parse_tags(("=value",))
+
+
+def test_decrypt_rejects_invalid_sha256_format():
+    """decrypt must reject hash arguments that are not 64-char hex strings."""
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "decrypt",
+            "not-a-valid-hash",
+            "--table", "t",
+            "--bucket", "b",
+        ],
+        env={
+            "AWS_ACCESS_KEY_ID": "testing",
+            "AWS_SECRET_ACCESS_KEY": "testing",
+            "AWS_DEFAULT_REGION": "us-east-1",
+        },
+    )
+    assert result.exit_code != 0
+    assert "invalid" in result.output.lower() or "sha256" in result.output.lower()
