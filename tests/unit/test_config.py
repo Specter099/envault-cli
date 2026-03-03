@@ -69,3 +69,33 @@ def test_config_missing_table_raises(monkeypatch):
 
     with pytest.raises(ConfigurationError, match="ENVAULT_TABLE"):
         Config.from_env()
+
+
+def test_config_non_integer_ttl_raises_config_error(monkeypatch):
+    monkeypatch.setenv("ENVAULT_KEY_ID", "alias/k")
+    monkeypatch.setenv("ENVAULT_BUCKET", "b")
+    monkeypatch.setenv("ENVAULT_TABLE", "t")
+    monkeypatch.setenv("ENVAULT_AUDIT_TTL_DAYS", "30d")
+
+    with pytest.raises(ConfigurationError, match="ENVAULT_AUDIT_TTL_DAYS"):
+        Config.from_env()
+
+
+def test_config_zero_ttl_raises_config_error(monkeypatch):
+    monkeypatch.setenv("ENVAULT_KEY_ID", "alias/k")
+    monkeypatch.setenv("ENVAULT_BUCKET", "b")
+    monkeypatch.setenv("ENVAULT_TABLE", "t")
+    monkeypatch.setenv("ENVAULT_AUDIT_TTL_DAYS", "0")
+
+    with pytest.raises(ConfigurationError, match="ENVAULT_AUDIT_TTL_DAYS"):
+        Config.from_env()
+
+
+def test_config_negative_ttl_raises_config_error(monkeypatch):
+    monkeypatch.setenv("ENVAULT_KEY_ID", "alias/k")
+    monkeypatch.setenv("ENVAULT_BUCKET", "b")
+    monkeypatch.setenv("ENVAULT_TABLE", "t")
+    monkeypatch.setenv("ENVAULT_AUDIT_TTL_DAYS", "-1")
+
+    with pytest.raises(ConfigurationError, match="ENVAULT_AUDIT_TTL_DAYS"):
+        Config.from_env()

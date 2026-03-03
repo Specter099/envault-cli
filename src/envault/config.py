@@ -51,7 +51,15 @@ class Config:
             )
 
         region = os.environ.get("ENVAULT_REGION", "us-east-1")
-        audit_ttl_days = int(os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365"))
+        _ttl_raw = os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365")
+        try:
+            audit_ttl_days = int(_ttl_raw)
+            if audit_ttl_days <= 0:
+                raise ValueError("must be positive")
+        except ValueError:
+            raise ConfigurationError(
+                f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {_ttl_raw!r}"
+            )
 
         return cls(
             key_id=key_id,
