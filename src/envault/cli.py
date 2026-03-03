@@ -132,7 +132,7 @@ def _encrypt_one(
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
     os.close(_fd)
     tmp_encrypted = Path(_tmp)
-    s3_key = s3.s3_key_for_file(file_path.name)
+    s3_key = s3.s3_key_for_file(sha256_hash=sha256, file_name=file_path.name)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     try:
@@ -443,7 +443,7 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
         sha256_hash=sha256_hash,
         file_name=file_name,
         current_state=ENCRYPTED,
-        s3_key=f"encrypted/{file_name}.encrypted",
+        s3_key=f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{file_name}.encrypted",
         s3_version_id="",
         kms_key_id=kms_key_id or "alias/s3_key",
         encryption_context=enc_context,

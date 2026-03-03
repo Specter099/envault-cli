@@ -73,3 +73,21 @@ def test_download_specific_version(tmp_path: Path):
     out = tmp_path / "retrieved.enc"
     store.download_file("encrypted/aa/aaa.../data.enc", out, version_id=v1)
     assert out.read_bytes() == b"first content"
+
+
+def test_s3_key_for_file_is_content_addressed():
+    """S3 key must include sha256 hash to prevent filename collisions."""
+    store = S3Store(bucket="b", region="us-east-1")
+    sha = "a" * 64
+
+    key = store.s3_key_for_file(sha256_hash=sha, file_name="report.xlsx")
+
+    # Key must contain the hash prefix (sharding) and full hash
+    assert sha[:2] in key
+    assert sha in key
+    assert "report.xlsx.encrypted" in key
+
+    # Two files with same name but different hashes get different keys
+    sha2 = "b" * 64
+    key2 = store.s3_key_for_file(sha256_hash=sha2, file_name="report.xlsx")
+    assert key != key2

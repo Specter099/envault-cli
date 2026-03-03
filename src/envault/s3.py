@@ -77,6 +77,11 @@ class S3Store:
         )
         logger.info("Download complete", extra={"local_path": str(local_path)})
 
-    def s3_key_for_file(self, file_name: str) -> str:
-        """Generate a canonical S3 key for an encrypted file."""
-        return f"encrypted/{file_name}.encrypted"
+    def s3_key_for_file(self, sha256_hash: str, file_name: str) -> str:
+        """Generate a content-addressed S3 key for an encrypted file.
+
+        Format: encrypted/{sha256[:2]}/{sha256}/{filename}.encrypted
+        The two-character prefix shards objects across 256 virtual directories,
+        preventing S3 listing bottlenecks at scale and ensuring uniqueness.
+        """
+        return f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{file_name}.encrypted"
