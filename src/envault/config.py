@@ -18,6 +18,7 @@ class Config:
     region: str
     encryption_context: dict[str, str] = field(default_factory=lambda: {"purpose": "backup"})
     audit_ttl_days: int = 365
+    allowed_account_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def from_env(cls) -> Config:
@@ -61,10 +62,14 @@ class Config:
                 f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {_ttl_raw!r}"
             )
 
+        _account_ids_raw = os.environ.get("ENVAULT_ALLOWED_ACCOUNT_IDS", "")
+        allowed_account_ids = [a.strip() for a in _account_ids_raw.split(",") if a.strip()]
+
         return cls(
             key_id=key_id,
             bucket=bucket,
             table_name=table_name,
             region=region,
             audit_ttl_days=audit_ttl_days,
+            allowed_account_ids=allowed_account_ids,
         )

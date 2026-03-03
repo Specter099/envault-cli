@@ -186,6 +186,12 @@ def _encrypt_one(
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
+@click.option(
+    "--allowed-account-ids",
+    envvar="ENVAULT_ALLOWED_ACCOUNT_IDS",
+    default="",
+    help="Comma-separated AWS account IDs to trust for decryption.",
+)
 @click.pass_context
 def decrypt(
     ctx: click.Context,
@@ -194,6 +200,7 @@ def decrypt(
     table: str,
     bucket: str,
     region: str,
+    allowed_account_ids: str,
 ) -> None:
     """Decrypt a file by its SHA256 hash.
 
@@ -202,6 +209,7 @@ def decrypt(
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
+    account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
 
     record = store.get_current_state(sha256_hash)
     if not record:
@@ -226,6 +234,7 @@ def decrypt(
             output_path=output_path,
             expected_sha256=sha256_hash,
             region=region,
+            allowed_account_ids=account_ids or None,
         )
     finally:
         tmp_encrypted.unlink(missing_ok=True)
@@ -485,7 +494,20 @@ def _extract_kms_key_id(header: dict[str, Any]) -> str:
 @click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 @click.option("--dry-run", is_flag=True)
-def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: bool) -> None:
+@click.option(
+    "--allowed-account-ids",
+    envvar="ENVAULT_ALLOWED_ACCOUNT_IDS",
+    default="",
+    help="Comma-separated AWS account IDs to trust for decryption.",
+)
+def rotate_key(
+    new_key_id: str,
+    table: str,
+    bucket: str,
+    region: str,
+    dry_run: bool,
+    allowed_account_ids: str,
+) -> None:
     """Re-encrypt all ENCRYPTED files under a new KMS key.
 
     Downloads each file, decrypts with the original key, re-encrypts with the new key,
@@ -494,6 +516,7 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
+    account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
 
     records = store.list_by_state(ENCRYPTED)
     if not records:
@@ -521,7 +544,14 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
             tmp_enc = Path(_tmp_enc)
 
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
-            decrypt_file(tmp_dl, tmp_pt, expected_sha256=record.sha256_hash, region=region)
+            decrypt_file(
+                tmp_dl,
+                tmp_pt,
+                expected_sha256=record.sha256_hash,
+                region=region,
+                allowed_account_ids=account_ids or None,
+            )
+            tmp_dl.unlink(missing_ok=True)
 
             new_result = encrypt_file(
                 tmp_pt, new_key_id, record.encryption_context, tmp_enc, region

@@ -99,3 +99,23 @@ def test_config_negative_ttl_raises_config_error(monkeypatch):
 
     with pytest.raises(ConfigurationError, match="ENVAULT_AUDIT_TTL_DAYS"):
         Config.from_env()
+
+
+def test_config_allowed_account_ids_parsed(monkeypatch):
+    monkeypatch.setenv("ENVAULT_KEY_ID", "alias/k")
+    monkeypatch.setenv("ENVAULT_BUCKET", "b")
+    monkeypatch.setenv("ENVAULT_TABLE", "t")
+    monkeypatch.setenv("ENVAULT_ALLOWED_ACCOUNT_IDS", "111111111111,222222222222")
+
+    cfg = Config.from_env()
+    assert cfg.allowed_account_ids == ["111111111111", "222222222222"]
+
+
+def test_config_allowed_account_ids_empty_by_default(monkeypatch):
+    monkeypatch.setenv("ENVAULT_KEY_ID", "alias/k")
+    monkeypatch.setenv("ENVAULT_BUCKET", "b")
+    monkeypatch.setenv("ENVAULT_TABLE", "t")
+    monkeypatch.delenv("ENVAULT_ALLOWED_ACCOUNT_IDS", raising=False)
+
+    cfg = Config.from_env()
+    assert cfg.allowed_account_ids == []
