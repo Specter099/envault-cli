@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "envault"
+name = "envault-cli"
 version = "0.1.0"
 description = "Client-side envelope encryption for files using AWS KMS, with DynamoDB state tracking"
 readme = "README.md"
