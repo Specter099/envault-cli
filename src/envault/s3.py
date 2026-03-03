@@ -62,6 +62,12 @@ class S3Store:
         """
         local_path.parent.mkdir(parents=True, exist_ok=True)
         extra_args: dict[str, str] = {}
+        if not version_id:
+            logger.warning(
+                "Downloading S3 object without VersionId — fetching latest version. "
+                "If the object was overwritten since encryption, the wrong ciphertext may be retrieved.",
+                extra={"bucket": self._bucket, "key": s3_key},
+            )
         if version_id:
             extra_args["VersionId"] = version_id
 

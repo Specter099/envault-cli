@@ -75,6 +75,24 @@ def test_download_specific_version(tmp_path: Path):
     assert out.read_bytes() == b"first content"
 
 
+@mock_aws
+def test_download_empty_version_id_logs_warning(tmp_path: Path, caplog):
+    """download_file with empty version_id must emit a WARNING."""
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    s3_client.put_object(Bucket=BUCKET, Key="encrypted/aa/aaa.../file.enc", Body=b"data")
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    out = tmp_path / "file.enc"
+
+    with caplog.at_level(logging.WARNING, logger="envault.s3"):
+        store.download_file("encrypted/aa/aaa.../file.enc", out, version_id="")
+
+    assert any(
+        "version" in r.message.lower() for r in caplog.records
+    ), f"Expected a version warning, got: {[r.message for r in caplog.records]}"
+
+
 def test_s3_key_for_file_is_content_addressed():
     """S3 key must include sha256 hash to prevent filename collisions."""
     store = S3Store(bucket="b", region="us-east-1")
