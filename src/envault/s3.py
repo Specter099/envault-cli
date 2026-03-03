@@ -21,17 +21,20 @@ class S3Store:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def upload_file(self, local_path: Path, s3_key: str) -> str:
-        """Upload a file to S3 and return the version ID.
+        """Upload a file to S3 and return the version ID atomically.
+
+        Uses put_object (single API call) so the VersionId is returned in the
+        same response, eliminating the race window of upload_file + head_object.
 
         Uses put_object to atomically retrieve the version ID from the response,
         avoiding a TOCTOU race between upload_file + head_object.
 
         Args:
             local_path: Local path of the file to upload.
-            s3_key: S3 object key (e.g. 'encrypted/secrets.xlsx.encrypted').
+            s3_key: S3 object key.
 
         Returns:
-            The S3 version ID of the uploaded object (requires bucket versioning).
+            The S3 VersionId of the uploaded object (empty string if bucket not versioned).
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
