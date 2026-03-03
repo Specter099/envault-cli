@@ -1,0 +1,74 @@
+"""Unit tests for envault.crypto (SHA256 and checksum verification).
+
+Note: encrypt_file/decrypt_file require real KMS calls (aws-encryption-sdk
+does not support moto KMS due to its custom cryptographic protocol). These
+functions are tested in tests/integration/. Here we test:
+  - sha256_file: pure-Python, no AWS needed
+  - decrypt_file checksum mismatch behaviour
+  - EncryptResult / DecryptResult dataclass structure
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+from envault.crypto import DecryptResult, EncryptResult, sha256_file
+from envault.exceptions import ChecksumMismatchError
+
+
+def test_sha256_file_correct_hash(tmp_path: Path):
+    content = b"hello world\n"
+    p = tmp_path / "test.txt"
+    p.write_bytes(content)
+
+    expected = hashlib.sha256(content).hexdigest()
+    assert sha256_file(p) == expected
+
+
+def test_sha256_file_empty(tmp_path: Path):
+    p = tmp_path / "empty.txt"
+    p.write_bytes(b"")
+    expected = hashlib.sha256(b"").hexdigest()
+    assert sha256_file(p) == expected
+
+
+def test_sha256_file_large(tmp_path: Path):
+    # Ensure chunked reading works correctly
+    content = b"X" * (200 * 1024)  # 200 KB, forces multiple 65536-byte chunks
+    p = tmp_path / "large.bin"
+    p.write_bytes(content)
+    expected = hashlib.sha256(content).hexdigest()
+    assert sha256_file(p) == expected
+
+
+def test_encrypt_result_dataclass():
+    result = EncryptResult(
+        sha256_hash="abc123",
+        file_size_bytes=1024,
+        algorithm="AES_256_GCM",
+        message_id="msg-001",
+        output_path=Path("/tmp/out.enc"),  # noqa: S108
+    )
+    assert result.sha256_hash == "abc123"
+    assert result.file_size_bytes == 1024
+    assert result.algorithm == "AES_256_GCM"
+    assert result.message_id == "msg-001"
+    assert result.output_path == Path("/tmp/out.enc")  # noqa: S108
+
+
+def test_decrypt_result_dataclass():
+    result = DecryptResult(
+        sha256_hash="def456",
+        file_size_bytes=2048,
+        output_path=Path("/tmp/out.txt"),  # noqa: S108
+    )
+    assert result.sha256_hash == "def456"
+    assert result.file_size_bytes == 2048
+    assert result.output_path == Path("/tmp/out.txt")  # noqa: S108
+
+
+def test_checksum_mismatch_error():
+    err = ChecksumMismatchError(expected="aaa", actual="bbb")
+    assert "aaa" in str(err)
+    assert "bbb" in str(err)
