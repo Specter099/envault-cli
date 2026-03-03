@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from envault.cli import _parse_output_json_entry
+from envault.cli import _parse_output_json_entry, _secure_delete
 
 
 def _make_entry(input_path: str) -> dict:
@@ -45,3 +45,27 @@ def test_parse_entry_skips_missing_file(tmp_path: Path):
 def test_parse_entry_skips_non_encrypt_mode():
     entry = {"mode": "decrypt", "input": "/some/file"}
     assert _parse_output_json_entry(entry) is None
+
+
+def test_secure_delete_overwrites_before_removal(tmp_path: Path):
+    """_secure_delete must zero-out file contents before unlinking."""
+    p = tmp_path / "sensitive.bin"
+    p.write_bytes(b"TOP SECRET DATA")
+    assert p.exists()
+
+    _secure_delete(p)
+
+    assert not p.exists()
+
+
+def test_secure_delete_missing_file_is_noop(tmp_path: Path):
+    """_secure_delete on a non-existent path must not raise."""
+    p = tmp_path / "does_not_exist"
+    _secure_delete(p)  # should not raise
+
+
+def test_secure_delete_zero_length_file(tmp_path: Path):
+    p = tmp_path / "empty"
+    p.write_bytes(b"")
+    _secure_delete(p)
+    assert not p.exists()

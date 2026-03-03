@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import tempfile
 import uuid
@@ -128,8 +129,9 @@ def _encrypt_one(
     if existing and existing.current_state == ENCRYPTED and not force:
         raise AlreadyEncryptedError(sha256_hash=sha256, file_name=file_path.name)
 
-    encrypted_name = file_path.name + ".encrypted"
-    tmp_encrypted = Path(tempfile.gettempdir()) / f"envault_{sha256[:16]}_{encrypted_name}"
+    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
+    os.close(_fd)
+    tmp_encrypted = Path(_tmp)
     s3_key = s3.s3_key_for_file(file_path.name)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -209,7 +211,9 @@ def decrypt(
         console.print(f"[yellow]File is in state {record.current_state}, not ENCRYPTED.[/yellow]")
         sys.exit(1)
 
-    tmp_encrypted = Path(tempfile.gettempdir()) / f"envault_dl_{sha256_hash[:16]}.encrypted"
+    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
+    os.close(_fd)
+    tmp_encrypted = Path(_tmp)
     output_path = (output if output.is_dir() else output.parent) / record.file_name
 
     try:
@@ -505,17 +509,24 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
-        tmpdir = Path(tempfile.gettempdir())
-        tmp_dl = tmpdir / f"envault_rot_dl_{record.sha256_hash[:16]}.encrypted"
-        tmp_pt = tmpdir / f"envault_rot_pt_{record.sha256_hash[:16]}"
-        tmp_enc = tmpdir / f"envault_rot_enc_{record.sha256_hash[:16]}.encrypted"
         try:
+            _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
+            os.close(_fd_dl)
+            tmp_dl = Path(_tmp_dl)
+            _fd_pt, _tmp_pt = tempfile.mkstemp(prefix="envault_pt_")
+            os.close(_fd_pt)
+            tmp_pt = Path(_tmp_pt)
+            _fd_enc, _tmp_enc = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
+            os.close(_fd_enc)
+            tmp_enc = Path(_tmp_enc)
+
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
             decrypt_file(tmp_dl, tmp_pt, expected_sha256=record.sha256_hash, region=region)
 
             new_result = encrypt_file(
                 tmp_pt, new_key_id, record.encryption_context, tmp_enc, region
             )
+            _secure_delete(tmp_pt)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
 
@@ -559,3 +570,22 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
         k, _, v = t.partition("=")
         tags[k.strip()] = v.strip()
     return tags
+
+
+def _secure_delete(path: Path) -> None:
+    """Overwrite a file with zeros then unlink it.
+
+    Prevents plaintext recovery from disk after decryption or key rotation.
+    Does nothing if the file does not exist.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("r+b") as f:
+            f.write(b"\x00" * size)
+            f.flush()
+            os.fsync(f.fileno())
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+    path.unlink(missing_ok=True)
