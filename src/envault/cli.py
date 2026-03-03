@@ -423,10 +423,17 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
     kms_key_id = _extract_kms_key_id(header)
     enc_context = header.get("encryption_context", {})
 
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    import hashlib
+    from envault.crypto import sha256_file
 
-    sha256_hash = hashlib.sha256(input_path.encode()).hexdigest()
+    plaintext_path = Path(input_path)
+    if not plaintext_path.exists():
+        logger.warning(
+            "Plaintext file not found for migration, skipping: %s", input_path
+        )
+        return None
+
+    sha256_hash = sha256_file(plaintext_path)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     return FileRecord(
         sha256_hash=sha256_hash,
