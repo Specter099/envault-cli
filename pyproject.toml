@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "envault"
+version = "0.1.0"
+description = "Client-side envelope encryption for files using AWS KMS, with DynamoDB state tracking"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+keywords = ["aws", "kms", "encryption", "s3", "dynamodb", "envelope-encryption"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "aws-encryption-sdk>=3.1.1",
+    "boto3>=1.26.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "tenacity>=8.2.0",
+    "python-json-logger>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "moto[dynamodb,s3,kms]>=4.2.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+    "boto3-stubs[dynamodb,s3,kms]>=1.26.0",
+]
+
+[project.scripts]
+envault = "envault.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Specter099/envault-cli"
+Repository = "https://github.com/Specter099/envault-cli"
+Issues = "https://github.com/Specter099/envault-cli/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/envault"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+ignore = ["S101"]  # allow assert in tests
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=envault --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["src/envault"]

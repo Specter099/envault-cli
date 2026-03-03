@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "opus",
+  "enabledPlugins": {
+    "commit-commands@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(npm install *)",
+      "Bash(pytest *)",
+      "Bash(python *)",
+      "Bash(cdk *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git branch *)",
+      "Bash(git checkout *)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr list *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr checkout *)",
+      "Bash(gh issue *)",
+      "Bash(gh repo *)",
+      "Bash(gh api *)",
+      "Bash(ls *)",
+      "Read",
+      "Grep"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)",
+      "Read(.env*)",
+      "Read(*credentials*)",
+      "Read(*secret*)",
+      "Read(~/.aws/*)",
+      "Read(*id_rsa*)",
+      "Read(*id_ed25519*)",
+      "Grep(.env*)",
+      "Grep(*credentials*)",
+      "Grep(*secret*)",
+      "Grep(~/.aws/*)"
+    ],
+    "ask": [
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+      "Bash(gh pr merge *)"
+    ]
+  }
+}
