@@ -93,8 +93,22 @@ def encrypt(
         console.print(f"[yellow]No files found in {input_path}[/yellow]")
         return
 
+    errors = 0
     for file_path in track(files, description="Encrypting..."):
-        _encrypt_one(file_path, config, tags, store, s3, correlation_id, force)
+        try:
+            _encrypt_one(file_path, config, tags, store, s3, correlation_id, force)
+        except AlreadyEncryptedError:
+            console.print(
+                f"[yellow]⏭[/yellow] {file_path.name} already ENCRYPTED (use --force to re-encrypt)"
+            )
+        except Exception as exc:
+            console.print(f"[red]✗[/red] {file_path.name}: {exc}")
+            logger.exception("Failed to encrypt %s", file_path)
+            errors += 1
+
+    if errors:
+        console.print(f"\n[red]{errors} file(s) failed to encrypt.[/red]")
+        sys.exit(1)
 
 
 def _encrypt_one(
@@ -119,16 +133,18 @@ def _encrypt_one(
     s3_key = s3.s3_key_for_file(file_path.name)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    result = encrypt_file(
-        input_path=file_path,
-        key_id=config.key_id,
-        encryption_context=config.encryption_context,
-        output_path=tmp_encrypted,
-        region=config.region,
-    )
+    try:
+        result = encrypt_file(
+            input_path=file_path,
+            key_id=config.key_id,
+            encryption_context=config.encryption_context,
+            output_path=tmp_encrypted,
+            region=config.region,
+        )
 
-    version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key)
-    tmp_encrypted.unlink(missing_ok=True)
+        version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key)
+    finally:
+        tmp_encrypted.unlink(missing_ok=True)
 
     record = FileRecord(
         sha256_hash=sha256,
@@ -196,17 +212,19 @@ def decrypt(
     tmp_encrypted = Path(tempfile.gettempdir()) / f"envault_dl_{sha256_hash[:16]}.encrypted"
     output_path = (output if output.is_dir() else output.parent) / record.file_name
 
-    s3.download_file(
-        s3_key=record.s3_key, local_path=tmp_encrypted, version_id=record.s3_version_id
-    )
+    try:
+        s3.download_file(
+            s3_key=record.s3_key, local_path=tmp_encrypted, version_id=record.s3_version_id
+        )
 
-    decrypt_file(
-        input_path=tmp_encrypted,
-        output_path=output_path,
-        expected_sha256=sha256_hash,
-        region=region,
-    )
-    tmp_encrypted.unlink(missing_ok=True)
+        decrypt_file(
+            input_path=tmp_encrypted,
+            output_path=output_path,
+            expected_sha256=sha256_hash,
+            region=region,
+        )
+    finally:
+        tmp_encrypted.unlink(missing_ok=True)
 
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     record.current_state = DECRYPTED
@@ -480,23 +498,19 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
+        tmpdir = Path(tempfile.gettempdir())
+        tmp_dl = tmpdir / f"envault_rot_dl_{record.sha256_hash[:16]}.encrypted"
+        tmp_pt = tmpdir / f"envault_rot_pt_{record.sha256_hash[:16]}"
+        tmp_enc = tmpdir / f"envault_rot_enc_{record.sha256_hash[:16]}.encrypted"
         try:
-            tmpdir = Path(tempfile.gettempdir())
-            tmp_dl = tmpdir / f"envault_rot_dl_{record.sha256_hash[:16]}.encrypted"
-            tmp_pt = tmpdir / f"envault_rot_pt_{record.sha256_hash[:16]}"
-            tmp_enc = tmpdir / f"envault_rot_enc_{record.sha256_hash[:16]}.encrypted"
-
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
             decrypt_file(tmp_dl, tmp_pt, expected_sha256=record.sha256_hash, region=region)
-            tmp_dl.unlink(missing_ok=True)
 
             new_result = encrypt_file(
                 tmp_pt, new_key_id, record.encryption_context, tmp_enc, region
             )
-            tmp_pt.unlink(missing_ok=True)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
-            tmp_enc.unlink(missing_ok=True)
 
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
             record.kms_key_id = new_key_id
@@ -510,6 +524,10 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
         except Exception as exc:
             console.print(f"[red]Error rotating {record.file_name}: {exc}[/red]")
             errors += 1
+        finally:
+            tmp_dl.unlink(missing_ok=True)
+            tmp_pt.unlink(missing_ok=True)
+            tmp_enc.unlink(missing_ok=True)
 
     console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
 

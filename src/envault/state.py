@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -109,7 +110,8 @@ class StateStore:
     ) -> None:
         """Append an immutable event record to the audit trail."""
         now = _now_iso()
-        sk = f"{EVENT_PREFIX}{now}#{operation}"
+        unique_suffix = uuid.uuid4().hex[:8]
+        sk = f"{EVENT_PREFIX}{now}#{operation}#{unique_suffix}"
         item = record.to_dynamo_item(sk=sk)
         item["operation"] = operation
         item["correlation_id"] = correlation_id
@@ -134,30 +136,51 @@ class StateStore:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def list_by_state(self, state: str) -> list[FileRecord]:
         """Return all files in a given state (uses state-index GSI)."""
-        response = self._table.query(
-            IndexName="state-index",
-            KeyConditionExpression=Key("current_state").eq(state),
-        )
-        return [_item_to_record(item) for item in response.get("Items", [])]
+        items: list[dict[str, Any]] = []
+        kwargs: dict[str, Any] = {
+            "IndexName": "state-index",
+            "KeyConditionExpression": Key("current_state").eq(state),
+        }
+        while True:
+            response = self._table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                break
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        return [_item_to_record(item) for item in items]
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def list_events_for_file(self, sha256_hash: str) -> list[dict[str, Any]]:
         """Return all event records for a file, sorted by timestamp."""
-        response = self._table.query(
-            KeyConditionExpression=(
+        items: list[dict[str, Any]] = []
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": (
                 Key("PK").eq(f"{FILE_PREFIX}{sha256_hash}") & Key("SK").begins_with(EVENT_PREFIX)
-            )
-        )
-        return response.get("Items", [])
+            ),
+        }
+        while True:
+            response = self._table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                break
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        return items
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def list_events_by_date(self, date_str: str) -> list[dict[str, Any]]:
         """Return all events for a given date YYYY-MM-DD (uses date-index GSI)."""
-        response = self._table.query(
-            IndexName="date-index",
-            KeyConditionExpression=Key("date").eq(date_str),
-        )
-        return response.get("Items", [])
+        items: list[dict[str, Any]] = []
+        kwargs: dict[str, Any] = {
+            "IndexName": "date-index",
+            "KeyConditionExpression": Key("date").eq(date_str),
+        }
+        while True:
+            response = self._table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                break
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        return items
 
     def summary(self) -> dict[str, Any]:
         """Return aggregate counts for the dashboard."""
