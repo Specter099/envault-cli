@@ -57,10 +57,10 @@ class Config:
             audit_ttl_days = int(_ttl_raw)
             if audit_ttl_days <= 0:
                 raise ValueError("must be positive")
-        except ValueError:
+        except ValueError as exc:
             raise ConfigurationError(
                 f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {_ttl_raw!r}"
-            )
+            ) from exc
 
         _account_ids_raw = os.environ.get("ENVAULT_ALLOWED_ACCOUNT_IDS", "")
         allowed_account_ids = [a.strip() for a in _account_ids_raw.split(",") if a.strip()]

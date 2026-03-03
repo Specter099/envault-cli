@@ -65,7 +65,8 @@ class S3Store:
         if not version_id:
             logger.warning(
                 "Downloading S3 object without VersionId — fetching latest version. "
-                "If the object was overwritten since encryption, the wrong ciphertext may be retrieved.",
+                "If the object was overwritten since encryption, "
+                "the wrong ciphertext may be retrieved.",
                 extra={"bucket": self._bucket, "key": s3_key},
             )
         if version_id:

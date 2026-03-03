@@ -5,14 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-import re
 
 import click
 from botocore.exceptions import BotoCoreError, ClientError
@@ -22,7 +21,12 @@ from rich.table import Table
 
 from envault.config import Config
 from envault.crypto import decrypt_file, encrypt_file
-from envault.exceptions import AlreadyEncryptedError, ConfigurationError, EnvaultError, MigrationError
+from envault.exceptions import (
+    AlreadyEncryptedError,
+    ConfigurationError,
+    EnvaultError,
+    MigrationError,
+)
 from envault.s3 import S3Store
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
@@ -34,7 +38,7 @@ def _setup_logging(verbose: bool) -> None:
     import pythonjsonlogger.jsonlogger as jsonlogger
 
     handler = logging.StreamHandler(sys.stderr)
-    fmt = jsonlogger.JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")  # type: ignore[attr-defined]
+    fmt = jsonlogger.JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")
     handler.setFormatter(fmt)
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, handlers=[handler])
