@@ -37,10 +37,10 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging(verbose: bool) -> None:
-    from pythonjsonlogger.jsonlogger import JsonFormatter  # type: ignore[attr-defined]
+    from pythonjsonlogger.json import JsonFormatter
 
     handler = logging.StreamHandler(sys.stderr)
-    fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")  # type: ignore[no-untyped-call,unused-ignore]
     handler.setFormatter(fmt)
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, handlers=[handler])
