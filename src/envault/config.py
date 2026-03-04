@@ -5,7 +5,19 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from botocore.config import Config as BotoConfig
+
 from envault.exceptions import ConfigurationError
+
+# Shared boto3 client config:
+# - Explicit timeouts prevent indefinite hangs under partial network failure
+# - Retries disabled at boto3 level — tenacity handles retries at the application layer
+#   to avoid compounding (boto3 5x * tenacity 3x = 15x amplification)
+boto_config = BotoConfig(
+    connect_timeout=5,
+    read_timeout=30,
+    retries={"max_attempts": 1},
+)
 
 
 @dataclass

@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 import boto3
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+from envault.config import boto_config
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,7 @@ class S3Store:
         self._bucket = bucket
         self._region = region
         self._kms_key_id = kms_key_id
-        self._s3 = boto3.client("s3", region_name=region)
+        self._s3 = boto3.client("s3", region_name=region, config=boto_config)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def upload_file(self, local_path: Path, s3_key: str) -> str:
@@ -40,23 +43,16 @@ class S3Store:
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
+            put_kwargs: dict[str, Any] = {
+                "Bucket": self._bucket,
+                "Key": s3_key,
+                "Body": f,
+                "ChecksumAlgorithm": "SHA256",
+            }
             if self._kms_key_id:
-                response = self._s3.put_object(
-                    Bucket=self._bucket,
-                    Key=s3_key,
-                    Body=f,
-                    ServerSideEncryption="aws:kms",
-                    SSEKMSKeyId=self._kms_key_id,
-                    ChecksumAlgorithm="SHA256",
-                )
-            else:
-                response = self._s3.put_object(
-                    Bucket=self._bucket,
-                    Key=s3_key,
-                    Body=f,
-                    ServerSideEncryption="aws:kms",
-                    ChecksumAlgorithm="SHA256",
-                )
+                put_kwargs["ServerSideEncryption"] = "aws:kms"
+                put_kwargs["SSEKMSKeyId"] = self._kms_key_id
+            response = self._s3.put_object(**put_kwargs)
         version_id: str = response.get("VersionId", "")
         logger.info(
             "Upload complete",

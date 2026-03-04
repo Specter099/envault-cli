@@ -573,3 +573,148 @@ def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path):
 
     leftover = glob.glob(f"{tempfile.gettempdir()}/envault_dl_*")
     assert leftover == []
+
+
+# ---------------------------------------------------------------------------
+# C-1: Partial-failure resilience — recovery logging on state write failure
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_encrypt_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplog):
+    """If DynamoDB write fails after S3 upload, log S3 key for recovery."""
+    import logging
+
+    _create_table()
+    _create_bucket()
+
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"sensitive data")
+    sha = hashlib.sha256(b"sensitive data").hexdigest()
+
+    runner = CliRunner()
+    with (
+        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
+        patch("envault.crypto.sha256_file", return_value=sha),
+        patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
+        caplog.at_level(logging.ERROR, logger="envault.cli"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "encrypt",
+                str(plaintext),
+                "--key-id",
+                KEY_ID,
+                "--bucket",
+                BUCKET_NAME,
+                "--table",
+                TABLE_NAME,
+                "--region",
+                REGION,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code != 0
+    # Recovery info must be in logs
+    assert any("state write failed" in r.message.lower() for r in caplog.records)
+
+
+@mock_aws
+def test_decrypt_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplog):
+    """If DynamoDB write fails after decryption, log output path for recovery."""
+    import logging
+
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    runner = CliRunner()
+    with (
+        patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok),
+        patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
+        caplog.at_level(logging.ERROR, logger="envault.cli"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code != 0
+    assert any("state write failed" in r.message.lower() for r in caplog.records)
+
+
+@mock_aws
+def test_rotate_key_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplog):
+    """If DynamoDB write fails after S3 re-upload during rotation, log recovery info."""
+    import logging
+
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    def _mock_decrypt(
+        input_path, output_path, expected_sha256=None, region="us-east-1", allowed_account_ids=None
+    ):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"plaintext")
+        return DecryptResult(
+            sha256_hash=FAKE_SHA,
+            file_size_bytes=9,
+            output_path=output_path,
+            encryption_context={
+                "purpose": "envault-backup",
+                "sha256": FAKE_SHA,
+                "file_name": "test.txt",
+                "kms_key_alias": KEY_ID,
+            },
+        )
+
+    runner = CliRunner()
+    with (
+        patch("envault.cli.decrypt_file", side_effect=_mock_decrypt),
+        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
+        patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
+        caplog.at_level(logging.ERROR, logger="envault.cli"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/new-key",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0  # rotate-key catches per-file errors
+    assert any("state write failed" in r.message.lower() for r in caplog.records)
