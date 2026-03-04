@@ -44,6 +44,7 @@ class S3Store:
                 Key=s3_key,
                 Body=f,
                 ServerSideEncryption="aws:kms",
+                ChecksumAlgorithm="SHA256",
             )
         version_id: str = response.get("VersionId", "")
         logger.info(

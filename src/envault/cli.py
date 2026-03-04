@@ -221,23 +221,12 @@ def decrypt(
 
     SHA256_HASH is the hash of the original plaintext file (shown by envault status).
     """
-    if not re.fullmatch(r"[0-9a-f]{64}", sha256_hash):
-        console.print(
-            f"[red]Invalid SHA256 hash: {sha256_hash!r}. "
-            "Expected 64 lowercase hexadecimal characters.[/red]"
-        )
-        sys.exit(1)
+    _validate_sha256(sha256_hash)
 
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
-    account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
-    if not account_ids:
-        console.print(
-            "[bold red]Error:[/bold red] ENVAULT_ALLOWED_ACCOUNT_IDS is required for decryption.\n"
-            "Set it to a comma-separated list of AWS account IDs trusted to encrypt data."
-        )
-        sys.exit(1)
+    account_ids = _validate_account_ids(allowed_account_ids)
 
     record = store.get_current_state(sha256_hash)
     if not record:
@@ -303,6 +292,7 @@ def status(state: str, sha256_hash: str | None, table: str, region: str) -> None
     store = StateStore(table_name=table, region=region)
 
     if sha256_hash:
+        _validate_sha256(sha256_hash)
         record = store.get_current_state(sha256_hash)
         if not record:
             console.print(f"[red]No record found for {sha256_hash[:16]}...[/red]")
@@ -357,6 +347,7 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
     store = StateStore(table_name=table, region=region)
 
     if sha256_hash:
+        _validate_sha256(sha256_hash)
         events = store.list_events_for_file(sha256_hash)
     elif since:
         events = store.list_events_by_date(since)
@@ -556,15 +547,7 @@ def rotate_key(
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
-    account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
-    if not account_ids:
-        console.print(
-            "[bold red]Error:[/bold red] ENVAULT_ALLOWED_ACCOUNT_IDS is required"
-            " for key rotation.\n"
-            "Set it to a comma-separated list of AWS account IDs trusted to"
-            " encrypt data."
-        )
-        sys.exit(1)
+    account_ids = _validate_account_ids(allowed_account_ids)
 
     records = store.list_by_state(ENCRYPTED)
     if not records:
@@ -646,8 +629,39 @@ def rotate_key(
 # ---------------------------------------------------------------------------
 
 
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TAG_KEY_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 _TAG_VALUE_MAX_LEN = 256
+
+
+def _validate_sha256(value: str) -> str:
+    """Validate a SHA256 hash string. Exit with error if invalid."""
+    if not _SHA256_RE.fullmatch(value):
+        console.print(
+            f"[red]Invalid SHA256 hash: {value!r}. "
+            "Expected 64 lowercase hexadecimal characters.[/red]"
+        )
+        sys.exit(1)
+    return value
+
+
+_ACCOUNT_ID_RE = re.compile(r"\d{12}")
+
+
+def _validate_account_ids(raw: str) -> list[str]:
+    """Parse and validate comma-separated AWS account IDs. Exit with error if invalid."""
+    account_ids = [a.strip() for a in raw.split(",") if a.strip()]
+    if not account_ids:
+        console.print(
+            "[bold red]Error:[/bold red] ENVAULT_ALLOWED_ACCOUNT_IDS is required.\n"
+            "Set it to a comma-separated list of AWS account IDs trusted to encrypt data."
+        )
+        sys.exit(1)
+    for account_id in account_ids:
+        if not _ACCOUNT_ID_RE.fullmatch(account_id):
+            console.print(f"[red]Invalid AWS account ID: {account_id!r}. Must be 12 digits.[/red]")
+            sys.exit(1)
+    return account_ids
 
 
 def _collect_files(path: Path) -> list[Path]:
@@ -690,8 +704,13 @@ def _best_effort_delete(path: Path) -> None:
     """
     try:
         size = path.stat().st_size
+        chunk = b"\x00" * min(65536, size)
         with path.open("r+b") as f:
-            f.write(b"\x00" * size)
+            remaining = size
+            while remaining > 0:
+                to_write = min(len(chunk), remaining)
+                f.write(chunk[:to_write])
+                remaining -= to_write
             f.flush()
             os.fsync(f.fileno())
     except FileNotFoundError:
