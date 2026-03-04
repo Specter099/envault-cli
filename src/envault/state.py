@@ -218,6 +218,24 @@ class StateStore:
         return [_item_to_record(item) for item in items]
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def list_by_file_name(self, file_name: str, state: str) -> list[FileRecord]:
+        """Return CURRENT records matching a file_name in a given state.
+
+        Results are sorted by encrypted_at descending (newest first).
+        Uses state-index GSI with FilterExpression on file_name and SK.
+        """
+        from boto3.dynamodb.conditions import Attr
+
+        items = self._paginate_query(
+            IndexName="state-index",
+            KeyConditionExpression=Key("current_state").eq(state),
+            FilterExpression=Attr("SK").eq(CURRENT) & Attr("file_name").eq(file_name),
+        )
+        records = [_item_to_record(item) for item in items]
+        records.sort(key=lambda r: r.encrypted_at, reverse=True)
+        return records
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def list_events_for_file(self, sha256_hash: str) -> list[dict[str, Any]]:
         """Return all event records for a file, sorted by timestamp."""
         return self._paginate_query(

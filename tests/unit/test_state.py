@@ -522,3 +522,54 @@ def test_put_event_retry_is_idempotent():
 
     if len(sks_seen) == 2:
         assert sks_seen[0] == sks_seen[1], f"Retry used different SK: {sks_seen}"
+
+
+@mock_aws
+def test_list_by_file_name_returns_matching_records():
+    """list_by_file_name returns only CURRENT records with the given file_name."""
+    store = _create_table()
+    r1 = _make_record(sha256_hash="a" * 64, file_name="secret.env")
+    r2 = _make_record(sha256_hash="b" * 64, file_name="secret.env")
+    r3 = _make_record(sha256_hash="c" * 64, file_name="other.env")
+    store.put_current_state(r1)
+    store.put_current_state(r2)
+    store.put_current_state(r3)
+    store.put_event(r1, operation="ENCRYPT", correlation_id="corr-1")
+
+    results = store.list_by_file_name("secret.env", ENCRYPTED)
+    assert len(results) == 2
+    names = {r.file_name for r in results}
+    assert names == {"secret.env"}
+
+
+@mock_aws
+def test_list_by_file_name_returns_empty_for_no_match():
+    """list_by_file_name returns empty list when no files match."""
+    store = _create_table()
+    r1 = _make_record(sha256_hash="a" * 64, file_name="secret.env")
+    store.put_current_state(r1)
+
+    results = store.list_by_file_name("nonexistent.txt", ENCRYPTED)
+    assert results == []
+
+
+@mock_aws
+def test_list_by_file_name_sorted_by_encrypted_at_descending():
+    """list_by_file_name returns results sorted newest-first by encrypted_at."""
+    store = _create_table()
+    r_old = _make_record(
+        sha256_hash="a" * 64,
+        file_name="data.csv",
+        encrypted_at="2026-01-01T00:00:00+00:00",
+    )
+    r_new = _make_record(
+        sha256_hash="b" * 64,
+        file_name="data.csv",
+        encrypted_at="2026-03-04T12:00:00+00:00",
+    )
+    store.put_current_state(r_old)
+    store.put_current_state(r_new)
+
+    results = store.list_by_file_name("data.csv", ENCRYPTED)
+    assert len(results) == 2
+    assert results[0].encrypted_at >= results[1].encrypted_at
