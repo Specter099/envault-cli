@@ -609,9 +609,7 @@ def rotate_key(
                 "file_name": record.file_name,
                 "kms_key_alias": new_key_id,
             }
-            new_result = encrypt_file(
-                tmp_pt, new_key_id, new_ctx, tmp_enc, region
-            )
+            new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
             _best_effort_delete(tmp_pt)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
@@ -624,9 +622,7 @@ def rotate_key(
             record.message_id = new_result.message_id
             record.s3_version_id = new_version_id
             record.last_updated = now
-            store.put_current_state(
-                record, expected_last_updated=original_last_updated
-            )
+            store.put_current_state(record, expected_last_updated=original_last_updated)
             store.put_event(record, operation="ROTATE_KEY", correlation_id=correlation_id)
             rotated += 1
         except (EnvaultError, ClientError, BotoCoreError) as exc:
