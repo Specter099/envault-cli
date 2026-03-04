@@ -12,7 +12,14 @@ from botocore.exceptions import ClientError
 from click.testing import CliRunner
 from moto import mock_aws
 
-from envault.cli import _best_effort_delete, _parse_output_json_entry, _parse_tags, cli, main
+from envault.cli import (
+    _best_effort_delete,
+    _friendly_message,
+    _parse_output_json_entry,
+    _parse_tags,
+    cli,
+    main,
+)
 from envault.crypto import DecryptResult, EncryptResult
 from envault.exceptions import ChecksumMismatchError, EnvaultError
 from envault.state import ENCRYPTED, FileRecord, StateStore
@@ -914,7 +921,7 @@ class TestFriendlyErrors:
     """Test that CLI errors are human-readable (no raw Click format or tracebacks)."""
 
     def test_decrypt_no_args_friendly_error(self) -> None:
-        """cli() wrapper shows friendly guidance for missing IDENTIFIER argument."""
+        """cli() wrapper shows descriptive guidance for missing IDENTIFIER."""
         from io import StringIO
 
         from rich.console import Console as RichConsole
@@ -929,9 +936,8 @@ class TestFriendlyErrors:
                 cli()
         assert exc_info.value.code == 2
         text = output.getvalue()
-        assert "Missing argument" in text
+        assert "decrypt command requires a SHA256 hash or filename" in text
         assert "envault decrypt --help" in text
-        # Should NOT have "Error:" prefix or Click's raw "Usage:" line
         assert not text.strip().startswith("Error:")
         assert not text.strip().startswith("Usage:")
 
@@ -946,7 +952,7 @@ class TestFriendlyErrors:
         assert "Run 'envault --help' for usage info." not in result.output
 
     def test_encrypt_no_args_friendly_error(self) -> None:
-        """cli() wrapper shows friendly guidance for missing INPUT_PATH argument."""
+        """cli() wrapper shows descriptive guidance for missing INPUT_PATH."""
         from io import StringIO
 
         from rich.console import Console as RichConsole
@@ -961,9 +967,32 @@ class TestFriendlyErrors:
                 cli()
         assert exc_info.value.code == 2
         text = output.getvalue()
-        assert "Missing argument" in text
+        assert "encrypt command requires a file or directory to encrypt" in text
         assert "envault encrypt --help" in text
         assert not text.strip().startswith("Error:")
+
+    @pytest.mark.parametrize(
+        ("arg_name", "cmd_name", "expected_fragment"),
+        [
+            ("IDENTIFIER", "decrypt", "decrypt command requires a SHA256 hash or filename"),
+            ("INPUT_PATH", "encrypt", "encrypt command requires a file or directory"),
+            ("FROM_PATH", "migrate", "migrate command requires the path to output.json"),
+        ],
+    )
+    def test_friendly_message_rewrites_missing_arg(
+        self, arg_name: str, cmd_name: str, expected_fragment: str
+    ) -> None:
+        """_friendly_message maps each argument to a descriptive sentence."""
+        ctx = click.Context(click.Command(cmd_name), info_name=cmd_name)
+        err = click.UsageError(f"Missing argument '{arg_name}'.", ctx=ctx)
+        result = _friendly_message(err)
+        assert expected_fragment in result
+
+    def test_friendly_message_passes_through_unknown_errors(self) -> None:
+        """Non-missing-argument errors are returned unchanged."""
+        ctx = click.Context(click.Command("decrypt"))
+        err = click.UsageError("No such option: --foo", ctx=ctx)
+        assert _friendly_message(err) == "No such option: --foo"
 
     @mock_aws
     def test_status_aws_error_shows_friendly_message(self) -> None:
