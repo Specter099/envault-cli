@@ -57,7 +57,7 @@ def _load_config() -> Config:
         sys.exit(1)
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose JSON logging to stderr.")
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
@@ -65,6 +65,8 @@ def main(ctx: click.Context, verbose: bool) -> None:
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
 
 
 def cli() -> None:
@@ -72,8 +74,10 @@ def cli() -> None:
     try:
         main(standalone_mode=False)
     except click.UsageError as e:
-        hint = f"\n  Run '{e.ctx.command_path} --help' for usage info." if e.ctx else ""
-        console.print(f"[bold red]Error:[/bold red] {e.format_message()}{hint}")
+        hint = ""
+        if e.ctx:
+            hint = f"\n  Run '{e.ctx.command_path} --help' for usage info."
+        console.print(f"{e.format_message()}{hint}")
         sys.exit(2)
     except click.Abort:
         console.print("[yellow]Aborted.[/yellow]")
