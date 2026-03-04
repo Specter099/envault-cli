@@ -85,7 +85,6 @@ class StateStore:
     GSIs:
       state-index: PK=current_state, SK=encrypted_at
       date-index:  PK=date, SK=last_updated
-      tag-index:   PK=tag_key, SK=tag_value
     """
 
     def __init__(self, table_name: str, region: str = "us-east-1") -> None:
