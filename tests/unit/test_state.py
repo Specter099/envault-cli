@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 import boto3
 from moto import mock_aws
@@ -192,3 +193,76 @@ def test_events_have_ttl():
     ttl = int(events[0].get("ttl", 0))
     assert ttl > int(time.time())
     assert ttl < int(time.time()) + 31 * 86400
+
+
+@mock_aws
+def test_list_by_state_follows_pagination():
+    """list_by_state must follow LastEvaluatedKey until exhausted."""
+    store = _create_table()
+
+    call_count = 0
+
+    r1_item = {
+        "PK": "FILE#" + "a" * 64,
+        "SK": "CURRENT",
+        "sha256_hash": "a" * 64,
+        "file_name": "file1.txt",
+        "current_state": "ENCRYPTED",
+        "s3_key": "encrypted/aa/file1.txt.encrypted",
+        "kms_key_id": "alias/envault",
+        "encryption_context": {"purpose": "backup"},
+        "algorithm": "AES_256_GCM",
+        "message_id": "msg1",
+        "file_size_bytes": 100,
+        "tags": {},
+        "s3_version_id": "v1",
+        "encrypted_at": "2026-03-03T10:00:00+00:00",
+        "decrypted_at": "",
+        "last_updated": "2026-03-03T10:00:00+00:00",
+        "ttl": 0,
+    }
+    r2_item = {
+        **r1_item,
+        "PK": "FILE#" + "b" * 64,
+        "sha256_hash": "b" * 64,
+        "file_name": "file2.txt",
+    }
+
+    def paged_query(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {
+                "Items": [r1_item],
+                "LastEvaluatedKey": {"PK": "FILE#" + "a" * 64, "SK": "CURRENT"},
+                "Count": 1,
+                "ResponseMetadata": {},
+            }
+        return {"Items": [r2_item], "Count": 1, "ResponseMetadata": {}}
+
+    with patch.object(store._table, "query", side_effect=paged_query):
+        records = store.list_by_state("ENCRYPTED")
+
+    assert call_count == 2
+    assert len(records) == 2
+
+
+@mock_aws
+def test_list_events_by_date_excludes_current_records():
+    """list_events_by_date must return only EVENT records, not CURRENT-state records."""
+    store = _create_table()
+    record = _make_record()
+    # Write a CURRENT record (which also gets 'date' attribute and appears in date-index)
+    store.put_current_state(record)
+    # Write an event record
+    store.put_event(record, operation="ENCRYPT", correlation_id="corr-1")
+
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    events = store.list_events_by_date(today)
+
+    # Must not contain the CURRENT state record
+    sks = [e.get("SK", "") for e in events]
+    assert all(sk.startswith("EVENT#") for sk in sks), f"Found non-EVENT records: {sks}"
+    assert len(events) >= 1

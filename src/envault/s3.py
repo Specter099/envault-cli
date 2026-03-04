@@ -21,17 +21,20 @@ class S3Store:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def upload_file(self, local_path: Path, s3_key: str) -> str:
-        """Upload a file to S3 and return the version ID.
+        """Upload a file to S3 and return the version ID atomically.
+
+        Uses put_object (single API call) so the VersionId is returned in the
+        same response, eliminating the race window of upload_file + head_object.
 
         Uses put_object to atomically retrieve the version ID from the response,
         avoiding a TOCTOU race between upload_file + head_object.
 
         Args:
             local_path: Local path of the file to upload.
-            s3_key: S3 object key (e.g. 'encrypted/secrets.xlsx.encrypted').
+            s3_key: S3 object key.
 
         Returns:
-            The S3 version ID of the uploaded object (requires bucket versioning).
+            The S3 VersionId of the uploaded object (empty string if bucket not versioned).
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
@@ -59,6 +62,13 @@ class S3Store:
         """
         local_path.parent.mkdir(parents=True, exist_ok=True)
         extra_args: dict[str, str] = {}
+        if not version_id:
+            logger.warning(
+                "Downloading S3 object without VersionId — fetching latest version. "
+                "If the object was overwritten since encryption, "
+                "the wrong ciphertext may be retrieved.",
+                extra={"bucket": self._bucket, "key": s3_key},
+            )
         if version_id:
             extra_args["VersionId"] = version_id
 
@@ -74,6 +84,11 @@ class S3Store:
         )
         logger.info("Download complete", extra={"local_path": str(local_path)})
 
-    def s3_key_for_file(self, file_name: str) -> str:
-        """Generate a canonical S3 key for an encrypted file."""
-        return f"encrypted/{file_name}.encrypted"
+    def s3_key_for_file(self, sha256_hash: str, file_name: str) -> str:
+        """Generate a content-addressed S3 key for an encrypted file.
+
+        Format: encrypted/{sha256[:2]}/{sha256}/{filename}.encrypted
+        The two-character prefix shards objects across 256 virtual directories,
+        preventing S3 listing bottlenecks at scale and ensuring uniqueness.
+        """
+        return f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{file_name}.encrypted"

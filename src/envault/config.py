@@ -18,6 +18,7 @@ class Config:
     region: str
     encryption_context: dict[str, str] = field(default_factory=lambda: {"purpose": "backup"})
     audit_ttl_days: int = 365
+    allowed_account_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def from_env(cls) -> Config:
@@ -51,7 +52,18 @@ class Config:
             )
 
         region = os.environ.get("ENVAULT_REGION", "us-east-1")
-        audit_ttl_days = int(os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365"))
+        _ttl_raw = os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365")
+        try:
+            audit_ttl_days = int(_ttl_raw)
+            if audit_ttl_days <= 0:
+                raise ValueError("must be positive")
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {_ttl_raw!r}"
+            ) from exc
+
+        _account_ids_raw = os.environ.get("ENVAULT_ALLOWED_ACCOUNT_IDS", "")
+        allowed_account_ids = [a.strip() for a in _account_ids_raw.split(",") if a.strip()]
 
         return cls(
             key_id=key_id,
@@ -59,4 +71,5 @@ class Config:
             table_name=table_name,
             region=region,
             audit_ttl_days=audit_ttl_days,
+            allowed_account_ids=allowed_account_ids,
         )

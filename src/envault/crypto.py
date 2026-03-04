@@ -123,6 +123,7 @@ def decrypt_file(
     output_path: Path,
     expected_sha256: str | None = None,
     region: str = "us-east-1",
+    allowed_account_ids: list[str] | None = None,
 ) -> DecryptResult:
     """Decrypt a file using AWS KMS.
 
@@ -145,7 +146,17 @@ def decrypt_file(
     client = aws_encryption_sdk.EncryptionSDKClient(
         commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT
     )
-    key_provider = DiscoveryAwsKmsMasterKeyProvider()
+    if allowed_account_ids:
+        from aws_encryption_sdk.key_providers.kms import DiscoveryFilter
+
+        key_provider = DiscoveryAwsKmsMasterKeyProvider(
+            discovery_filter=DiscoveryFilter(
+                account_ids=tuple(allowed_account_ids),
+                partition="aws",
+            )
+        )
+    else:
+        key_provider = DiscoveryAwsKmsMasterKeyProvider()
 
     with input_path.open("rb") as encrypted_file:
         plaintext, _ = client.decrypt(

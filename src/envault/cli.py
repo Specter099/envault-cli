@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import sys
 import tempfile
 import uuid
@@ -12,13 +14,19 @@ from pathlib import Path
 from typing import Any
 
 import click
+from botocore.exceptions import BotoCoreError, ClientError
 from rich.console import Console
 from rich.progress import track
 from rich.table import Table
 
 from envault.config import Config
 from envault.crypto import decrypt_file, encrypt_file
-from envault.exceptions import AlreadyEncryptedError, ConfigurationError
+from envault.exceptions import (
+    AlreadyEncryptedError,
+    ConfigurationError,
+    EnvaultError,
+    MigrationError,
+)
 from envault.s3 import S3Store
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
@@ -27,10 +35,10 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging(verbose: bool) -> None:
-    import pythonjsonlogger.jsonlogger as jsonlogger
+    from pythonjsonlogger.jsonlogger import JsonFormatter  # type: ignore[attr-defined]
 
     handler = logging.StreamHandler(sys.stderr)
-    fmt = jsonlogger.JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")  # type: ignore[attr-defined]
+    fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")
     handler.setFormatter(fmt)
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, handlers=[handler])
@@ -128,9 +136,10 @@ def _encrypt_one(
     if existing and existing.current_state == ENCRYPTED and not force:
         raise AlreadyEncryptedError(sha256_hash=sha256, file_name=file_path.name)
 
-    encrypted_name = file_path.name + ".encrypted"
-    tmp_encrypted = Path(tempfile.gettempdir()) / f"envault_{sha256[:16]}_{encrypted_name}"
-    s3_key = s3.s3_key_for_file(file_path.name)
+    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
+    os.close(_fd)
+    tmp_encrypted = Path(_tmp)
+    s3_key = s3.s3_key_for_file(sha256_hash=sha256, file_name=file_path.name)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     try:
@@ -184,6 +193,12 @@ def _encrypt_one(
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
+@click.option(
+    "--allowed-account-ids",
+    envvar="ENVAULT_ALLOWED_ACCOUNT_IDS",
+    default="",
+    help="Comma-separated AWS account IDs to trust for decryption.",
+)
 @click.pass_context
 def decrypt(
     ctx: click.Context,
@@ -192,14 +207,23 @@ def decrypt(
     table: str,
     bucket: str,
     region: str,
+    allowed_account_ids: str,
 ) -> None:
     """Decrypt a file by its SHA256 hash.
 
     SHA256_HASH is the hash of the original plaintext file (shown by envault status).
     """
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256_hash):
+        console.print(
+            f"[red]Invalid SHA256 hash: {sha256_hash!r}. "
+            "Expected 64 lowercase hexadecimal characters.[/red]"
+        )
+        sys.exit(1)
+
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
+    account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
 
     record = store.get_current_state(sha256_hash)
     if not record:
@@ -209,7 +233,9 @@ def decrypt(
         console.print(f"[yellow]File is in state {record.current_state}, not ENCRYPTED.[/yellow]")
         sys.exit(1)
 
-    tmp_encrypted = Path(tempfile.gettempdir()) / f"envault_dl_{sha256_hash[:16]}.encrypted"
+    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
+    os.close(_fd)
+    tmp_encrypted = Path(_tmp)
     output_path = (output if output.is_dir() else output.parent) / record.file_name
 
     try:
@@ -222,6 +248,7 @@ def decrypt(
             output_path=output_path,
             expected_sha256=sha256_hash,
             region=region,
+            allowed_account_ids=account_ids or None,
         )
     finally:
         tmp_encrypted.unlink(missing_ok=True)
@@ -400,7 +427,7 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
                     record, operation="ENCRYPT", correlation_id="migrated-from-output-json"
                 )
             imported += 1
-        except Exception as exc:
+        except (json.JSONDecodeError, KeyError, ValueError, MigrationError) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
 
@@ -423,16 +450,21 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
     kms_key_id = _extract_kms_key_id(header)
     enc_context = header.get("encryption_context", {})
 
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    import hashlib
+    from envault.crypto import sha256_file
 
-    sha256_hash = hashlib.sha256(input_path.encode()).hexdigest()
+    plaintext_path = Path(input_path)
+    if not plaintext_path.exists():
+        logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
+        return None
+
+    sha256_hash = sha256_file(plaintext_path)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     return FileRecord(
         sha256_hash=sha256_hash,
         file_name=file_name,
         current_state=ENCRYPTED,
-        s3_key=f"encrypted/{file_name}.encrypted",
+        s3_key=f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{file_name}.encrypted",
         s3_version_id="",
         kms_key_id=kms_key_id or "alias/s3_key",
         encryption_context=enc_context,
@@ -474,7 +506,20 @@ def _extract_kms_key_id(header: dict[str, Any]) -> str:
 @click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 @click.option("--dry-run", is_flag=True)
-def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: bool) -> None:
+@click.option(
+    "--allowed-account-ids",
+    envvar="ENVAULT_ALLOWED_ACCOUNT_IDS",
+    default="",
+    help="Comma-separated AWS account IDs to trust for decryption.",
+)
+def rotate_key(
+    new_key_id: str,
+    table: str,
+    bucket: str,
+    region: str,
+    dry_run: bool,
+    allowed_account_ids: str,
+) -> None:
     """Re-encrypt all ENCRYPTED files under a new KMS key.
 
     Downloads each file, decrypts with the original key, re-encrypts with the new key,
@@ -483,6 +528,7 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
+    account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
 
     records = store.list_by_state(ENCRYPTED)
     if not records:
@@ -498,17 +544,31 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
-        tmpdir = Path(tempfile.gettempdir())
-        tmp_dl = tmpdir / f"envault_rot_dl_{record.sha256_hash[:16]}.encrypted"
-        tmp_pt = tmpdir / f"envault_rot_pt_{record.sha256_hash[:16]}"
-        tmp_enc = tmpdir / f"envault_rot_enc_{record.sha256_hash[:16]}.encrypted"
         try:
+            _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
+            os.close(_fd_dl)
+            tmp_dl = Path(_tmp_dl)
+            _fd_pt, _tmp_pt = tempfile.mkstemp(prefix="envault_pt_")
+            os.close(_fd_pt)
+            tmp_pt = Path(_tmp_pt)
+            _fd_enc, _tmp_enc = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
+            os.close(_fd_enc)
+            tmp_enc = Path(_tmp_enc)
+
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
-            decrypt_file(tmp_dl, tmp_pt, expected_sha256=record.sha256_hash, region=region)
+            decrypt_file(
+                tmp_dl,
+                tmp_pt,
+                expected_sha256=record.sha256_hash,
+                region=region,
+                allowed_account_ids=account_ids or None,
+            )
+            tmp_dl.unlink(missing_ok=True)
 
             new_result = encrypt_file(
                 tmp_pt, new_key_id, record.encryption_context, tmp_enc, region
             )
+            _secure_delete(tmp_pt)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
 
@@ -521,7 +581,7 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
             store.put_current_state(record)
             store.put_event(record, operation="ROTATE_KEY", correlation_id=correlation_id)
             rotated += 1
-        except Exception as exc:
+        except (EnvaultError, ClientError, BotoCoreError) as exc:
             console.print(f"[red]Error rotating {record.file_name}: {exc}[/red]")
             errors += 1
         finally:
@@ -537,6 +597,10 @@ def rotate_key(new_key_id: str, table: str, bucket: str, region: str, dry_run: b
 # ---------------------------------------------------------------------------
 
 
+_TAG_KEY_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+_TAG_VALUE_MAX_LEN = 256
+
+
 def _collect_files(path: Path) -> list[Path]:
     if path.is_file():
         return [path]
@@ -550,5 +614,33 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
             console.print(f"[yellow]Ignoring invalid tag '{t}' (expected KEY=VALUE)[/yellow]")
             continue
         k, _, v = t.partition("=")
-        tags[k.strip()] = v.strip()
+        k = k.strip()
+        v = v.strip()
+        if not _TAG_KEY_RE.match(k):
+            raise click.UsageError(
+                f"Invalid tag key {k!r}: must be 1–64 characters, "
+                "alphanumeric, underscore, or hyphen only."
+            )
+        if len(v) > _TAG_VALUE_MAX_LEN:
+            raise click.UsageError(f"Tag value for {k!r} exceeds {_TAG_VALUE_MAX_LEN} characters.")
+        tags[k] = v
     return tags
+
+
+def _secure_delete(path: Path) -> None:
+    """Overwrite a file with zeros then unlink it.
+
+    Prevents plaintext recovery from disk after decryption or key rotation.
+    Does nothing if the file does not exist.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("r+b") as f:
+            f.write(b"\x00" * size)
+            f.flush()
+            os.fsync(f.fileno())
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+    path.unlink(missing_ok=True)
