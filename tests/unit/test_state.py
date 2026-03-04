@@ -361,7 +361,7 @@ def test_summary_uses_count_query():
     assert summary["total"] == 2
     assert summary["encrypted"] == 1
     assert summary["decrypted"] == 1
-    assert summary["last_activity"] == "\u2014"
+    assert summary["last_activity"] != "\u2014"  # Should be a real timestamp
 
 
 @mock_aws
@@ -400,6 +400,94 @@ def test_list_by_state_max_items_zero_returns_all():
 
     records = store.list_by_state(ENCRYPTED)
     assert len(records) == 5
+
+
+@mock_aws
+def test_list_by_state_excludes_event_records():
+    """list_by_state must only return CURRENT records, not EVENT records from the GSI.
+
+    Bug: both CURRENT and EVENT records have 'current_state' set, so both appear
+    in the state-index GSI. list_by_state must filter out EVENT records.
+    """
+    store = _create_table()
+    record = _make_record(
+        sha256_hash="a" * 64,
+        current_state=ENCRYPTED,
+        encrypted_at="2026-03-03T10:00:00+00:00",
+    )
+    store.put_current_state(record)
+    store.put_event(record, operation="ENCRYPT", correlation_id="corr-1")
+
+    # Should return exactly 1 record (the CURRENT), not 2
+    results = store.list_by_state(ENCRYPTED)
+    assert len(results) == 1, f"Expected 1 record, got {len(results)} — EVENT records leaked"
+    assert results[0].sha256_hash == "a" * 64
+
+
+@mock_aws
+def test_count_by_state_excludes_event_records():
+    """_count_by_state must only count CURRENT records, not EVENT records.
+
+    Same root cause as list_by_state — both record types have current_state,
+    so both appear in state-index GSI.
+    """
+    store = _create_table()
+    record = _make_record(
+        sha256_hash="a" * 64,
+        current_state=ENCRYPTED,
+        encrypted_at="2026-03-03T10:00:00+00:00",
+    )
+    store.put_current_state(record)
+    store.put_event(record, operation="ENCRYPT", correlation_id="corr-1")
+    store.put_event(record, operation="ENCRYPT", correlation_id="corr-2")
+
+    # Should count 1 (the CURRENT record), not 3
+    assert store._count_by_state(ENCRYPTED) == 1
+
+
+@mock_aws
+def test_summary_returns_last_activity_timestamp():
+    """summary() must return the actual last_updated timestamp, not a hard-coded dash."""
+    store = _create_table()
+    record = _make_record(
+        sha256_hash="a" * 64,
+        current_state=ENCRYPTED,
+        encrypted_at="2026-03-03T10:00:00+00:00",
+    )
+    store.put_current_state(record)
+
+    summary = store.summary()
+    assert summary["last_activity"] != "\u2014", "last_activity should not be a hard-coded dash"
+    # Should be an ISO timestamp string
+    assert "T" in summary["last_activity"], (
+        f"Expected ISO timestamp, got: {summary['last_activity']}"
+    )
+
+
+@mock_aws
+def test_summary_counts_exclude_events():
+    """summary() total/encrypted/decrypted counts must not double-count EVENT records."""
+    store = _create_table()
+    r1 = _make_record(
+        sha256_hash="a" * 64,
+        current_state=ENCRYPTED,
+        encrypted_at="2026-03-03T10:00:00+00:00",
+    )
+    store.put_current_state(r1)
+    store.put_event(r1, operation="ENCRYPT", correlation_id="corr-1")
+
+    r2 = _make_record(
+        sha256_hash="b" * 64,
+        current_state=DECRYPTED,
+        encrypted_at="2026-03-03T11:00:00+00:00",
+    )
+    store.put_current_state(r2)
+    store.put_event(r2, operation="DECRYPT", correlation_id="corr-2")
+
+    summary = store.summary()
+    assert summary["total"] == 2, f"Expected 2, got {summary['total']} — events double-counted"
+    assert summary["encrypted"] == 1, f"Expected 1, got {summary['encrypted']}"
+    assert summary["decrypted"] == 1, f"Expected 1, got {summary['decrypted']}"
 
 
 @mock_aws
