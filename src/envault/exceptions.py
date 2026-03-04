@@ -39,7 +39,7 @@ class EncryptionContextMismatchError(EnvaultError):
         self.expected = expected
         self.actual = actual
         super().__init__(
-            f"Encryption context mismatch: expected {expected!r}, got {actual!r}. "
+            "Encryption context mismatch detected. "
             "The ciphertext may have been tampered with or swapped."
         )
 

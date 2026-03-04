@@ -51,7 +51,11 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_not_exception_type(ConfigurationError),
+)
 def encrypt_file(
     input_path: Path,
     key_id: str,
@@ -92,9 +96,9 @@ def encrypt_file(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("wb") as out:
+    fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
         out.write(ciphertext)
-    os.chmod(output_path, 0o600)
 
     algorithm = (
         header.algorithm.name if hasattr(header.algorithm, "name") else str(header.algorithm)
@@ -175,17 +179,16 @@ def decrypt_file(
             key_provider=key_provider,
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("wb") as out:
-        out.write(plaintext)
-    os.chmod(output_path, 0o600)
-
-    actual_sha256 = sha256_file(output_path)
-    file_size = output_path.stat().st_size
+    actual_sha256 = hashlib.sha256(plaintext).hexdigest()
+    file_size = len(plaintext)
 
     if expected_sha256 and actual_sha256 != expected_sha256:
-        output_path.unlink(missing_ok=True)
         raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(plaintext)
 
     logger.info(
         "Decryption complete",

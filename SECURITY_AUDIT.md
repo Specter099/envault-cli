@@ -1,19 +1,20 @@
-# Security Audit Report — envault-cli
+# CISO Final Security Review — envault-cli
 
-**Auditor:** Senior Security Reviewer
-**Date:** 2026-03-03
-**Codebase version:** 0.1.1 (`main` branch)
-**Scope:** Full source review — Python package (`src/envault/`), legacy shell scripts (`code/`), CDK infrastructure (`infra/cdk/`), CI/CD workflows (`.github/workflows/`), tests.
+**Reviewer:** CISO Final Security Review
+**Date:** 2026-03-04
+**Codebase version:** commit `5b575e9` on `main` (post-remediation of prior audit findings)
+**Scope:** Full codebase — Python package (`src/envault/`), CDK infrastructure (`infra/cdk/`), CI/CD workflows (`.github/workflows/`), legacy shell scripts (`code/`), tests (`tests/`), dependencies, pre-commit configuration.
+**Prior audit:** v1 dated 2026-03-03
 
 ---
 
 ## Executive Summary
 
-`envault` implements client-side envelope encryption using AWS KMS and the AWS Encryption SDK. The cryptographic design is sound: AES-256-GCM is applied locally, only the data-encryption key (DEK) is sent to KMS, and the commitment policy `REQUIRE_ENCRYPT_REQUIRE_DECRYPT` is enforced throughout. The CDK infrastructure enforces KMS-SSE on both S3 and DynamoDB, blocks public access, enables versioning, and sets PITR on DynamoDB.
+The envault-cli codebase demonstrates strong security fundamentals: client-side envelope encryption with AES-256-GCM, KMS commitment policy enforcement (`REQUIRE_ENCRYPT_REQUIRE_DECRYPT`), discovery filters with mandatory account ID restrictions, least-privilege IAM, CMK encryption on all data stores, SHA-pinned CI actions with OIDC Trusted Publisher for PyPI, and optimistic locking on DynamoDB state transitions.
 
-Despite this solid foundation, **four bugs are severe enough to cause either data loss or a security breach in production**, and several additional weaknesses reduce the overall assurance level below what the design intends.
+The prior security audit (2026-03-03) identified 4 critical, 5 high, and 8 medium findings. All critical and high findings from that audit have been remediated in the current codebase (see [Prior Audit Remediation Status](#prior-audit-remediation-status) below).
 
-Findings are grouped by severity. Every finding references the exact file and line(s) where the issue appears.
+However, this final review identifies **3 critical, 8 high, 10 medium, and 7 low findings** that must be addressed before production deployment. The critical findings center on the **decrypt path**: plaintext is written to disk before integrity verification, the entire file is buffered in memory with no streaming support, and these code paths have zero test coverage.
 
 ---
 
@@ -24,480 +25,753 @@ Findings are grouped by severity. Every finding references the exact file and li
 | **CRITICAL** | Exploitable in normal use; causes data loss, integrity failure, or unauthorized access |
 | **HIGH** | Significant security or reliability risk; exploitable under plausible conditions |
 | **MEDIUM** | Weakness that reduces defence-in-depth or can be chained with another finding |
-| **LOW / INFO** | Best-practice gap with low standalone impact |
+| **LOW** | Best-practice gap with low standalone impact |
 
 ---
 
 ## CRITICAL Findings
 
-### C-1 — `migrate` computes a hash of the file *path*, not the file *content*
+### C-1 — Plaintext written to disk before checksum verification
 
-**File:** `src/envault/cli.py:411`
-
-```python
-sha256_hash = hashlib.sha256(input_path.encode()).hexdigest()
-```
-
-`input_path` is a string such as `"../encrypt/payroll.xlsx"`. The hash stored in DynamoDB is therefore **a hash of the path string**, not the file content.
-
-The entire system uses SHA256 of plaintext *content* as the primary identifier:
-
-- DynamoDB PK: `FILE#{content_sha256}` (`state.py:53`)
-- Integrity check on decrypt: `expected_sha256` is compared against the freshly-computed content hash (`crypto.py:163`)
-- CLI `decrypt` command looks up records by content hash (`cli.py:188`)
-
-Consequence: every record imported via `migrate` will have a PK that can **never** match a real decrypt lookup. Furthermore, if a user attempts to decrypt a migrated record by supplying the migrated (path-based) hash, the decryption will produce a different content hash, triggering `ChecksumMismatchError` and deleting the decrypted output (`crypto.py:164`). Migrated data is effectively **unrecoverable through the CLI**.
-
-**Recommendation:** Either (a) read the actual file and compute its SHA256 content hash during migration, or (b) deprecate the `migrate` command entirely if it cannot access the original plaintext files.
-
----
-
-### C-2 — Plaintext written to a predictable, world-readable path during key rotation
-
-**File:** `src/envault/cli.py:486`
+**File:** `src/envault/crypto.py:178-188`
 
 ```python
-tmp_pt = tmpdir / f"envault_rot_pt_{record.sha256_hash[:16]}"
+output_path.parent.mkdir(parents=True, exist_ok=True)
+with output_path.open("wb") as out:
+    out.write(plaintext)
+os.chmod(output_path, 0o600)
+
+actual_sha256 = sha256_file(output_path)
+file_size = output_path.stat().st_size
+
+if expected_sha256 and actual_sha256 != expected_sha256:
+    output_path.unlink(missing_ok=True)
+    raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
 ```
 
-During `rotate-key`, each encrypted file is downloaded, decrypted, re-encrypted, and uploaded. The intermediate *plaintext* is written to `/tmp/envault_rot_pt_<16-hex-chars>`.
+**Description:** Decrypted plaintext is written to the output file, then re-read from disk for SHA256 verification. If the checksum fails (indicating tampering or corruption), the file is deleted — but it already existed on disk in the clear. On copy-on-write filesystems (APFS on macOS, ZFS), the data persists in filesystem snapshots even after `unlink()`. Additionally, between the write and the check, another process could read the potentially tampered plaintext.
 
-Three distinct vulnerabilities arise here:
+**Attack scenario:** An attacker substitutes ciphertext in S3 with a different validly-encrypted file (encrypted under the same KMS key). The user decrypts it. Tampered plaintext hits disk at the user-specified path before the integrity check catches it. On APFS, it survives in a Time Machine snapshot. On any filesystem, a watching process can exfiltrate it during the verification window.
 
-1. **World-readable `/tmp`** — on a multi-user Linux host, any process running as another user can `open()` this path while the rotate-key loop is processing, reading the plaintext data.
+**Recommendation:** Compute SHA256 on the in-memory `plaintext` bytes before writing to disk. Only write if the hash matches:
 
-2. **Predictable filename** — the first 16 hex characters of the SHA256 hash are not secret; they appear in the CLI's status output (`cli.py:269`), in audit records, and in log lines. An attacker with read access to `/tmp` can wait for the specific path rather than guessing.
+```python
+actual_sha256 = hashlib.sha256(plaintext).hexdigest()
+if expected_sha256 and actual_sha256 != expected_sha256:
+    raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
+# Only write after verification passes
+fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "wb") as out:
+    out.write(plaintext)
+```
 
-3. **No secure deletion** — `tmp_pt.unlink(missing_ok=True)` (`cli.py:496`) removes the directory entry but does not zero-out the inode data. On non-journalling filesystems, or after a crash between encrypt and unlink, the plaintext bytes remain on disk until overwritten by subsequent writes.
-
-The encrypted temp files (`tmp_dl`, `tmp_enc`) are less critical but share the same predictability and non-secure-deletion problems.
-
-**Recommendation:** Use `tempfile.NamedTemporaryFile(delete=False, mode='wb')` with `os.chmod(fd, 0o600)` immediately after creation to get a randomly-named, owner-only file. Before unlinking, overwrite the file contents with zeroes (`file.write(b'\x00' * file_size)`). Consider using Python's `secrets`-based temp file wrappers, or process the rotation entirely in memory when file sizes permit.
+This also addresses H-3 (file permissions race) by creating the file with `0o600` atomically.
 
 ---
 
-### C-3 — Legacy shell scripts source `.env` without restriction, leaking all credentials to subprocesses
+### C-2 — No streaming — entire plaintext/ciphertext held in memory
 
-**Files:** `code/encrypt.sh:5-9`, `code/decrypt.sh:5-9`
+**Files:** `src/envault/crypto.py:87-92` (encrypt), `src/envault/crypto.py:172-176` (decrypt)
 
-```bash
-if [[ -f "../.env" ]]; then
-    set -a
-    . "../.env"
-    set +a
-fi
+```python
+# encrypt
+with input_path.open("rb") as plaintext_file:
+    ciphertext, header = client.encrypt(
+        source=plaintext_file, key_provider=key_provider,
+        encryption_context=encryption_context,
+    )
+
+# decrypt
+with input_path.open("rb") as encrypted_file:
+    plaintext, header = client.decrypt(
+        source=encrypted_file, key_provider=key_provider,
+    )
 ```
 
-`set -a` causes every variable assigned in `.env` to be automatically exported. All subsequent child processes — including `aws-encryption-cli` and `aws s3 sync` — inherit **every** variable defined in `.env`. If `.env` contains `AWS_SECRET_ACCESS_KEY`, `DATABASE_PASSWORD`, or any other credential, those values are exposed through `/proc/<pid>/environ` to any process on the host with sufficient permissions, and to any subcommand that logs its environment.
+**Description:** Both `client.encrypt()` and `client.decrypt()` return the full content as a Python `bytes` object in memory. Two security consequences:
 
-The scripts validate only `S3_BUCKET`; all other variables from `.env` pass through silently.
+1. **Memory exhaustion / DoS:** A maliciously large ciphertext causes OOM. There is no file size validation.
+2. **Plaintext exposure in memory:** Sensitive plaintext in Python `bytes` cannot be securely zeroed — it persists in process memory (and potentially swap) until garbage collected. Python's memory allocator does not guarantee overwrite on deallocation.
 
-**Recommendation:** Replace the sourcing pattern with explicit, targeted exports:
+**Attack scenario:** (1) Attacker uploads a multi-GB ciphertext to S3; user's `envault decrypt` OOMs or causes system instability. (2) After decryption, plaintext bytes remain recoverable from process memory or swap via forensic tools.
 
-```bash
-S3_BUCKET="$(grep -E '^S3_BUCKET=' ../.env | cut -d= -f2-)"
-export S3_BUCKET
+**Recommendation:** Use `client.stream(mode='e'/'d', ...)` for chunked I/O directly to output files. This also enables computing SHA256 during streaming, eliminating the TOCTOU in C-1 and M-8:
+
+```python
+with client.stream(mode='d', source=encrypted_file, key_provider=key_provider) as decryptor:
+    hasher = hashlib.sha256()
+    for chunk in decryptor:
+        hasher.update(chunk)
+        out.write(chunk)
 ```
-
-Alternatively, use a secrets manager and remove `.env` support entirely from these scripts.
 
 ---
 
-### C-4 — Encryption scripts upload themselves to the same S3 bucket as encrypted data
+### C-3 — Zero test coverage on critical integrity checks
 
-**Files:** `code/encrypt.sh:61`, `code/decrypt.sh:56`
+**Files:** `tests/unit/test_crypto.py`, `tests/unit/test_cli.py`
 
-```bash
-aws s3 sync ../code "s3://${S3_BUCKET}/code"
-```
+**Description:** The two most important security invariants in the system have **no test coverage**:
 
-Both the encryption and decryption shell scripts are synced to `s3://<bucket>/code/` — the same bucket that stores production encrypted data. This creates a supply-chain attack surface:
+1. **`ChecksumMismatchError` during decrypt** — The only test (`test_checksum_mismatch_error` at `test_crypto.py:102`) tests the exception's `__str__` method, never the actual `decrypt_file` code path that raises it. A regression in the checksum comparison, file cleanup, or retry exclusion would be invisible.
 
-- An attacker who gains **write** access to the S3 bucket (e.g., via misconfigured bucket policy, a compromised AWS credential, or a server-side request-forgery vulnerability) can replace `encrypt.sh` or `decrypt.sh`.
-- The next time a developer runs `make encrypt`, they execute the attacker's version, which may exfiltrate plaintext before encrypting.
+2. **`EncryptionContextMismatchError`** — Never tested anywhere. The `decrypt` command (`cli.py:270`) and `rotate-key` command (`cli.py:601`) both check for context mismatches, but neither path is exercised by any test.
 
-There is no code-signing or integrity check on the downloaded scripts.
+3. **CLI `encrypt` and `decrypt` commands** — Never invoked via `CliRunner` except a single hash-format validation test for `decrypt`. The entire security-critical orchestration flow (tempfile creation, encryption, S3 upload, DynamoDB state write, tempfile cleanup, error handling) is untested.
 
-**Recommendation:** Remove the code-sync lines entirely. Scripts should be distributed via version-controlled mechanisms (git, package manager), not the same bucket that holds sensitive data. If script archival is genuinely needed, use a separate bucket with tighter access controls and enable S3 Object Lock.
+4. **`rotate-key` command** — The most complex operation in the system (download, decrypt, re-encrypt, upload, state update, 3 temp files) has zero tests.
+
+5. **Temp file cleanup on failure** — `finally` blocks that clean up temp files (including `_best_effort_delete` for plaintext) have zero test coverage.
+
+6. **File permission setting** — `os.chmod(output_path, 0o600)` after encrypt/decrypt is untested.
+
+**Impact:** Any regression in checksum verification, encryption context comparison, temp file cleanup, file permissions, or error handling would be completely invisible to CI.
+
+**Recommendation:** Add tests for each of the above. At minimum:
+- Call `decrypt_file` with a mismatched `expected_sha256` and assert `ChecksumMismatchError` is raised and output file is deleted
+- Mock `decrypt_file` to return a mismatched `encryption_context` and assert `EncryptionContextMismatchError` is raised
+- Use `CliRunner` with mocked crypto and moto-backed AWS to test full encrypt/decrypt/rotate-key flows
+- Simulate failures at each stage and verify temp file cleanup
+- Verify output file permissions are `0o600`
 
 ---
 
 ## HIGH Findings
 
-### H-1 — Non-atomic state transitions leave the system in an inconsistent state
+### H-1 — Path traversal via `file_name` from DynamoDB during decrypt
 
-**File:** `src/envault/cli.py:122-154` (encrypt flow), `cli.py:199-216` (decrypt flow)
-
-The encrypt workflow performs three sequential, independent operations:
-
-1. `encrypt_file()` — writes ciphertext to `/tmp`
-2. `s3.upload_file()` — copies ciphertext to S3
-3. `store.put_current_state()` + `store.put_event()` — records state in DynamoDB
-
-Each step retries independently. If S3 upload succeeds but DynamoDB write fails after three retries, the encrypted file is permanently stored in S3 with **no corresponding DynamoDB record**. The file is therefore unrecoverable through the CLI.
-
-Conversely, during decrypt (cli.py:199-216): the plaintext file is written to disk before `put_current_state` is called. If the state update fails, the plaintext is on disk but the audit trail shows the file is still ENCRYPTED — a state lie.
-
-**Recommendation:** Wrap the S3 upload and DynamoDB write in a compensating-transaction pattern: if the DynamoDB write fails after S3 upload succeeds, delete the S3 object (or record it as orphaned). For the CURRENT-state record, use DynamoDB conditional writes (`ConditionExpression="attribute_not_exists(PK)"` for new records, version checks for updates).
-
----
-
-### H-2 — Predictable temp file names are vulnerable to TOCTOU/symlink attacks
-
-**Files:** `src/envault/cli.py:118`, `cli.py:196`
+**File:** `src/envault/cli.py:253`
 
 ```python
-tmp_encrypted = Path(tempfile.gettempdir()) / f"envault_{sha256[:16]}_{encrypted_name}"
-tmp_encrypted = Path(tempfile.gettempdir()) / f"envault_dl_{sha256_hash[:16]}.encrypted"
+output_path = (output if output.is_dir() else output.parent) / record.file_name
 ```
 
-These filenames are deterministic. On a shared system, an attacker who can predict the hash prefix can:
+**Description:** `record.file_name` comes from DynamoDB and is used unsanitized in the output path construction. The `_sanitize_filename()` method exists in `S3Store` and is used for S3 key generation, but is NOT applied to the output path during decryption. The `file_name` stored in DynamoDB is the raw `file_path.name` from the original encryption.
 
-1. Create a symlink at `/tmp/envault_<prefix>_<name>.encrypted` pointing to a sensitive file (e.g., `/etc/cron.d/backdoor`).
-2. When `encrypt_file()` calls `output_path.parent.mkdir(parents=True, exist_ok=True)` followed by `output_path.open("wb")` (`crypto.py:90-92`), Python's `open()` in write mode follows the symlink and overwrites the target file with ciphertext.
+**Attack scenario:** An attacker with DynamoDB write access (or who corrupts the migration source) sets `file_name = "../../.ssh/authorized_keys"`. A user running `envault decrypt <hash>` writes the decrypted file to an arbitrary filesystem path.
 
-This is a classic symlink attack enabled by `/tmp`'s sticky bit.
+**Recommendation:** Sanitize `record.file_name` before constructing the output path:
 
-**Recommendation:** Replace manually-constructed temp paths with `tempfile.mkstemp()`, which uses `O_EXCL | O_CREAT` to atomically create a file that cannot pre-exist, eliminating the TOCTOU window.
+```python
+safe_name = Path(record.file_name).name  # Strip directory components
+if not safe_name or safe_name.startswith('.'):
+    safe_name = f"decrypted_{record.sha256_hash[:16]}"
+output_path = (output if output.is_dir() else output.parent) / safe_name
+```
 
 ---
 
-### H-3 — `list_by_state` and `list_events_by_date` do not paginate DynamoDB results
+### H-2 — Symlink traversal in `_collect_files`
 
-**Files:** `src/envault/state.py:135-141`, `state.py:153-160`
+**File:** `src/envault/cli.py:650-653`
 
 ```python
-response = self._table.query(
-    IndexName="state-index",
-    KeyConditionExpression=Key("current_state").eq(state),
+def _collect_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    return [p for p in path.rglob("*") if p.is_file()]
+```
+
+**Description:** `Path.rglob("*")` follows symbolic links by default. `path.is_file()` returns `True` for symlinks pointing to files. An attacker who can create symlinks within a target directory can cause envault to encrypt files outside the intended directory tree.
+
+**Attack scenario:** A shared directory contains `symlink -> /home/victim/.ssh/id_rsa`. User runs `envault encrypt shared_dir/`. The tool follows the symlink, encrypts the victim's SSH key, and uploads it to S3 where the attacker can decrypt it.
+
+**Recommendation:** Filter out symlinks:
+
+```python
+def _collect_files(path: Path) -> list[Path]:
+    if path.is_symlink():
+        return []
+    if path.is_file():
+        return [path]
+    return [p for p in path.rglob("*") if p.is_file() and not p.is_symlink()]
+```
+
+---
+
+### H-3 — Output file permissions race (chmod after write)
+
+**Files:** `src/envault/crypto.py:95-97` (encrypt), `src/envault/crypto.py:179-181` (decrypt)
+
+```python
+with output_path.open("wb") as out:
+    out.write(plaintext)
+os.chmod(output_path, 0o600)
+```
+
+**Description:** Files are created with the process's default umask permissions (typically `0o644`), then restricted to `0o600` afterward. Between creation and chmod, other users on the system can read the file contents. This is particularly concerning for the decryption case where plaintext is being written.
+
+**Attack scenario:** On a multi-user system, another user reads the plaintext file during the window between `open("wb")` and `os.chmod()`.
+
+**Recommendation:** Use `os.open()` with explicit mode to create the file atomically with restricted permissions:
+
+```python
+fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "wb") as out:
+    out.write(plaintext)
+```
+
+Note: Temp files created with `mkstemp` already have `0o600` permissions — this issue only affects final output files.
+
+---
+
+### H-4 — `encrypt_file` retry doesn't exclude non-retryable exceptions
+
+**File:** `src/envault/crypto.py:54-57`
+
+```python
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+def encrypt_file(...) -> EncryptResult:
+```
+
+**Description:** The `@retry` decorator on `encrypt_file` retries ALL exceptions including `ConfigurationError` and other non-retryable errors. The `decrypt_file` decorator correctly uses `retry=retry_if_not_exception_type((ConfigurationError, ChecksumMismatchError))` to exclude non-retryable types. This inconsistency means a misconfigured KMS key causes 3 unnecessary KMS API calls, and each retry generates a different data encryption key producing different ciphertext.
+
+**Recommendation:** Add retry exclusion to match `decrypt_file`:
+
+```python
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_not_exception_type(ConfigurationError),
 )
-return [_item_to_record(item) for item in response.get("Items", [])]
 ```
-
-DynamoDB Query returns at most 1 MB of data per call. If the `current_state=ENCRYPTED` index partition exceeds 1 MB (approximately 2,000–5,000 records depending on field sizes), `LastEvaluatedKey` is set in the response but **never checked**. Subsequent pages are silently dropped.
-
-`rotate-key` calls `list_by_state(ENCRYPTED)` to enumerate all files to re-encrypt. For large deployments, files beyond the first page remain under the old KMS key even though the operator receives a "Rotated N files, 0 errors" success message. This is a **silent correctness failure** in a security-critical operation.
-
-**Recommendation:** Implement a `_paginate_query()` helper that follows `LastEvaluatedKey` until exhausted, and use it in all query methods.
 
 ---
 
-### H-4 — `DiscoveryAwsKmsMasterKeyProvider` imposes no account or region constraints
+### H-5 — Publish workflow missing top-level `permissions` restriction
 
-**File:** `src/envault/crypto.py:148`
+**File:** `.github/workflows/publish.yml`
 
-```python
-key_provider = DiscoveryAwsKmsMasterKeyProvider()
+**Description:** Unlike `ci.yml` which sets `permissions: read-all` at the top level, the publish workflow has no top-level permissions declaration. The `build` job inherits the default GITHUB_TOKEN permissions, which in many repository configurations is `write` for contents, packages, pull-requests, and more.
+
+**Attack scenario:** A compromised or future third-party action in the build job runs with elevated GITHUB_TOKEN permissions, potentially pushing malicious code, creating releases, or modifying PR reviews.
+
+**Recommendation:** Add `permissions: read-all` at the top level; scope per-job as needed:
+
+```yaml
+permissions: read-all
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    ...
+  publish-pypi:
+    permissions:
+      id-token: write
+    ...
 ```
-
-Discovery mode will attempt to use **any** KMS key referenced in the ciphertext header, including keys in foreign AWS accounts or regions. The AWS Encryption SDK provides `DiscoveryFilter` to restrict discovery to specific account IDs and AWS regions:
-
-```python
-discovery_filter = DiscoveryFilter(account_ids=["123456789012"], partition="aws")
-key_provider = DiscoveryAwsKmsMasterKeyProvider(discovery_filter=discovery_filter)
-```
-
-Without this filter, if an attacker substitutes a crafted ciphertext (e.g., by uploading a malicious object to S3 under a predictable key path), `decrypt_file` will make an outbound KMS `Decrypt` call to an attacker-controlled key, potentially leaking information about the calling IAM identity or triggering unexpected billing.
-
-**Recommendation:** Configure `DiscoveryFilter` with the expected AWS account ID(s), read from environment variables (`ENVAULT_ALLOWED_ACCOUNTS`) or derived from the configured key ARN.
 
 ---
 
-### H-5 — Version ID race condition between `upload_file` and `head_object`
+### H-6 — PyPI publish has no CI quality gate
 
-**File:** `src/envault/s3.py:34-47`
+**File:** `.github/workflows/publish.yml:3-6`
 
-```python
-self._s3.upload_file(str(local_path), self._bucket, s3_key, ...)
-head = self._s3.head_object(Bucket=self._bucket, Key=s3_key)
-version_id: str = head.get("VersionId", "")
+```yaml
+on:
+  push:
+    tags:
+      - "v*.*.*"
 ```
 
-Two separate API calls retrieve the version ID. In a concurrent scenario where two processes encrypt files with the same name simultaneously, `head_object` may return the version ID from the *other* process's upload, causing DynamoDB to store a pointer to the wrong S3 object version. The decrypt command would then download the wrong ciphertext — leading to a `ChecksumMismatchError` at best, or silent wrong-file decryption if the file names are also the same.
+**Description:** Anyone with push access can create a tag matching `v*.*.*` and trigger a full PyPI release. The publish workflow does NOT depend on CI passing — no tests, linting, or type checking are required before publication.
 
-**Recommendation:** Use `boto3`'s `put_object` (which returns the `VersionId` in the response) instead of `upload_file` + `head_object`. For files already using `upload_file` for multipart support, switch to `create_multipart_upload` / `complete_multipart_upload` which also returns the version ID.
+**Attack scenario:** A compromised contributor account pushes a tag on a commit containing malicious code. The package is built and published to PyPI without any quality checks, distributing a supply-chain attack to all `pip install envault-cli` users.
+
+**Recommendation:** Combine multiple defenses:
+1. Add the CI workflow as a `needs:` dependency in the publish workflow
+2. Configure the `pypi` GitHub Environment with required reviewers
+3. Restrict tag creation to administrators via branch protection rules
+
+```yaml
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: ci
+    ...
+```
+
+---
+
+### H-7 — `decrypt.conf` shell variable not expanded by aws-encryption-cli
+
+**File:** `code/decrypt.conf:2`
+
+```
+--wrapping-keys key=${KMS_KEY_ARN}
+```
+
+**Description:** The `@filename` argument-file syntax in `aws-encryption-cli` reads literal text without shell variable expansion. The string `${KMS_KEY_ARN}` is passed literally as the key identifier, causing decryption to fail with an obscure KMS error or silently attempt to use a key named `${KMS_KEY_ARN}`.
+
+In contrast, `encrypt.conf` hardcodes `key=alias/s3_key`, creating an inconsistency between encrypt and decrypt configurations.
+
+**Recommendation:** Use `--wrapping-keys discovery=true` in the legacy scripts (matching the Python code's discovery pattern), or generate the conf file dynamically at runtime.
+
+---
+
+### H-8 — Temp file cleanup on encryption/decryption failure is untested
+
+**Files:** `src/envault/cli.py:143-161` (encrypt), `src/envault/cli.py:250-268` (decrypt)
+
+**Description:** Both `_encrypt_one` and the `decrypt` command create temp files via `tempfile.mkstemp`. The `finally` blocks are responsible for cleaning up these files even on failure, including calling `_best_effort_delete` for plaintext files. No test verifies this behavior. Additionally, the `_best_effort_delete` test (`test_best_effort_delete_overwrites_before_removal`) only verifies the file no longer exists — it does not verify the file was zeroed before deletion.
+
+**Attack scenario:** A transient AWS error causes encryption to fail. Temp files containing ciphertext or plaintext are left on disk. During key rotation, a decrypted plaintext temp file could remain indefinitely if the re-encryption step fails and the `finally` block has a regression.
+
+**Recommendation:** Add tests that simulate failures at various stages and verify all temp files are cleaned up. Modify `_best_effort_delete` test to verify zeroing occurs before unlinking.
 
 ---
 
 ## MEDIUM Findings
 
-### M-1 — `ENVAULT_AUDIT_TTL_DAYS` raises an unhandled `ValueError` on non-numeric input
+### M-1 — Broad `except Exception` in encrypt command hides programming errors
 
-**File:** `src/envault/config.py:54`
-
-```python
-audit_ttl_days = int(os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365"))
-```
-
-If the environment variable is set to a non-integer value (e.g., `"30d"` or an accidental space), Python raises `ValueError` with a generic traceback rather than the application's `ConfigurationError` with an actionable message. This is inconsistent with the explicit validation done for `ENVAULT_KEY_ID`, `ENVAULT_BUCKET`, and `ENVAULT_TABLE`.
-
-**Recommendation:** Wrap the conversion in a `try/except ValueError` and raise `ConfigurationError` with a descriptive message.
-
----
-
-### M-2 — S3 key derived only from base filename; directory collisions silently overwrite data
-
-**File:** `src/envault/s3.py:77`
-
-```python
-return f"encrypted/{file_name}.encrypted"
-```
-
-Only the basename is used. Encrypting `/finance/Q1/report.xlsx` and `/ops/Q2/report.xlsx` both produce `encrypted/report.xlsx.encrypted`. The second upload overwrites the first in S3's current-object pointer (the older version is retained by versioning, but the DynamoDB `CURRENT` record for the first file's hash now points to the second upload's version ID — i.e., wrong ciphertext). The user receives no warning.
-
-**Recommendation:** Incorporate the SHA256 hash into the S3 key: `f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{file_name}.encrypted"`. This makes keys content-addressable, eliminates collisions, and aligns with common object storage patterns.
-
----
-
-### M-3 — `audit` command returns CURRENT records mixed with EVENT records
-
-**Files:** `src/envault/state.py:99`, `state.py:153-160`
-
-`put_current_state` sets `item["date"] = _today_str()`, so every CURRENT-state record has a `date` attribute. The `date-index` GSI therefore indexes both CURRENT and EVENT items. `list_events_by_date` returns all items where `date = <requested_date>`, including CURRENT-state snapshots.
-
-In the `audit` command (`cli.py:308-311`), the sort key is parsed:
-
-```python
-parts = sk.split("#")
-ts = parts[1] if len(parts) > 1 else ""
-op = parts[2] if len(parts) > 2 else e.get("operation", "")
-```
-
-For CURRENT records (`SK = "CURRENT"`), `parts[1]` is an empty string and `parts[2]` does not exist — the fallback to `e.get("operation", "")` returns `""`. The table silently shows empty rows for state records, polluting the audit output. Worse, an operator scanning for all DECRYPT events on a given date will see incomplete results.
-
-**Recommendation:** Filter by `SK begins_with "EVENT#"` in the `date-index` query, or add a record-type discriminator attribute and use a `FilterExpression`.
-
----
-
-### M-4 — Broad `except Exception` in `migrate` and `rotate-key` swallows programming errors
-
-**Files:** `src/envault/cli.py:385-387`, `cli.py:510-512`
+**File:** `src/envault/cli.py:116-119`
 
 ```python
 except Exception as exc:
-    logger.warning("Failed to migrate record at line %d: %s", i, exc)
+    console.print(f"[red]✗[/red] {file_path.name}: {exc}")
+    logger.exception("Failed to encrypt %s", file_path)
     errors += 1
 ```
 
-`Exception` is caught so broadly that `AttributeError`, `NameError`, `TypeError` — i.e., programming bugs — are silently counted as "errors" and processing continues. In `rotate-key`, this means a Python bug in the rotation code could cause every file to fail silently while the operator sees "Rotated 0 files, 47 errors" and does not know whether to re-run or investigate.
+**Description:** The encrypt command catches `Exception` broadly. `TypeError`, `AttributeError`, and `NameError` (indicating bugs) are silently counted as "errors" and processing continues. A programming bug could cause every file in a batch to silently fail. The `rotate-key` command (`cli.py:630`) correctly narrowed this to `(EnvaultError, ClientError, BotoCoreError)`.
 
-More critically: after a partial rotate-key failure, some files remain under the old KMS key. There is no report of *which* files failed, making remediation manual and error-prone.
-
-**Recommendation:** Catch specific exception classes (`EnvaultError`, `ClientError`, `BotoCoreError`). Let programming errors propagate so they surface as unhandled exceptions in the traceback.
-
----
-
-### M-5 — Tag key/value inputs are not length- or character-validated
-
-**File:** `src/envault/cli.py:528-536`
+**Recommendation:** Match the pattern used in `rotate-key`:
 
 ```python
-k, _, v = t.partition("=")
-tags[k.strip()] = v.strip()
+except (EnvaultError, ClientError, BotoCoreError) as exc:
 ```
-
-DynamoDB attribute names and values have size limits (attribute name: 255 bytes; item total: 400 KB). Tag values that contain newlines, NUL bytes, or control characters may cause unexpected behaviour in the Rich terminal output or in downstream log processing. There is no validation beyond checking for the presence of `=`.
-
-**Recommendation:** Validate tag keys against `[a-zA-Z0-9_\-]{1,64}` and tag values against printable ASCII with a reasonable length cap.
 
 ---
 
-### M-6 — GitHub Actions workflow pins action versions by floating tag, not commit SHA
+### M-2 — SHA256 hash validation inconsistent across commands
 
-**File:** `.github/workflows/ci.yml:17,22,29,32,59,75`
+**Files:** `src/envault/cli.py:302` (status), `src/envault/cli.py:356` (audit)
+
+**Description:** The `decrypt` command validates the SHA256 hash with `re.fullmatch(r"[0-9a-f]{64}", sha256_hash)` at line 224, but the `status` and `audit` commands pass `sha256_hash` directly to DynamoDB queries without validation. A malformed input produces confusing "not found" errors.
+
+**Recommendation:** Extract the validation into a shared helper and apply consistently:
+
+```python
+def _validate_sha256(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise click.BadParameter("Expected 64 lowercase hexadecimal characters")
+    return value
+```
+
+---
+
+### M-3 — `_best_effort_delete` allocates full file size in memory
+
+**File:** `src/envault/cli.py:676-696`
+
+```python
+size = path.stat().st_size
+with path.open("r+b") as f:
+    f.write(b"\x00" * size)
+```
+
+**Description:** `b"\x00" * size` allocates a single bytes object equal to the file size. For a 1GB file, this allocates 1GB of zeros in memory.
+
+**Recommendation:** Write zeros in chunks:
+
+```python
+CHUNK_SIZE = 65536
+remaining = size
+with path.open("r+b") as f:
+    while remaining > 0:
+        to_write = min(CHUNK_SIZE, remaining)
+        f.write(b"\x00" * to_write)
+        remaining -= to_write
+    f.flush()
+    os.fsync(f.fileno())
+```
+
+---
+
+### M-4 — No format validation on `--allowed-account-ids`
+
+**Files:** `src/envault/cli.py:234`, `src/envault/cli.py:556`
+
+```python
+account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
+```
+
+**Description:** AWS account IDs are 12-digit numeric strings. The code does not validate format before passing to `DiscoveryFilter`. A malformed account ID (e.g., `*`, empty string, non-numeric) could either cause a runtime error or weaken the discovery filter.
+
+**Recommendation:** Validate each account ID:
+
+```python
+for account_id in account_ids:
+    if not re.fullmatch(r"\d{12}", account_id):
+        console.print(f"[red]Invalid AWS account ID: {account_id!r}. Must be 12 digits.[/red]")
+        sys.exit(1)
+```
+
+---
+
+### M-5 — `EncryptionContextMismatchError` leaks full encryption context in error message
+
+**File:** `src/envault/exceptions.py:41-44`
+
+```python
+super().__init__(
+    f"Encryption context mismatch: expected {expected!r}, got {actual!r}. "
+    "The ciphertext may have been tampered with or swapped."
+)
+```
+
+**Description:** The full encryption context dictionaries (containing SHA256 hash, file name, and KMS key alias) are included in the exception message. If this exception propagates to logs or console output, it reveals metadata about the encrypted file. `ChecksumMismatchError` already truncates hashes to 16 chars, but this exception does not.
+
+**Recommendation:** Remove context details from the user-facing message:
+
+```python
+super().__init__(
+    "Encryption context mismatch detected. "
+    "The ciphertext may have been tampered with or swapped."
+)
+```
+
+Log the full context at DEBUG level for troubleshooting.
+
+---
+
+### M-6 — S3 upload missing checksum verification
+
+**File:** `src/envault/s3.py:42-47`
+
+```python
+response = self._s3.put_object(
+    Bucket=self._bucket,
+    Key=s3_key,
+    Body=f,
+    ServerSideEncryption="aws:kms",
+)
+```
+
+**Description:** The `put_object` call does not specify `ChecksumAlgorithm`. While AES-256-GCM provides authentication, a bit-flip during transit to S3 could corrupt the ciphertext before it's stored, leading to silent decryption failures later.
+
+**Recommendation:** Add `ChecksumAlgorithm="SHA256"` so S3 validates upload integrity server-side.
+
+---
+
+### M-7 — `.secrets.baseline` referenced but does not exist
+
+**File:** `.pre-commit-config.yaml:6`
 
 ```yaml
-uses: actions/checkout@v6
-uses: actions/setup-python@v6
-uses: zricethezav/gitleaks-action@v2
-uses: actions/upload-artifact@v7
+- id: detect-secrets
+  args: ["--baseline", ".secrets.baseline"]
 ```
 
-Floating version tags (e.g., `@v6`) allow action maintainers — or an attacker who compromises their account — to silently push malicious code under the existing tag. The next CI run executes the modified action with full repository access and the `GITHUB_TOKEN`.
+**Description:** The `.secrets.baseline` file is referenced in pre-commit config and listed in `.gitignore` (line 62), but does not exist in the repository. Because it's in `.gitignore`, even if generated locally it won't be committed. This means the `detect-secrets` hook fails on every commit, causing developers to skip hooks with `--no-verify` or disable the hook.
 
-**Recommendation:** Pin all actions to specific commit SHAs. Use Dependabot or Renovate to receive automated SHA-update PRs.
+**Recommendation:** Remove `.secrets.baseline` from `.gitignore`, generate it with `detect-secrets scan > .secrets.baseline`, audit false positives, and commit it.
 
-Example:
+---
+
+### M-8 — TOCTOU: file read twice between hash and encrypt
+
+**File:** `src/envault/cli.py:137-157`
+
+```python
+sha256 = sha256_file(file_path)  # First read
+...
+result = encrypt_file(
+    input_path=file_path,  # Second read
+    ...
+)
+```
+
+**Description:** The file is read once to compute the SHA256 hash (which becomes the DynamoDB primary key) and again for encryption. If the file is modified between these two reads, the SHA256 stored in DynamoDB won't match the actual encrypted content. Upon decryption, the checksum verification would fail.
+
+**Recommendation:** Compute SHA256 as part of the encryption operation, or read the file once and use the same bytes for both. The streaming API fix (C-2) naturally resolves this.
+
+---
+
+### M-9 — No dependency vulnerability scanning in CI
+
+**File:** `.github/workflows/ci.yml`
+
+**Description:** The CI pipeline runs linting, type checking, and unit tests, but no dependency vulnerability scanner (`pip-audit`, `safety`). For a security-critical encryption tool depending on `cryptography`, `aws-encryption-sdk`, `cffi`, and `boto3`, CVE monitoring is essential.
+
+**Recommendation:** Add a CI step:
+
 ```yaml
-uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+- name: Audit dependencies
+  run: pip install pip-audit && pip-audit
 ```
 
 ---
 
-### M-7 — `s3.download_file` silently falls back to latest version when `version_id` is empty
+### M-10 — CDK infrastructure requirements use open-ended version constraints
 
-**File:** `src/envault/s3.py:60-61`
+**File:** `infra/cdk/requirements.txt`
 
-```python
-if version_id:
-    extra_args["VersionId"] = version_id
+```
+aws-cdk-lib>=2.100.0
+cdk-nag>=2.28.0
+constructs>=10.0.0
 ```
 
-If `s3_version_id` is empty in the DynamoDB record (e.g., for a bucket without versioning enabled, or for a migrated record), the download silently fetches the **latest** object version rather than the version recorded at encryption time. This is a time-of-check/time-of-use (TOCTOU) gap: if the S3 object has been overwritten since encryption, the wrong ciphertext is decrypted and the checksum check will fail — or succeed against a different plaintext if an attacker controls the S3 bucket.
+**Description:** All three dependencies use `>=` with no upper bound. A `pip install` could pull in a future major version with breaking or security-behavioral changes.
 
-**Recommendation:** Log a `WARNING` when `version_id` is empty. Consider treating an empty version ID as an error for production-mode decrypts.
+**Recommendation:** Add upper bounds:
 
----
-
-### M-8 — `upload_file` does not verify upload integrity with a checksum algorithm
-
-**File:** `src/envault/s3.py:34-39`
-
-`boto3`'s `upload_file` (via the underlying S3 Transfer Manager) does not, by default, compute a checksum of the uploaded data for S3 to verify on its end. Silent bit-flip corruption during transit would produce an S3 object whose content does not match what was written.
-
-**Recommendation:** Add `ChecksumAlgorithm="SHA256"` to `ExtraArgs` in `upload_file`. boto3 will compute and send the checksum header; S3 will reject the upload if the received bytes differ.
-
----
-
-## LOW / INFORMATIONAL Findings
-
-### L-1 — `current_state` records not excluded from CURRENT-state GSI pagination
-
-The `state-index` GSI partition key is `current_state`, which holds values `ENCRYPTED` or `DECRYPTED`. CURRENT records and EVENT records are both written to this GSI. The EVENT records created immediately after encryption also carry `current_state = "ENCRYPTED"`, so the GSI partition is inflated by an order of magnitude (one CURRENT record + N EVENT records per file). At scale this significantly increases read capacity consumption on `list_by_state` queries.
-
-**Recommendation:** Filter on `SK = "CURRENT"` using a `FilterExpression` in `list_by_state`, or use a separate record-type attribute to distinguish item types.
-
----
-
-### L-2 — `ENVAULT_REGION` not validated; silent fallback may cause cross-region surprises
-
-**File:** `src/envault/config.py:53`
-
-`region = os.environ.get("ENVAULT_REGION", "us-east-1")` — accepted without format validation. A typo (`us-eas-1`) causes obscure boto3 errors rather than a clear config failure.
-
-**Recommendation:** Validate against known AWS region strings or let the first boto3 call's error surface early with an explanatory wrapper.
-
----
-
-### L-3 — Dependency versions use open-ended `>=` constraints with no upper bound
-
-**File:** `pyproject.toml:25-31`
-
-```toml
-"aws-encryption-sdk>=3.1.1",
-"boto3>=1.26.0",
+```
+aws-cdk-lib>=2.100.0,<3
+cdk-nag>=2.28.0,<3
+constructs>=10.0.0,<11
 ```
 
-Open-ended constraints allow pip to install future major versions that may introduce breaking API changes or new security behaviour. The `aws-encryption-sdk` in particular has had breaking changes between major versions.
+---
 
-**Recommendation:** Use compatible-release constraints (`~=3.1`) or upper bounds (`>=3.1.1,<4.0.0`) for all security-relevant dependencies.
+## LOW Findings
+
+### L-1 — S3 bucket missing `bucket_key_enabled`
+
+**File:** `infra/cdk/stacks/envault_stack.py:69-91`
+
+**Description:** The S3 bucket uses KMS-SSE but does not set `bucket_key_enabled=True`. Without S3 Bucket Keys, every `PutObject`/`GetObject` makes a separate KMS request, increasing cost, latency, and CloudTrail noise (reducing signal-to-noise for security monitoring).
+
+**Recommendation:** Add `bucket_key_enabled=True` to the bucket construct.
 
 ---
 
-### L-4 — S3 access logging not enabled in CDK stack
+### L-2 — No MFA Delete on versioned S3 bucket
 
-**File:** `infra/cdk/stacks/envault_stack.py:51-71`
+**File:** `infra/cdk/stacks/envault_stack.py:69-91`
 
-S3 server-access logs capture request-level detail (requester, operation, object key, response code) that is essential for forensic investigation of unauthorized access. Without them, a breach leaves no S3-level audit trail beyond CloudTrail data events (if enabled separately).
+**Description:** Versioning is enabled but MFA Delete is not configured. An attacker who compromises IAM credentials with `s3:DeleteObjectVersion` could permanently destroy all encrypted file versions. The `EnvaultUserPolicy` does not grant delete permissions, but other principals might.
 
-**Recommendation:** Add `server_access_logs_bucket` and `server_access_logs_prefix` to the bucket construct, or enable CloudTrail data events for the bucket.
-
----
-
-### L-5 — `tag-index` GSI is defined in CDK but never populated or queried
-
-**Files:** `infra/cdk/stacks/envault_stack.py:111-116`, `src/envault/state.py` (no tag-index query exists)
-
-The GSI indexes `tag_key` and `tag_value` attributes, but `to_dynamo_item` (`state.py:47-57`) never writes these attributes — it serializes `tags` as a DynamoDB Map under the key `tags`. The GSI is consuming capacity without providing any functionality.
-
-**Recommendation:** Either implement tag-based lookup (denormalize `tags` into `tag_key`/`tag_value` attributes) or remove the GSI from the CDK stack to avoid unnecessary cost.
+**Recommendation:** Document and enable MFA Delete post-deployment (requires root account credentials; cannot be configured via CDK).
 
 ---
 
-### L-6 — Log output includes file paths and KMS key identifiers
+### L-3 — Hardcoded table name and policy name prevent multi-environment deployment
 
-**File:** `src/envault/crypto.py:76`
+**Files:** `infra/cdk/stacks/envault_stack.py:99` (`table_name="envault-state"`), `infra/cdk/stacks/envault_stack.py:135` (`managed_policy_name="EnvaultUserPolicy"`)
 
-```python
-logger.info("Encrypting file", extra={"input": str(input_path), "key_id": key_id})
+**Description:** Hardcoded names prevent deploying multiple stack instances in the same account/region (e.g., staging and production). Hardcoded IAM policy names also risk CloudFormation replacement failures.
+
+**Recommendation:** Parameterize names or let CDK generate unique names.
+
+---
+
+### L-4 — GSI projections use `ALL`, increasing storage and exposure surface
+
+**File:** `infra/cdk/stacks/envault_stack.py:114-127`
+
+**Description:** Both GSIs project ALL attributes, replicating `encryption_context`, `s3_key`, `kms_key_id`, and `tags` into each index. This increases the attack surface if a query against a GSI inadvertently exposes sensitive metadata.
+
+**Recommendation:** Use `KEYS_ONLY` or `INCLUDE` projection with only the attributes needed for each query pattern.
+
+---
+
+### L-5 — S3 `put_object` doesn't specify `SSEKMSKeyId`
+
+**File:** `src/envault/s3.py:42-47`
+
+**Description:** The upload specifies `ServerSideEncryption="aws:kms"` but not `SSEKMSKeyId`, so S3 uses the bucket's default KMS key. If the bucket default differs from the envault CMK, server-side encryption uses a different key than intended.
+
+**Recommendation:** Pass the KMS key ID to `put_object`.
+
+---
+
+### L-6 — Fake AWS credentials in CI set at job level
+
+**File:** `.github/workflows/ci.yml:73-76`
+
+**Description:** Fake AWS credentials (`testing`) for moto mocking are set at the job level. Any future CI step added after tests would inherit these environment variables, normalizing credentials in workflow env blocks.
+
+**Recommendation:** Scope the env block to the specific `run:` step, or add a comment documenting the intent.
+
+---
+
+### L-7 — No `CODEOWNERS` file for security-critical paths
+
+**File:** (missing)
+
+**Description:** No `CODEOWNERS` file enforces review requirements for changes to `.github/workflows/`, `src/envault/crypto.py`, `infra/cdk/`, or `pyproject.toml`. Any contributor with write access can modify the publish pipeline or cryptographic code without mandatory security review.
+
+**Recommendation:** Add `.github/CODEOWNERS`:
+
+```
+/.github/workflows/  @security-team
+/src/envault/crypto.py  @security-team
+/infra/cdk/  @security-team
+/pyproject.toml  @security-team
 ```
 
-If verbose/structured logs are forwarded to a centralised SIEM, the file name (potentially sensitive, e.g. `salary_h2_2025.xlsx`) and KMS key alias appear in plaintext. File names are also stored unencrypted in DynamoDB `file_name` fields.
+---
 
-**Recommendation:** Document this data-flow explicitly in the README. Consider offering a `--log-sanitize` flag that replaces file paths with their SHA256 hash in log output.
+## CDK Infrastructure Assessment
+
+The CDK infrastructure has no CRITICAL or HIGH findings. Key observations:
+
+| Area | Status |
+|------|--------|
+| KMS CMK with auto-rotation | Enabled |
+| S3 encryption with CMK | Enabled |
+| S3 public access blocked | `BLOCK_ALL` on both buckets |
+| TLS enforced | `enforce_ssl=True` on both buckets |
+| S3 versioning | Enabled |
+| S3 access logging | Enabled (dedicated bucket) |
+| DynamoDB CMK encryption | `CUSTOMER_MANAGED` |
+| DynamoDB PITR | Enabled |
+| DynamoDB deletion protection | Enabled |
+| Removal policies | `RETAIN` on all stateful resources |
+| IAM least privilege | No delete permissions; scoped to specific ARNs |
+| cdk-nag integration | `AwsSolutionsChecks` with justified suppressions |
+
+**Notable CDK-specific items:**
+- Default KMS key policy grants `kms:*` to account root (standard CDK behavior, delegates to IAM). For shared accounts, consider adding conditions.
+- Access logs bucket uses legacy ACL-based delivery (`ObjectWriter`). `BLOCK_ALL` mitigates the primary risk.
+- No CloudTrail data events provisioned (expected to be configured at account/org level).
 
 ---
 
-### L-7 — `detect-secrets` pre-commit hook references a baseline file that may not exist
+## Security Strengths
 
-**File:** `.pre-commit-config.yaml` (referenced in CLAUDE.md)
+These represent meaningful security engineering:
 
-If `.secrets.baseline` does not exist in the repository, `detect-secrets` will fail on the first pre-commit run, blocking all commits until the baseline is manually generated. This creates developer friction and the risk of developers disabling the hook.
-
-**Recommendation:** Commit an empty baseline (`detect-secrets scan --no-verify > .secrets.baseline`) or add a CI step that fails if the baseline is absent.
+1. **`CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT`** — strongest setting, prevents key commitment attacks
+2. **`DiscoveryFilter` with mandatory account IDs** — hard failure if `ENVAULT_ALLOWED_ACCOUNT_IDS` unset
+3. **Per-file encryption context as AAD** — cryptographic binding prevents ciphertext substitution at the AEAD layer
+4. **Optimistic locking** — `ConditionExpression` on DynamoDB writes prevents concurrent modification
+5. **Zero shell invocations** — no `subprocess`, `os.system`, `shell=True` anywhere in Python code
+6. **Temp files via `mkstemp`** with `_best_effort_delete` zero-overwrite
+7. **SHA-pinned GitHub Actions** with OIDC Trusted Publisher for PyPI
+8. **Least-privilege IAM** — no delete permissions, scoped to specific resource ARNs
+9. **CMK encryption on all data stores** with key rotation enabled
+10. **cdk-nag `AwsSolutionsChecks`** with properly scoped, justified suppressions
+11. **S3 public access fully blocked**, TLS enforced, versioning enabled, access logging to dedicated bucket
+12. **DynamoDB PITR + deletion protection** with `RemovalPolicy.RETAIN`
+13. **Content-addressed S3 keys** — `encrypted/{sha256[:2]}/{sha256}/{filename}.encrypted` prevents collisions
+14. **Paginated DynamoDB queries** — `_paginate_query()` follows `LastEvaluatedKey` until exhaustion
+15. **Tag input validation** — strict regex for keys, length limits for values
+16. **JSON structured logging** to stderr via `python-json-logger`
 
 ---
 
-### L-8 — Encrypt script cleanup uses `|| true`, masking partial S3 sync failures
+## Prior Audit Remediation Status
 
-**File:** `code/encrypt.sh:57`
+All findings from the v1 audit (2026-03-03) have been verified:
 
-```bash
-find "$OUTPUT_DIR" -type f -delete 2>/dev/null || true
-```
-
-The cleanup of local encrypted files is attempted regardless of whether the preceding S3 sync succeeded in full. If `aws s3 sync` transferred only a subset of files before being interrupted (e.g., network cut), the remaining files are still deleted locally. Combined with `|| true`, any cleanup errors are also silently ignored.
-
-**Recommendation:** Verify S3 sync success with a post-sync object count comparison before deleting local files.
+| Prior ID | Severity | Finding | Status | Evidence |
+|----------|----------|---------|--------|----------|
+| C-1 | CRITICAL | `migrate` hashes file path, not content | **FIXED** | `cli.py:478-485` calls `sha256_file(plaintext_path)` |
+| C-2 | CRITICAL | Predictable world-readable `/tmp` paths | **FIXED** | Uses `tempfile.mkstemp()` with `_best_effort_delete()` |
+| C-3 | CRITICAL | Unrestricted `.env` sourcing in shell scripts | **FIXED** | `encrypt.sh:5-8`, `decrypt.sh:5-8` extract only `S3_BUCKET` via `grep` |
+| C-4 | CRITICAL | Code synced to production S3 bucket | **FIXED** | `aws s3 sync ../code` lines removed |
+| H-1 | HIGH | Non-atomic state transitions | **PARTIAL** | Optimistic locking added; compensating transactions not yet implemented |
+| H-2 | HIGH | Predictable temp file names / TOCTOU | **FIXED** | `tempfile.mkstemp()` used throughout |
+| H-3 | HIGH | DynamoDB queries not paginated | **FIXED** | `_paginate_query()` at `state.py:96-106` |
+| H-4 | HIGH | `DiscoveryAwsKmsMasterKeyProvider` unconstrained | **FIXED** | `crypto.py:163-170` uses `DiscoveryFilter` |
+| H-5 | HIGH | Version ID race (`upload_file` + `head_object`) | **FIXED** | `s3.py:42` uses `put_object` returning `VersionId` |
+| M-1 | MEDIUM | Non-numeric `ENVAULT_AUDIT_TTL_DAYS` | **FIXED** | Validates with try/except raising `ConfigurationError` |
+| M-2 | MEDIUM | S3 key from basename only (collisions) | **FIXED** | Content-addressed keys with SHA256 prefix |
+| M-3 | MEDIUM | `date-index` returns CURRENT records | **FIXED** | Filters on `SK.begins_with(EVENT_PREFIX)` |
+| M-4 | MEDIUM | Broad `except Exception` in rotate-key | **FIXED** | Now catches `(EnvaultError, ClientError, BotoCoreError)` |
+| M-5 | MEDIUM | Tag inputs not validated | **FIXED** | Validates keys with regex, values with length limit |
+| M-6 | MEDIUM | Actions pinned by floating tag | **FIXED** | All actions pinned to commit SHAs |
+| M-7 | MEDIUM | Empty `version_id` downloads latest | **OPEN** | Still falls back silently |
+| M-8 | MEDIUM | S3 upload integrity not verified | **OPEN** | See current M-6 |
 
 ---
 
 ## Summary Table
 
-| ID | Severity | File | Finding |
-|----|----------|------|---------|
-| C-1 | CRITICAL | `cli.py:411` | `migrate` hashes file path, not content — migrated records are unresolvable |
-| C-2 | CRITICAL | `cli.py:486` | Plaintext written to predictable world-readable `/tmp` during key rotation |
-| C-3 | CRITICAL | `code/encrypt.sh:5-9`, `decrypt.sh:5-9` | Unrestricted `.env` sourcing leaks all credentials to subprocesses |
-| C-4 | CRITICAL | `code/encrypt.sh:61`, `decrypt.sh:56` | Encryption scripts synced to production data bucket — supply-chain risk |
-| H-1 | HIGH | `cli.py:122-154`, `cli.py:199-216` | Non-atomic state transitions; S3/DynamoDB partial failures orphan data |
-| H-2 | HIGH | `cli.py:118`, `cli.py:196` | Deterministic `/tmp` paths enable TOCTOU/symlink attacks |
-| H-3 | HIGH | `state.py:135-141`, `state.py:153-160` | DynamoDB queries not paginated; rotate-key silently skips files at scale |
-| H-4 | HIGH | `crypto.py:148` | `DiscoveryAwsKmsMasterKeyProvider` unconstrained; no account/region filter |
-| H-5 | HIGH | `s3.py:34-47` | Version ID fetched in a separate `head_object` call — race condition |
-| M-1 | MEDIUM | `config.py:54` | Non-numeric `ENVAULT_AUDIT_TTL_DAYS` raises unhandled `ValueError` |
-| M-2 | MEDIUM | `s3.py:77` | S3 key from basename only; same-named files in different dirs collide |
-| M-3 | MEDIUM | `state.py:99`, `state.py:153-160` | `date-index` GSI returns CURRENT records alongside EVENT records |
-| M-4 | MEDIUM | `cli.py:385-387`, `cli.py:510-512` | Broad `except Exception` hides programming errors; rotation failures untracked |
-| M-5 | MEDIUM | `cli.py:528-536` | Tag key/value inputs not length or character validated |
-| M-6 | MEDIUM | `ci.yml` | GitHub Actions pinned by floating tag, not commit SHA |
-| M-7 | MEDIUM | `s3.py:60-61` | Empty `version_id` silently downloads latest S3 version |
-| M-8 | MEDIUM | `s3.py:34-39` | S3 upload integrity not verified with a checksum algorithm |
-| L-1 | LOW | `state.py`, CDK | EVENT records inflate `state-index` GSI; CURRENT records not filtered |
-| L-2 | LOW | `config.py:53` | `ENVAULT_REGION` not validated against known region strings |
-| L-3 | LOW | `pyproject.toml:25-31` | Open-ended `>=` dependency constraints; no upper bound |
-| L-4 | LOW | CDK stack | S3 access logging not enabled |
-| L-5 | LOW | CDK stack, `state.py` | `tag-index` GSI defined but never used |
-| L-6 | LOW | `crypto.py:76` | File paths and KMS key IDs logged in structured output |
-| L-7 | LOW | `.pre-commit-config.yaml` | `detect-secrets` baseline file may be absent |
-| L-8 | LOW | `code/encrypt.sh:57` | Local file deletion not gated on verified S3 sync success |
+| ID | Severity | Component | Finding |
+|----|----------|-----------|---------|
+| C-1 | CRITICAL | `crypto.py:178-188` | Plaintext written to disk before checksum verification |
+| C-2 | CRITICAL | `crypto.py:87-92, 172-176` | No streaming; entire file buffered in memory |
+| C-3 | CRITICAL | `tests/` | Zero test coverage on critical integrity checks |
+| H-1 | HIGH | `cli.py:253` | Path traversal via `file_name` from DynamoDB |
+| H-2 | HIGH | `cli.py:650-653` | Symlink traversal in `_collect_files` |
+| H-3 | HIGH | `crypto.py:95-97, 179-181` | File permissions race (chmod after write) |
+| H-4 | HIGH | `crypto.py:54-57` | `encrypt_file` retry includes non-retryable exceptions |
+| H-5 | HIGH | `publish.yml` | Missing top-level `permissions` restriction |
+| H-6 | HIGH | `publish.yml:3-6` | PyPI publish has no CI quality gate |
+| H-7 | HIGH | `code/decrypt.conf:2` | Shell variable not expanded by aws-encryption-cli |
+| H-8 | HIGH | `cli.py:143-161, 250-268` | Temp file cleanup on failure is untested |
+| M-1 | MEDIUM | `cli.py:116-119` | Broad `except Exception` hides programming errors |
+| M-2 | MEDIUM | `cli.py:302, 356` | SHA256 validation inconsistent across commands |
+| M-3 | MEDIUM | `cli.py:676-696` | `_best_effort_delete` allocates full file size in memory |
+| M-4 | MEDIUM | `cli.py:234, 556` | No format validation on `--allowed-account-ids` |
+| M-5 | MEDIUM | `exceptions.py:41-44` | Encryption context leaked in error message |
+| M-6 | MEDIUM | `s3.py:42-47` | S3 upload missing checksum verification |
+| M-7 | MEDIUM | `.pre-commit-config.yaml:6` | `.secrets.baseline` non-functional |
+| M-8 | MEDIUM | `cli.py:137-157` | TOCTOU between hash computation and encryption |
+| M-9 | MEDIUM | `ci.yml` | No dependency vulnerability scanning |
+| M-10 | MEDIUM | `infra/cdk/requirements.txt` | Open-ended version constraints |
+| L-1 | LOW | CDK stack | S3 bucket missing `bucket_key_enabled` |
+| L-2 | LOW | CDK stack | No MFA Delete on versioned S3 bucket |
+| L-3 | LOW | CDK stack | Hardcoded resource names prevent multi-env |
+| L-4 | LOW | CDK stack | GSI projections use `ALL` |
+| L-5 | LOW | `s3.py:42-47` | S3 upload doesn't specify `SSEKMSKeyId` |
+| L-6 | LOW | `ci.yml:73-76` | Fake credentials at job level |
+| L-7 | LOW | Missing | No `CODEOWNERS` for security-critical paths |
 
 ---
 
-## Recommended Remediation Order
+## Remediation Priority
 
-### Immediate (before any production workload)
+### Block Release — Before Production
 
-1. **C-1** — Fix or remove `migrate`. If the original plaintext files are accessible, re-implement to read content and compute the actual SHA256.
-2. **C-2** — Replace manual `/tmp` paths with `tempfile.mkstemp()` throughout `cli.py`; zero-overwrite plaintext temp files before unlinking.
-3. **C-3** — Remove unrestricted `.env` sourcing from shell scripts; export only validated, named variables.
-4. **C-4** — Remove code-sync lines from `encrypt.sh` and `decrypt.sh`.
-5. **H-3** — Implement DynamoDB query pagination in `state.py` before deploying `rotate-key` against any non-trivial dataset.
+| # | ID | Effort | Description |
+|---|-----|--------|-------------|
+| 1 | C-1 | 1h | Verify checksum in memory before writing plaintext to disk |
+| 2 | H-1 | 15m | Sanitize `record.file_name` in decrypt output path |
+| 3 | H-2 | 15m | Skip symlinks in `_collect_files` |
+| 4 | H-3 | 30m | Atomic file creation with `os.open()` and `0o600` |
+| 5 | H-5 | 5m | Add `permissions: read-all` to `publish.yml` |
+| 6 | H-6 | 30m | Gate PyPI publish on CI passing |
+| 7 | M-1 | 10m | Narrow `except Exception` to specific types |
+| 8 | M-5 | 10m | Remove encryption context from error messages |
 
-### Short-term (next release)
+### Next Release
 
-6. **H-1** — Add compensating-transaction logic or DynamoDB conditional writes to enforce consistent state.
-7. **H-2** — Switch to `tempfile.mkstemp()` to eliminate TOCTOU.
-8. **H-4** — Add `DiscoveryFilter` with account ID and partition to `decrypt_file`.
-9. **H-5** — Replace `upload_file` + `head_object` with `put_object` which returns `VersionId` atomically.
-10. **M-2** — Include SHA256 hash in S3 object key to avoid filename collisions.
-11. **M-3** — Add `FilterExpression` to `list_events_by_date` to exclude CURRENT records.
-12. **M-6** — Pin all GitHub Actions to specific commit SHAs.
+| # | ID | Effort | Description |
+|---|-----|--------|-------------|
+| 9 | C-2 | 4h | Switch to streaming encrypt/decrypt API |
+| 10 | C-3 | 8h | Add test coverage for all integrity checks and CLI flows |
+| 11 | H-4 | 10m | Add `retry_if_not_exception_type` to encrypt retry |
+| 12 | H-8 | 2h | Add tests for temp file cleanup on failure paths |
+| 13 | M-2 | 30m | Unify SHA256 validation across all commands |
+| 14 | M-3 | 15m | Chunk zero-overwrite in `_best_effort_delete` |
+| 15 | M-4 | 15m | Validate account ID format |
+| 16 | M-6 | 10m | Add `ChecksumAlgorithm` to S3 upload |
+| 17 | M-7 | 15m | Fix detect-secrets baseline |
+| 18 | M-9 | 30m | Add `pip-audit` to CI |
 
-### Medium-term
+### Hardening
 
-13. **M-1**, **M-4**, **M-5**, **M-7**, **M-8** — Input validation, exception specificity, upload integrity verification.
-14. **L-3**, **L-4**, **L-5** — Dependency upper-bound pinning, S3 access logging, remove unused GSI.
+| # | ID | Effort | Description |
+|---|-----|--------|-------------|
+| 19 | L-1 | 5m | Enable S3 Bucket Keys |
+| 20 | L-7 | 10m | Add CODEOWNERS |
+| 21 | M-10 | 10m | Add upper bounds to CDK requirements |
+| 22 | L-2 | 30m | Document/enable MFA Delete post-deploy |
+| 23 | L-5 | 10m | Pass KMS key ID to S3 `put_object` |
+
+---
+
+## Compliance Assessment
+
+| Framework | Assessment |
+|-----------|------------|
+| **SOC 2 (CC6.1, CC6.7)** | Strong. Encryption at rest (CMK) and in transit (TLS enforced). Access logging provides audit. Gap: no CloudTrail data events for object-level auditing. |
+| **PCI-DSS (Req 3, 7, 10)** | Partially met. Encryption and access control are solid. Req 10 needs CloudTrail data events. MFA Delete recommended for Req 3. |
+| **HIPAA (164.312)** | Partially met. Encryption and access controls strong. Object Lock (WORM) would strengthen PHI storage compliance. |
+
+---
+
+## Verdict
+
+The cryptographic foundations are sound and the prior audit remediations are solid. The critical gap is the **decrypt path** — plaintext hits disk before integrity verification, and this entire flow is untested. Items 1-8 above (Block Release) are release blockers. After those fixes plus test coverage (items 9-12), this codebase meets production-grade security standards for a client-side encryption tool.
 
 ---
 

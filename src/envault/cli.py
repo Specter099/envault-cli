@@ -113,7 +113,7 @@ def encrypt(
             console.print(
                 f"[yellow]⏭[/yellow] {file_path.name} already ENCRYPTED (use --force to re-encrypt)"
             )
-        except Exception as exc:
+        except (EnvaultError, ClientError, BotoCoreError) as exc:
             console.print(f"[red]✗[/red] {file_path.name}: {exc}")
             logger.exception("Failed to encrypt %s", file_path)
             errors += 1
@@ -250,7 +250,10 @@ def decrypt(
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
     os.close(_fd)
     tmp_encrypted = Path(_tmp)
-    output_path = (output if output.is_dir() else output.parent) / record.file_name
+    safe_name = Path(record.file_name).name
+    if not safe_name or safe_name.startswith("."):
+        safe_name = f"decrypted_{sha256_hash[:16]}"
+    output_path = (output if output.is_dir() else output.parent) / safe_name
 
     try:
         s3.download_file(
@@ -648,9 +651,11 @@ _TAG_VALUE_MAX_LEN = 256
 
 
 def _collect_files(path: Path) -> list[Path]:
+    if path.is_symlink():
+        return []
     if path.is_file():
         return [path]
-    return [p for p in path.rglob("*") if p.is_file()]
+    return [p for p in path.rglob("*") if p.is_file() and not p.is_symlink()]
 
 
 def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
