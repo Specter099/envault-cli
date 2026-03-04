@@ -97,7 +97,7 @@ def encrypt(
     config = Config(key_id=key_id, bucket=bucket, table_name=table, region=region)
     tags = _parse_tags(tag)
     store = StateStore(table_name=table, region=region)
-    s3 = S3Store(bucket=bucket, region=region)
+    s3 = S3Store(bucket=bucket, region=region, kms_key_id=key_id)
     correlation_id = str(uuid.uuid4())
 
     files = _collect_files(input_path)
@@ -545,7 +545,7 @@ def rotate_key(
     uploads back to S3, and updates DynamoDB state.
     """
     store = StateStore(table_name=table, region=region)
-    s3 = S3Store(bucket=bucket, region=region)
+    s3 = S3Store(bucket=bucket, region=region, kms_key_id=new_key_id)
     correlation_id = str(uuid.uuid4())
     account_ids = _validate_account_ids(allowed_account_ids)
 

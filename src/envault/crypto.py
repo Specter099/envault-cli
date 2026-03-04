@@ -7,6 +7,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, BinaryIO
 
 import aws_encryption_sdk
 from aws_encryption_sdk import (
@@ -19,6 +20,8 @@ from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wai
 from envault.exceptions import ChecksumMismatchError, ConfigurationError
 
 logger = logging.getLogger(__name__)
+
+_CHUNK_SIZE = 65536
 
 
 @dataclass
@@ -42,11 +45,32 @@ class DecryptResult:
     encryption_context: dict[str, str]
 
 
+class _HashingReader:
+    """File wrapper that computes SHA256 as data is read through it."""
+
+    def __init__(self, file_obj: BinaryIO) -> None:
+        self._file = file_obj
+        self._hasher = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._file.read(size)
+        if data:
+            self._hasher.update(data)
+        return data
+
+    @property
+    def hexdigest(self) -> str:
+        return self._hasher.hexdigest()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._file, name)
+
+
 def sha256_file(path: Path) -> str:
     """Compute SHA256 hash of a file's contents."""
     h = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
+        for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -63,7 +87,12 @@ def encrypt_file(
     output_path: Path,
     region: str = "us-east-1",
 ) -> EncryptResult:
-    """Encrypt a file using AWS KMS envelope encryption.
+    """Encrypt a file using AWS KMS envelope encryption (streaming).
+
+    Uses streaming mode to avoid holding the full plaintext or ciphertext
+    in memory. SHA256 is computed incrementally as data flows through the
+    encryption stream, eliminating the TOCTOU window between hashing and
+    encrypting.
 
     The plaintext never leaves this machine — only the data encryption key (DEK)
     is sent to KMS for wrapping. The file is encrypted locally with AES-256-GCM.
@@ -78,7 +107,6 @@ def encrypt_file(
     Returns:
         EncryptResult with hash, size, algorithm, and message_id.
     """
-    sha256_hash = sha256_file(input_path)
     file_size = input_path.stat().st_size
 
     logger.info("Encrypting file", extra={"input": str(input_path), "key_id": key_id})
@@ -88,17 +116,27 @@ def encrypt_file(
     )
     key_provider = StrictAwsKmsMasterKeyProvider(key_ids=[key_id])
 
-    with input_path.open("rb") as plaintext_file:
-        ciphertext, header = client.encrypt(
-            source=plaintext_file,
-            key_provider=key_provider,
-            encryption_context=encryption_context,
-        )
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as out:
-        out.write(ciphertext)
+
+    with input_path.open("rb") as raw_input:
+        hashing_reader = _HashingReader(raw_input)
+        with client.stream(
+            source=hashing_reader,
+            mode="e",
+            key_provider=key_provider,
+            encryption_context=encryption_context,
+            frame_length=4096,
+        ) as encryptor:
+            with os.fdopen(fd, "wb") as out:
+                while True:
+                    chunk = encryptor.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            header = encryptor.header
+
+    sha256_hash = hashing_reader.hexdigest
 
     algorithm = (
         header.algorithm.name if hasattr(header.algorithm, "name") else str(header.algorithm)
@@ -138,13 +176,18 @@ def decrypt_file(
     region: str = "us-east-1",
     allowed_account_ids: list[str] | None = None,
 ) -> DecryptResult:
-    """Decrypt a file using AWS KMS.
+    """Decrypt a file using AWS KMS (streaming).
+
+    Uses streaming mode to avoid holding the full plaintext in memory.
+    SHA256 is computed incrementally as decrypted data is written to disk.
+    On checksum mismatch the partially-written output is deleted.
 
     Args:
         input_path: Path to the encrypted file.
         output_path: Destination path for the decrypted plaintext.
         expected_sha256: If provided, verifies the checksum after decryption.
         region: AWS region where the KMS key lives.
+        allowed_account_ids: AWS account IDs trusted to have encrypted the data.
 
     Returns:
         DecryptResult with hash and size of the decrypted file.
@@ -174,21 +217,33 @@ def decrypt_file(
     )
 
     with input_path.open("rb") as encrypted_file:
-        plaintext, header = client.decrypt(
+        with client.stream(
             source=encrypted_file,
+            mode="d",
             key_provider=key_provider,
-        )
+            max_encrypted_data_keys=1,
+        ) as decryptor:
+            enc_context = dict(decryptor.header.encryption_context)
 
-    actual_sha256 = hashlib.sha256(plaintext).hexdigest()
-    file_size = len(plaintext)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+            hasher = hashlib.sha256()
+            file_size = 0
+            with os.fdopen(fd, "wb") as out:
+                while True:
+                    chunk = decryptor.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    out.write(chunk)
+                    file_size += len(chunk)
+
+    actual_sha256 = hasher.hexdigest()
 
     if expected_sha256 and actual_sha256 != expected_sha256:
+        output_path.unlink(missing_ok=True)
         raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as out:
-        out.write(plaintext)
 
     logger.info(
         "Decryption complete",
@@ -199,5 +254,5 @@ def decrypt_file(
         sha256_hash=actual_sha256,
         file_size_bytes=file_size,
         output_path=output_path,
-        encryption_context=dict(header.encryption_context),
+        encryption_context=enc_context,
     )

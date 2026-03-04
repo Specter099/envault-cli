@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 class S3Store:
     """Handles upload and download of encrypted files to/from S3."""
 
-    def __init__(self, bucket: str, region: str = "us-east-1") -> None:
+    def __init__(self, bucket: str, region: str = "us-east-1", kms_key_id: str = "") -> None:
         self._bucket = bucket
         self._region = region
+        self._kms_key_id = kms_key_id
         self._s3 = boto3.client("s3", region_name=region)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
@@ -39,13 +40,23 @@ class S3Store:
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
-            response = self._s3.put_object(
-                Bucket=self._bucket,
-                Key=s3_key,
-                Body=f,
-                ServerSideEncryption="aws:kms",
-                ChecksumAlgorithm="SHA256",
-            )
+            if self._kms_key_id:
+                response = self._s3.put_object(
+                    Bucket=self._bucket,
+                    Key=s3_key,
+                    Body=f,
+                    ServerSideEncryption="aws:kms",
+                    SSEKMSKeyId=self._kms_key_id,
+                    ChecksumAlgorithm="SHA256",
+                )
+            else:
+                response = self._s3.put_object(
+                    Bucket=self._bucket,
+                    Key=s3_key,
+                    Body=f,
+                    ServerSideEncryption="aws:kms",
+                    ChecksumAlgorithm="SHA256",
+                )
         version_id: str = response.get("VersionId", "")
         logger.info(
             "Upload complete",
