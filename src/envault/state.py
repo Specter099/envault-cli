@@ -207,10 +207,13 @@ class StateStore:
             state: The state to filter by (e.g. ENCRYPTED, DECRYPTED).
             max_items: Maximum items to return. 0 means no limit.
         """
+        from boto3.dynamodb.conditions import Attr
+
         items = self._paginate_query(
             max_items=max_items,
             IndexName="state-index",
             KeyConditionExpression=Key("current_state").eq(state),
+            FilterExpression=Attr("SK").eq(CURRENT),
         )
         return [_item_to_record(item) for item in items]
 
@@ -239,11 +242,14 @@ class StateStore:
         )
 
     def _count_by_state(self, state: str) -> int:
-        """Return count of records in a given state using Select=COUNT (no data transfer)."""
+        """Return count of CURRENT records in a given state via Select=COUNT."""
+        from boto3.dynamodb.conditions import Attr
+
         count = 0
         query_kwargs: dict[str, Any] = {
             "IndexName": "state-index",
             "KeyConditionExpression": Key("current_state").eq(state),
+            "FilterExpression": Attr("SK").eq(CURRENT),
             "Select": "COUNT",
         }
         while True:
@@ -255,15 +261,44 @@ class StateStore:
             query_kwargs["ExclusiveStartKey"] = last_key
         return count
 
+    def _latest_record_timestamp(self, state: str) -> str | None:
+        """Return the last_updated timestamp of the most recent CURRENT record in a state."""
+        from boto3.dynamodb.conditions import Attr
+
+        response = self._table.query(
+            IndexName="state-index",
+            KeyConditionExpression=Key("current_state").eq(state),
+            FilterExpression=Attr("SK").eq(CURRENT),
+            ScanIndexForward=False,
+            Limit=1,
+        )
+        items = response.get("Items", [])
+        if not items:
+            return None
+        value = items[0].get("last_updated")
+        return str(value) if value is not None else None
+
     def summary(self) -> dict[str, Any]:
-        """Return aggregate counts for the dashboard."""
+        """Return aggregate counts and last activity timestamp for the dashboard."""
         encrypted_count = self._count_by_state(ENCRYPTED)
         decrypted_count = self._count_by_state(DECRYPTED)
+
+        # Find the most recent activity across both states
+        timestamps = [
+            ts
+            for ts in (
+                self._latest_record_timestamp(ENCRYPTED),
+                self._latest_record_timestamp(DECRYPTED),
+            )
+            if ts
+        ]
+        last_activity = max(timestamps) if timestamps else "\u2014"
+
         return {
             "total": encrypted_count + decrypted_count,
             "encrypted": encrypted_count,
             "decrypted": decrypted_count,
-            "last_activity": "\u2014",
+            "last_activity": last_activity,
         }
 
 
