@@ -23,6 +23,7 @@ from envault.config import Config
 from envault.crypto import decrypt_file, encrypt_file
 from envault.exceptions import (
     AlreadyEncryptedError,
+    ChecksumMismatchError,
     ConfigurationError,
     EncryptionContextMismatchError,
     EnvaultError,
@@ -275,15 +276,44 @@ def decrypt(
             region=region,
             allowed_account_ids=account_ids or None,
         )
+
+        _verify_encryption_context(
+            expected=record.encryption_context, actual=result.encryption_context
+        )
+    except EncryptionContextMismatchError:
+        output_path.unlink(missing_ok=True)
+        console.print(
+            "[bold red]Decryption failed:[/bold red] encryption context mismatch.\n"
+            "The ciphertext metadata does not match the record in DynamoDB.\n"
+            "This could mean the encrypted file in S3 was replaced or corrupted.\n"
+            f"  File: {record.file_name}  SHA256: {sha256_hash[:16]}..."
+        )
+        sys.exit(1)
+    except ChecksumMismatchError as exc:
+        console.print(
+            "[bold red]Decryption failed:[/bold red] checksum mismatch.\n"
+            f"Expected SHA256 {exc.expected[:16]}... but got {exc.actual[:16]}...\n"
+            "The decrypted content does not match the original file.\n"
+            "The encrypted data in S3 may have been corrupted or tampered with."
+        )
+        sys.exit(1)
+    except ConfigurationError as exc:
+        console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        sys.exit(1)
+    except (ClientError, BotoCoreError) as exc:
+        error_msg = str(exc)
+        if isinstance(exc, ClientError):
+            error_msg = exc.response.get("Error", {}).get("Message", str(exc))
+        console.print(
+            f"[bold red]AWS error during decryption:[/bold red] {error_msg}\n"
+            f"  File: {record.file_name}  S3: {record.s3_key}"
+        )
+        sys.exit(1)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Decryption error:[/bold red] {exc}")
+        sys.exit(1)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
-
-    if result.encryption_context != record.encryption_context:
-        output_path.unlink(missing_ok=True)
-        raise EncryptionContextMismatchError(
-            expected=record.encryption_context,
-            actual=result.encryption_context,
-        )
 
     original_last_updated = record.last_updated
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -615,12 +645,9 @@ def rotate_key(
             )
             tmp_dl.unlink(missing_ok=True)
 
-            if dec_result.encryption_context != record.encryption_context:
-                _best_effort_delete(tmp_pt)
-                raise EncryptionContextMismatchError(
-                    expected=record.encryption_context,
-                    actual=dec_result.encryption_context,
-                )
+            _verify_encryption_context(
+                expected=record.encryption_context, actual=dec_result.encryption_context
+            )
 
             new_ctx = {
                 "purpose": "envault-backup",
@@ -757,6 +784,27 @@ def _validate_account_ids(raw: str) -> list[str]:
             console.print(f"[red]Invalid AWS account ID: {account_id!r}. Must be 12 digits.[/red]")
             sys.exit(1)
     return account_ids
+
+
+def _verify_encryption_context(expected: dict[str, str], actual: dict[str, str]) -> None:
+    """Verify that all expected encryption context keys exist in the actual context.
+
+    The AWS Encryption SDK may add extra keys (e.g. ``aws-crypto-public-key``)
+    to the ciphertext header when using algorithms with key commitment.  These
+    SDK-managed keys are legitimate and should be ignored.  We only check that
+    every application-level key stored in DynamoDB is present and matches.
+
+    Raises:
+        EncryptionContextMismatchError: If any expected key is missing or has a
+            different value in the actual context.
+    """
+    mismatched: dict[str, tuple[str, str | None]] = {}
+    for key, expected_value in expected.items():
+        actual_value = actual.get(key)
+        if actual_value != expected_value:
+            mismatched[key] = (expected_value, actual_value)
+    if mismatched:
+        raise EncryptionContextMismatchError(expected=expected, actual=actual)
 
 
 def _collect_files(path: Path) -> list[Path]:

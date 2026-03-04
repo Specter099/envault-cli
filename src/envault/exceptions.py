@@ -28,7 +28,9 @@ class ChecksumMismatchError(EnvaultError):
         self.expected = expected
         self.actual = actual
         super().__init__(
-            f"Checksum mismatch after decryption: expected {expected[:16]}..., got {actual[:16]}..."
+            f"Checksum mismatch: expected SHA256 {expected[:16]}..., "
+            f"got {actual[:16]}... "
+            "The decrypted content does not match the original file."
         )
 
 
@@ -38,9 +40,12 @@ class EncryptionContextMismatchError(EnvaultError):
     def __init__(self, expected: dict[str, str], actual: dict[str, str]) -> None:
         self.expected = expected
         self.actual = actual
+        # Identify which application-level keys differ
+        diff_keys = [k for k in expected if actual.get(k) != expected[k]]
+        detail = ", ".join(diff_keys) if diff_keys else "unknown"
         super().__init__(
-            "Encryption context mismatch detected. "
-            "The ciphertext may have been tampered with or swapped."
+            f"Encryption context mismatch on key(s): {detail}. "
+            "The encrypted file in S3 does not match the record in DynamoDB."
         )
 
 

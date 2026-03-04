@@ -8,6 +8,7 @@ from unittest.mock import patch
 import boto3
 import click
 import pytest
+from botocore.exceptions import ClientError
 from click.testing import CliRunner
 from moto import mock_aws
 
@@ -485,9 +486,143 @@ def test_decrypt_encryption_context_mismatch(tmp_path: Path):
         )
 
     assert result.exit_code != 0
+    assert "encryption context mismatch" in result.output.lower()
     # Output file should have been cleaned up
     decrypted_files = list(tmp_path.glob("test.txt"))
     assert not decrypted_files or not decrypted_files[0].exists()
+
+
+@mock_aws
+def test_decrypt_succeeds_with_sdk_extra_keys(tmp_path: Path):
+    """decrypt must pass when ciphertext has extra SDK-added keys like aws-crypto-public-key."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    def _mock_decrypt_with_extra_keys(
+        input_path, output_path, expected_sha256=None, region="us-east-1", allowed_account_ids=None
+    ):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"decrypted content")
+        return DecryptResult(
+            sha256_hash=FAKE_SHA,
+            file_size_bytes=17,
+            output_path=output_path,
+            encryption_context={
+                "purpose": "envault-backup",
+                "sha256": FAKE_SHA,
+                "file_name": "test.txt",
+                "kms_key_alias": KEY_ID,
+                # SDK-added key — must NOT cause mismatch
+                "aws-crypto-public-key": "A4f3example...",
+            },
+        )
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_with_extra_keys):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "decrypted" in result.output.lower() or "✓" in result.output
+
+
+@mock_aws
+def test_decrypt_checksum_mismatch_shows_friendly_message(tmp_path: Path):
+    """decrypt surfaces ChecksumMismatchError as a human-readable message, not a traceback."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    _upload_fake_ciphertext(record.s3_key)
+
+    runner = CliRunner()
+    with patch(
+        "envault.cli.decrypt_file",
+        side_effect=ChecksumMismatchError(expected="aaa", actual="bbb"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code != 0
+    assert "checksum mismatch" in result.output.lower()
+    # Should NOT show a Python traceback
+    assert "Traceback" not in result.output
+
+
+@mock_aws
+def test_decrypt_aws_error_shows_friendly_message(tmp_path: Path):
+    """decrypt surfaces AWS ClientError as a human-readable message, not a traceback."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    _upload_fake_ciphertext(record.s3_key)
+
+    error_response = {"Error": {"Code": "AccessDenied", "Message": "Access Denied to KMS key"}}
+    runner = CliRunner()
+    with patch(
+        "envault.cli.decrypt_file",
+        side_effect=ClientError(error_response, "Decrypt"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code != 0
+    assert "aws error" in result.output.lower()
+    assert "Access Denied" in result.output
+    assert "Traceback" not in result.output
 
 
 @mock_aws
