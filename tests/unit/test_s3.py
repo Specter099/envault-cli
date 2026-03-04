@@ -132,3 +132,44 @@ def test_s3_key_sanitize_preserves_safe_names():
 
     key = store.s3_key_for_file(sha256_hash=sha, file_name="my-file_v2.tar.gz")
     assert "my-file_v2.tar.gz.encrypted" in key
+
+
+@mock_aws
+def test_upload_passes_sse_kms_key_id(tmp_path: Path):
+    """upload_file must pass SSEKMSKeyId when kms_key_id is configured."""
+    from unittest.mock import patch
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+
+    p = tmp_path / "file.enc"
+    p.write_bytes(b"ciphertext")
+
+    kms_key = "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
+    store = S3Store(bucket=BUCKET, region=REGION, kms_key_id=kms_key)
+
+    with patch.object(store._s3, "put_object", wraps=store._s3.put_object) as mock_put:
+        store.upload_file(local_path=p, s3_key="encrypted/aa/aaa.../file.enc")
+        mock_put.assert_called_once()
+        call_kwargs = mock_put.call_args.kwargs
+        assert call_kwargs.get("SSEKMSKeyId") == kms_key
+
+
+@mock_aws
+def test_upload_without_kms_key_id_omits_sse(tmp_path: Path):
+    """upload_file without kms_key_id must not pass SSEKMSKeyId."""
+    from unittest.mock import patch
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+
+    p = tmp_path / "file.enc"
+    p.write_bytes(b"ciphertext")
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+
+    with patch.object(store._s3, "put_object", wraps=store._s3.put_object) as mock_put:
+        store.upload_file(local_path=p, s3_key="encrypted/aa/aaa.../file.enc")
+        mock_put.assert_called_once()
+        call_kwargs = mock_put.call_args.kwargs
+        assert "SSEKMSKeyId" not in call_kwargs

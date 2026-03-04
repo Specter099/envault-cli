@@ -30,6 +30,30 @@ class EnvaultStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         # ------------------------------------------------------------------ #
+        # Parameters                                                            #
+        # ------------------------------------------------------------------ #
+        table_name_param = cdk.CfnParameter(
+            self,
+            "TableNameParam",
+            type="String",
+            default="envault-state",
+            description="Name for the DynamoDB state table.",
+            allowed_pattern=r"[a-zA-Z0-9_.\-]+",
+            min_length=3,
+            max_length=255,
+        )
+        policy_name_param = cdk.CfnParameter(
+            self,
+            "PolicyNameParam",
+            type="String",
+            default="EnvaultUserPolicy",
+            description="Name for the IAM managed policy.",
+            allowed_pattern=r"[\w+=,.@\-]+",
+            min_length=1,
+            max_length=128,
+        )
+
+        # ------------------------------------------------------------------ #
         # KMS Customer Managed Key                                             #
         # ------------------------------------------------------------------ #
         encryption_key = kms.Key(
@@ -72,6 +96,7 @@ class EnvaultStack(Stack):
             versioned=True,
             encryption=s3.BucketEncryption.KMS,
             encryption_key=encryption_key,
+            bucket_key_enabled=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
             server_access_logs_bucket=access_logs_bucket,
@@ -96,7 +121,7 @@ class EnvaultStack(Stack):
         table = dynamodb.Table(
             self,
             "EnvaultStateTable",
-            table_name="envault-state",
+            table_name=table_name_param.value_as_string,
             partition_key=dynamodb.Attribute(name="PK", type=dynamodb.AttributeType.STRING),
             sort_key=dynamodb.Attribute(name="SK", type=dynamodb.AttributeType.STRING),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -110,7 +135,9 @@ class EnvaultStack(Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
-        # GSI: query all files in a given state
+        # GSI: query all files in a given state.
+        # Projection ALL is required: rotate-key reads all attributes from this index.
+        # Changing projection type would cause CloudFormation table replacement.
         table.add_global_secondary_index(
             index_name="state-index",
             partition_key=dynamodb.Attribute(name="current_state", type=dynamodb.AttributeType.STRING),
@@ -118,7 +145,10 @@ class EnvaultStack(Stack):
             projection_type=dynamodb.ProjectionType.ALL,
         )
 
-        # GSI: query all events on a given calendar date
+        # GSI: query all events on a given calendar date.
+        # Projection ALL kept to avoid CloudFormation table replacement on existing stacks.
+        # For new deployments, INCLUDE with [SK, file_name, sha256_hash, correlation_id,
+        # operation] would reduce storage and exposure surface.
         table.add_global_secondary_index(
             index_name="date-index",
             partition_key=dynamodb.Attribute(name="date", type=dynamodb.AttributeType.STRING),
@@ -132,7 +162,7 @@ class EnvaultStack(Stack):
         policy = iam.ManagedPolicy(
             self,
             "EnvaultUserPolicy",
-            managed_policy_name="EnvaultUserPolicy",
+            managed_policy_name=policy_name_param.value_as_string,
             description="Least-privilege access for envault CLI users",
             statements=[
                 iam.PolicyStatement(

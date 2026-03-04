@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from envault.crypto import DecryptResult, EncryptResult, sha256_file
+from envault.crypto import DecryptResult, EncryptResult, _HashingReader, sha256_file
 from envault.exceptions import ChecksumMismatchError
 
 
@@ -103,3 +103,53 @@ def test_checksum_mismatch_error():
     err = ChecksumMismatchError(expected="aaa", actual="bbb")
     assert "aaa" in str(err)
     assert "bbb" in str(err)
+
+
+# ---------------------------------------------------------------------------
+# _HashingReader tests
+# ---------------------------------------------------------------------------
+
+
+def test_hashing_reader_computes_sha256(tmp_path: Path):
+    """_HashingReader must produce correct SHA256 after multiple reads."""
+    content = b"hello world" * 100
+    p = tmp_path / "data.bin"
+    p.write_bytes(content)
+
+    with p.open("rb") as f:
+        reader = _HashingReader(f)
+        chunks = []
+        while True:
+            chunk = reader.read(64)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+    assert b"".join(chunks) == content
+    assert reader.hexdigest == hashlib.sha256(content).hexdigest()
+
+
+def test_hashing_reader_empty_read(tmp_path: Path):
+    """_HashingReader must handle empty files correctly."""
+    p = tmp_path / "empty.bin"
+    p.write_bytes(b"")
+
+    with p.open("rb") as f:
+        reader = _HashingReader(f)
+        data = reader.read()
+
+    assert data == b""
+    assert reader.hexdigest == hashlib.sha256(b"").hexdigest()
+
+
+def test_hashing_reader_delegates_attributes(tmp_path: Path):
+    """_HashingReader must delegate unknown attributes to the wrapped file."""
+    p = tmp_path / "test.bin"
+    p.write_bytes(b"some data")
+
+    with p.open("rb") as f:
+        reader = _HashingReader(f)
+        # .name is a file attribute, not defined on _HashingReader
+        assert reader.name == f.name
+        # .seekable() is a method on the file object
+        assert reader.seekable() == f.seekable()

@@ -1,0 +1,10 @@
+# Default code owners for all files
+* @Specter099
+
+# Infrastructure requires explicit review
+/infra/ @Specter099
+
+# Security-sensitive files
+/src/envault/crypto.py @Specter099
+/src/envault/config.py @Specter099
+/.github/workflows/ @Specter099
