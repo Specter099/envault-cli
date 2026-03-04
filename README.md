@@ -7,6 +7,8 @@ Client-side envelope encryption for files using AWS KMS, with DynamoDB state tra
 [![Python](https://img.shields.io/pypi/pyversions/envault-cli)](https://pypi.org/project/envault-cli/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
+> **Beta Software** — This project is under active development and is not yet recommended for production use. APIs, CLI flags, and storage formats may change between releases. Use at your own risk.
+
 ---
 
 ## How it works
@@ -37,13 +39,13 @@ export ENVAULT_BUCKET=my-encrypted-files-bucket
 export ENVAULT_TABLE=envault-state
 
 # Encrypt a file
-envault encrypt --input ./secret.txt --tag project=finance
+envault encrypt ./secret.txt --tag project=finance
 
 # Check state
 envault dashboard
 
-# Decrypt
-envault decrypt --input ./secret.txt.encrypted --output ./secret.txt
+# Decrypt by filename (or SHA256 hash)
+envault decrypt secret.txt -o ./
 ```
 
 ---
@@ -65,14 +67,14 @@ All config via environment variables — no config files with secrets.
 ## CLI reference
 
 ```bash
-# Encrypt a file and store in S3
-envault encrypt --input FILE [--key-id ALIAS] [--bucket BUCKET] [--tag KEY=VALUE]...
+# Encrypt a file (or directory) and store in S3
+envault encrypt INPUT_PATH [--tag KEY=VALUE]... [--force]
 
-# Decrypt from S3
-envault decrypt --input S3_KEY [--output PATH]
+# Decrypt by filename or SHA256 hash
+envault decrypt IDENTIFIER [-o OUTPUT_DIR] [--version N]
 
 # List all encrypted/decrypted files
-envault status --state [encrypted|decrypted]
+envault status [--state encrypted|decrypted|all]
 
 # Show state for a specific file
 envault status --file SHA256
@@ -84,10 +86,10 @@ envault audit [--since YYYY-MM-DD] [--file SHA256]
 envault dashboard
 
 # Re-encrypt all files with a new KMS key
-envault rotate-key --new-key-id alias/new-key
+envault rotate-key --new-key-id alias/new-key [--dry-run]
 
-# Migrate from legacy output.json
-envault migrate --from code/output.json [--dry-run]
+# Migrate from legacy output.json (NDJSON format)
+envault migrate FROM_PATH [--dry-run]
 ```
 
 ---
