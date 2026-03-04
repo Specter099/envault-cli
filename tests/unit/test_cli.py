@@ -7,7 +7,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from envault.cli import _parse_output_json_entry, _parse_tags, _secure_delete, main
+from envault.cli import _best_effort_delete, _parse_output_json_entry, _parse_tags, main
 
 
 def _make_entry(input_path: str) -> dict:
@@ -49,28 +49,45 @@ def test_parse_entry_skips_non_encrypt_mode():
     assert _parse_output_json_entry(entry) is None
 
 
-def test_secure_delete_overwrites_before_removal(tmp_path: Path):
-    """_secure_delete must zero-out file contents before unlinking."""
+def test_best_effort_delete_overwrites_before_removal(tmp_path: Path):
+    """_best_effort_delete must zero-out file contents before unlinking."""
     p = tmp_path / "sensitive.bin"
     p.write_bytes(b"TOP SECRET DATA")
     assert p.exists()
 
-    _secure_delete(p)
+    _best_effort_delete(p)
 
     assert not p.exists()
 
 
-def test_secure_delete_missing_file_is_noop(tmp_path: Path):
-    """_secure_delete on a non-existent path must not raise."""
+def test_best_effort_delete_missing_file_is_noop(tmp_path: Path):
+    """_best_effort_delete on a non-existent path must not raise."""
     p = tmp_path / "does_not_exist"
-    _secure_delete(p)  # should not raise
+    _best_effort_delete(p)  # should not raise
 
 
-def test_secure_delete_zero_length_file(tmp_path: Path):
+def test_best_effort_delete_zero_length_file(tmp_path: Path):
     p = tmp_path / "empty"
     p.write_bytes(b"")
-    _secure_delete(p)
+    _best_effort_delete(p)
     assert not p.exists()
+
+
+def test_best_effort_delete_logs_warning_on_oserror(tmp_path: Path, caplog):
+    """_best_effort_delete must log a warning if overwrite fails with OSError."""
+    import logging
+    from unittest.mock import patch
+
+    p = tmp_path / "readonly.bin"
+    p.write_bytes(b"data")
+
+    with (
+        patch.object(Path, "open", side_effect=OSError("Permission denied")),
+        caplog.at_level(logging.WARNING, logger="envault.cli"),
+    ):
+        _best_effort_delete(p)
+
+    assert any("best-effort" in r.message.lower() for r in caplog.records)
 
 
 def test_parse_tags_valid():

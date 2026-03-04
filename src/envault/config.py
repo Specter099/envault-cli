@@ -16,9 +16,21 @@ class Config:
     bucket: str
     table_name: str
     region: str
-    encryption_context: dict[str, str] = field(default_factory=lambda: {"purpose": "backup"})
     audit_ttl_days: int = 365
     allowed_account_ids: list[str] = field(default_factory=list)
+
+    def build_encryption_context(self, sha256_hash: str, file_name: str) -> dict[str, str]:
+        """Build per-file encryption context bound to the ciphertext as AAD.
+
+        Returns a dict that is unique per file, preventing cross-file
+        ciphertext substitution attacks.
+        """
+        return {
+            "purpose": "envault-backup",
+            "sha256": sha256_hash,
+            "file_name": file_name,
+            "kms_key_alias": self.key_id,
+        }
 
     @classmethod
     def from_env(cls) -> Config:

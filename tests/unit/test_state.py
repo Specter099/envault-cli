@@ -8,6 +8,7 @@ from unittest.mock import patch
 import boto3
 from moto import mock_aws
 
+from envault.exceptions import StateConflictError
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
 TABLE = "envault-test-state"
@@ -129,12 +130,16 @@ def test_put_current_state_upserts():
     record = _make_record()
     store.put_current_state(record)
 
-    record.current_state = DECRYPTED
-    store.put_current_state(record)
-
     fetched = store.get_current_state(record.sha256_hash)
     assert fetched is not None
-    assert fetched.current_state == DECRYPTED
+    original_last_updated = fetched.last_updated
+
+    record.current_state = DECRYPTED
+    store.put_current_state(record, expected_last_updated=original_last_updated)
+
+    fetched2 = store.get_current_state(record.sha256_hash)
+    assert fetched2 is not None
+    assert fetched2.current_state == DECRYPTED
 
 
 @mock_aws
@@ -266,3 +271,43 @@ def test_list_events_by_date_excludes_current_records():
     sks = [e.get("SK", "") for e in events]
     assert all(sk.startswith("EVENT#") for sk in sks), f"Found non-EVENT records: {sks}"
     assert len(events) >= 1
+
+
+@mock_aws
+def test_put_current_state_conflict_raises():
+    """Updating with wrong expected_last_updated must raise StateConflictError."""
+    import pytest
+
+    store = _create_table()
+    record = _make_record()
+    store.put_current_state(record)
+
+    record.current_state = DECRYPTED
+    with pytest.raises(StateConflictError, match="Concurrent modification"):
+        store.put_current_state(record, expected_last_updated="1970-01-01T00:00:00+00:00")
+
+
+@mock_aws
+def test_put_current_state_new_record_succeeds():
+    """A new record (no expected_last_updated) should succeed when no record exists."""
+    store = _create_table()
+    record = _make_record()
+    store.put_current_state(record)
+
+    fetched = store.get_current_state(record.sha256_hash)
+    assert fetched is not None
+    assert fetched.current_state == ENCRYPTED
+
+
+@mock_aws
+def test_put_current_state_fails_if_already_exists():
+    """A new record (no expected_last_updated) must fail if the PK already exists."""
+    import pytest
+
+    store = _create_table()
+    record = _make_record()
+    store.put_current_state(record)
+
+    record2 = _make_record()
+    with pytest.raises(StateConflictError, match="Concurrent modification"):
+        store.put_current_state(record2)

@@ -11,7 +11,10 @@ from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import Key
-from tenacity import retry, stop_after_attempt, wait_exponential
+from botocore.exceptions import ClientError
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
+
+from envault.exceptions import StateConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -102,15 +105,48 @@ class StateStore:
             query_kwargs["ExclusiveStartKey"] = last_key
         return items
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-    def put_current_state(self, record: FileRecord) -> None:
-        """Upsert the current state record for a file (PK=FILE#hash, SK=CURRENT)."""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_not_exception_type(StateConflictError),
+    )
+    def put_current_state(
+        self, record: FileRecord, expected_last_updated: str | None = None
+    ) -> None:
+        """Upsert the current state record for a file (PK=FILE#hash, SK=CURRENT).
+
+        Args:
+            record: The file record to write.
+            expected_last_updated: If provided, uses optimistic locking — the write
+                only succeeds if the existing record's last_updated matches. If None
+                and no record exists yet, uses attribute_not_exists to prevent
+                clobbering an existing record.
+        """
         record.last_updated = _now_iso()
         item = record.to_dynamo_item(sk=CURRENT)
         # Add GSI keys
         item["current_state"] = record.current_state
         item["date"] = _today_str()
-        self._table.put_item(Item=item)
+
+        put_kwargs: dict[str, Any] = {"Item": item}
+
+        if expected_last_updated is not None:
+            put_kwargs["ConditionExpression"] = "last_updated = :expected"
+            put_kwargs["ExpressionAttributeValues"] = {":expected": expected_last_updated}
+        else:
+            put_kwargs["ConditionExpression"] = "attribute_not_exists(PK)"
+
+        try:
+            self._table.put_item(**put_kwargs)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise StateConflictError(
+                    f"Concurrent modification detected for {record.sha256_hash[:16]}... "
+                    f"(expected last_updated={expected_last_updated!r}). "
+                    "Another process may have modified this record."
+                ) from exc
+            raise
+
         logger.debug(
             "put_current_state",
             extra={"sha256": record.sha256_hash[:16], "state": record.current_state},

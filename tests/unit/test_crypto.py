@@ -58,14 +58,45 @@ def test_encrypt_result_dataclass():
 
 
 def test_decrypt_result_dataclass():
+    ctx = {"purpose": "envault-backup", "sha256": "def456"}
     result = DecryptResult(
         sha256_hash="def456",
         file_size_bytes=2048,
         output_path=Path("/tmp/out.txt"),  # noqa: S108
+        encryption_context=ctx,
     )
     assert result.sha256_hash == "def456"
     assert result.file_size_bytes == 2048
     assert result.output_path == Path("/tmp/out.txt")  # noqa: S108
+    assert result.encryption_context == ctx
+
+
+def test_decrypt_file_requires_account_ids(tmp_path: Path):
+    """decrypt_file must raise ConfigurationError when allowed_account_ids is empty."""
+    import pytest
+
+    from envault.crypto import decrypt_file
+    from envault.exceptions import ConfigurationError
+
+    dummy_input = tmp_path / "dummy.enc"
+    dummy_input.write_bytes(b"fake ciphertext")
+    dummy_output = tmp_path / "out.txt"
+
+    with pytest.raises(ConfigurationError, match="allowed_account_ids"):
+        decrypt_file(
+            input_path=dummy_input,
+            output_path=dummy_output,
+            region="us-east-1",
+            allowed_account_ids=[],
+        )
+
+    with pytest.raises(ConfigurationError, match="allowed_account_ids"):
+        decrypt_file(
+            input_path=dummy_input,
+            output_path=dummy_output,
+            region="us-east-1",
+            allowed_account_ids=None,
+        )
 
 
 def test_checksum_mismatch_error():
