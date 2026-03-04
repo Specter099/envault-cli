@@ -324,3 +324,78 @@ def test_put_current_state_fails_if_already_exists():
     record2 = _make_record()
     with pytest.raises(StateConflictError, match="Concurrent modification"):
         store.put_current_state(record2)
+
+
+@mock_aws
+def test_paginate_query_respects_max_items():
+    """_paginate_query must stop after max_items even if more results exist."""
+    store = _create_table()
+    for i in range(5):
+        sha = f"{chr(ord('a') + i)}" * 64
+        r = _make_record(
+            sha256_hash=sha,
+            current_state=ENCRYPTED,
+            encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
+        )
+        store.put_current_state(r)
+
+    records = store.list_by_state(ENCRYPTED, max_items=3)
+    assert len(records) <= 3
+
+
+@mock_aws
+def test_summary_uses_count_query():
+    """summary() must return correct counts without loading all records."""
+    store = _create_table()
+    r1 = _make_record(
+        sha256_hash="d" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
+    )
+    r2 = _make_record(
+        sha256_hash="e" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
+    )
+    store.put_current_state(r1)
+    store.put_current_state(r2)
+
+    summary = store.summary()
+    assert summary["total"] == 2
+    assert summary["encrypted"] == 1
+    assert summary["decrypted"] == 1
+    assert summary["last_activity"] == "\u2014"
+
+
+@mock_aws
+def test_count_by_state_returns_correct_count():
+    """_count_by_state must count records without loading item data."""
+    store = _create_table()
+    for i in range(4):
+        sha = f"{chr(ord('a') + i)}" * 64
+        r = _make_record(
+            sha256_hash=sha,
+            current_state=ENCRYPTED,
+            encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
+        )
+        store.put_current_state(r)
+    r_dec = _make_record(
+        sha256_hash="z" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T15:00:00+00:00"
+    )
+    store.put_current_state(r_dec)
+
+    assert store._count_by_state(ENCRYPTED) == 4
+    assert store._count_by_state(DECRYPTED) == 1
+
+
+@mock_aws
+def test_list_by_state_max_items_zero_returns_all():
+    """list_by_state with max_items=0 (default) must return all records."""
+    store = _create_table()
+    for i in range(5):
+        sha = f"{chr(ord('a') + i)}" * 64
+        r = _make_record(
+            sha256_hash=sha,
+            current_state=ENCRYPTED,
+            encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
+        )
+        store.put_current_state(r)
+
+    records = store.list_by_state(ENCRYPTED)
+    assert len(records) == 5

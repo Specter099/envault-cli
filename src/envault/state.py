@@ -94,12 +94,18 @@ class StateStore:
         self._dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
         self._table = self._dynamodb.Table(table_name)
 
-    def _paginate_query(self, **query_kwargs: Any) -> list[dict[str, Any]]:
-        """Execute a DynamoDB Query, following LastEvaluatedKey until exhausted."""
+    def _paginate_query(self, max_items: int = 0, **query_kwargs: Any) -> list[dict[str, Any]]:
+        """Execute a DynamoDB Query, following LastEvaluatedKey until exhausted.
+
+        Args:
+            max_items: Maximum items to return. 0 means no limit.
+        """
         items: list[dict[str, Any]] = []
         while True:
             response = self._table.query(**query_kwargs)
             items.extend(response.get("Items", []))
+            if max_items and len(items) >= max_items:
+                return items[:max_items]
             last_key = response.get("LastEvaluatedKey")
             if not last_key:
                 break
@@ -183,9 +189,15 @@ class StateStore:
         return _item_to_record(item)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-    def list_by_state(self, state: str) -> list[FileRecord]:
-        """Return all files in a given state (uses state-index GSI)."""
+    def list_by_state(self, state: str, max_items: int = 0) -> list[FileRecord]:
+        """Return all files in a given state (uses state-index GSI).
+
+        Args:
+            state: The state to filter by (e.g. ENCRYPTED, DECRYPTED).
+            max_items: Maximum items to return. 0 means no limit.
+        """
         items = self._paginate_query(
+            max_items=max_items,
             IndexName="state-index",
             KeyConditionExpression=Key("current_state").eq(state),
         )
@@ -215,19 +227,32 @@ class StateStore:
             FilterExpression=Attr("SK").begins_with(EVENT_PREFIX),
         )
 
+    def _count_by_state(self, state: str) -> int:
+        """Return count of records in a given state using Select=COUNT (no data transfer)."""
+        count = 0
+        query_kwargs: dict[str, Any] = {
+            "IndexName": "state-index",
+            "KeyConditionExpression": Key("current_state").eq(state),
+            "Select": "COUNT",
+        }
+        while True:
+            response = self._table.query(**query_kwargs)
+            count += response.get("Count", 0)
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
+        return count
+
     def summary(self) -> dict[str, Any]:
         """Return aggregate counts for the dashboard."""
-        encrypted = self.list_by_state(ENCRYPTED)
-        decrypted = self.list_by_state(DECRYPTED)
-        last_activity = max(
-            (r.last_updated for r in encrypted + decrypted),
-            default="—",
-        )
+        encrypted_count = self._count_by_state(ENCRYPTED)
+        decrypted_count = self._count_by_state(DECRYPTED)
         return {
-            "total": len(encrypted) + len(decrypted),
-            "encrypted": len(encrypted),
-            "decrypted": len(decrypted),
-            "last_activity": last_activity,
+            "total": encrypted_count + decrypted_count,
+            "encrypted": encrypted_count,
+            "decrypted": decrypted_count,
+            "last_activity": "\u2014",
         }
 
 
