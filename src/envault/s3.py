@@ -23,6 +23,9 @@ class S3Store:
     def upload_file(self, local_path: Path, s3_key: str) -> str:
         """Upload a file to S3 and return the version ID.
 
+        Uses put_object to atomically retrieve the version ID from the response,
+        avoiding a TOCTOU race between upload_file + head_object.
+
         Args:
             local_path: Local path of the file to upload.
             s3_key: S3 object key (e.g. 'encrypted/secrets.xlsx.encrypted').
@@ -31,15 +34,14 @@ class S3Store:
             The S3 version ID of the uploaded object (requires bucket versioning).
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
-        self._s3.upload_file(
-            str(local_path),
-            self._bucket,
-            s3_key,
-            ExtraArgs={"ServerSideEncryption": "aws:kms"},
-        )
-        # Fetch the version ID from a head_object call (upload_file doesn't return it)
-        head = self._s3.head_object(Bucket=self._bucket, Key=s3_key)
-        version_id: str = head.get("VersionId", "")
+        with local_path.open("rb") as f:
+            response = self._s3.put_object(
+                Bucket=self._bucket,
+                Key=s3_key,
+                Body=f,
+                ServerSideEncryption="aws:kms",
+            )
+        version_id: str = response.get("VersionId", "")
         logger.info(
             "Upload complete",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
