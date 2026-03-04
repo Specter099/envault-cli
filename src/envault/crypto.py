@@ -205,7 +205,8 @@ def decrypt_file(
     logger.info("Decrypting file", extra={"input": str(input_path)})
 
     client = aws_encryption_sdk.EncryptionSDKClient(
-        commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT
+        commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT,
+        max_encrypted_data_keys=1,
     )
     from aws_encryption_sdk.key_providers.kms import DiscoveryFilter
 
@@ -221,7 +222,6 @@ def decrypt_file(
             source=encrypted_file,
             mode="d",
             key_provider=key_provider,
-            max_encrypted_data_keys=1,
         ) as decryptor:
             enc_context = dict(decryptor.header.encryption_context)
 
