@@ -85,7 +85,6 @@ class StateStore:
     GSIs:
       state-index: PK=current_state, SK=encrypted_at
       date-index:  PK=date, SK=last_updated
-      tag-index:   PK=tag_key, SK=tag_value
     """
 
     def __init__(self, table_name: str, region: str = "us-east-1") -> None:
@@ -94,12 +93,18 @@ class StateStore:
         self._dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
         self._table = self._dynamodb.Table(table_name)
 
-    def _paginate_query(self, **query_kwargs: Any) -> list[dict[str, Any]]:
-        """Execute a DynamoDB Query, following LastEvaluatedKey until exhausted."""
+    def _paginate_query(self, max_items: int = 0, **query_kwargs: Any) -> list[dict[str, Any]]:
+        """Execute a DynamoDB Query, following LastEvaluatedKey until exhausted.
+
+        Args:
+            max_items: Maximum items to return. 0 means no limit.
+        """
         items: list[dict[str, Any]] = []
         while True:
             response = self._table.query(**query_kwargs)
             items.extend(response.get("Items", []))
+            if max_items and len(items) >= max_items:
+                return items[:max_items]
             last_key = response.get("LastEvaluatedKey")
             if not last_key:
                 break
@@ -153,13 +158,25 @@ class StateStore:
             extra={"sha256": record.sha256_hash[:16], "state": record.current_state},
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def put_event(
         self, record: FileRecord, operation: str, correlation_id: str, audit_ttl_days: int = 365
     ) -> None:
         """Append an immutable event record to the audit trail."""
         now = _now_iso()
         unique_suffix = uuid.uuid4().hex[:8]
+        self._put_event_inner(record, operation, correlation_id, audit_ttl_days, now, unique_suffix)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def _put_event_inner(
+        self,
+        record: FileRecord,
+        operation: str,
+        correlation_id: str,
+        audit_ttl_days: int,
+        now: str,
+        unique_suffix: str,
+    ) -> None:
+        """Inner retry loop for put_event -- uses a fixed SK across retries."""
         sk = f"{EVENT_PREFIX}{now}#{operation}#{unique_suffix}"
         item = record.to_dynamo_item(sk=sk)
         item["operation"] = operation
@@ -183,9 +200,15 @@ class StateStore:
         return _item_to_record(item)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-    def list_by_state(self, state: str) -> list[FileRecord]:
-        """Return all files in a given state (uses state-index GSI)."""
+    def list_by_state(self, state: str, max_items: int = 0) -> list[FileRecord]:
+        """Return all files in a given state (uses state-index GSI).
+
+        Args:
+            state: The state to filter by (e.g. ENCRYPTED, DECRYPTED).
+            max_items: Maximum items to return. 0 means no limit.
+        """
         items = self._paginate_query(
+            max_items=max_items,
             IndexName="state-index",
             KeyConditionExpression=Key("current_state").eq(state),
         )
@@ -215,19 +238,32 @@ class StateStore:
             FilterExpression=Attr("SK").begins_with(EVENT_PREFIX),
         )
 
+    def _count_by_state(self, state: str) -> int:
+        """Return count of records in a given state using Select=COUNT (no data transfer)."""
+        count = 0
+        query_kwargs: dict[str, Any] = {
+            "IndexName": "state-index",
+            "KeyConditionExpression": Key("current_state").eq(state),
+            "Select": "COUNT",
+        }
+        while True:
+            response = self._table.query(**query_kwargs)
+            count += response.get("Count", 0)
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
+        return count
+
     def summary(self) -> dict[str, Any]:
         """Return aggregate counts for the dashboard."""
-        encrypted = self.list_by_state(ENCRYPTED)
-        decrypted = self.list_by_state(DECRYPTED)
-        last_activity = max(
-            (r.last_updated for r in encrypted + decrypted),
-            default="—",
-        )
+        encrypted_count = self._count_by_state(ENCRYPTED)
+        decrypted_count = self._count_by_state(DECRYPTED)
         return {
-            "total": len(encrypted) + len(decrypted),
-            "encrypted": len(encrypted),
-            "decrypted": len(decrypted),
-            "last_activity": last_activity,
+            "total": encrypted_count + decrypted_count,
+            "encrypted": encrypted_count,
+            "decrypted": decrypted_count,
+            "last_activity": "\u2014",
         }
 
 

@@ -8,10 +8,13 @@ from aws_cdk import (
     RemovalPolicy,
     Stack,
 )
+from aws_cdk import aws_cloudwatch as cloudwatch
+from aws_cdk import aws_cloudwatch_actions as cw_actions
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_sns as sns
 from cdk_nag import NagSuppressions
 from constructs import Construct
 
@@ -70,6 +73,18 @@ class EnvaultStack(Stack):
             target_key=encryption_key,
         )
 
+        # Deny key deletion for all principals — requires removing this
+        # policy statement first (break-glass procedure).
+        encryption_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyScheduleKeyDeletion",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["kms:ScheduleKeyDeletion", "kms:DisableKey"],
+                resources=["*"],
+            )
+        )
+
         # ------------------------------------------------------------------ #
         # S3 Access Logging Bucket                                              #
         # ------------------------------------------------------------------ #
@@ -103,14 +118,17 @@ class EnvaultStack(Stack):
             server_access_logs_prefix="envault-access-logs/",
             removal_policy=RemovalPolicy.RETAIN,
             lifecycle_rules=[
-                # Move old non-current versions to GLACIER after 90 days
+                # Move old non-current versions to GLACIER after 90 days,
+                # then expire after 365 days to prevent unbounded growth
+                # from key rotation creating new versions per file.
                 s3.LifecycleRule(
                     noncurrent_version_transitions=[
                         s3.NoncurrentVersionTransition(
                             storage_class=s3.StorageClass.GLACIER,
                             transition_after=Duration.days(90),
                         )
-                    ]
+                    ],
+                    noncurrent_version_expiration=Duration.days(365),
                 )
             ],
         )
@@ -223,6 +241,60 @@ class EnvaultStack(Stack):
                 },
             ],
         )
+
+        # ------------------------------------------------------------------ #
+        # Monitoring — SNS + CloudWatch Alarms                                #
+        # ------------------------------------------------------------------ #
+        ops_topic = sns.Topic(
+            self,
+            "EnvaultOpsTopic",
+            display_name="envault operational alerts",
+            enforce_ssl=True,
+        )
+
+        # DynamoDB throttle alarm
+        table.metric_throttled_requests_for_operation("PutItem").create_alarm(
+            self,
+            "DynamoThrottleAlarm",
+            alarm_name="envault-dynamodb-throttle",
+            evaluation_periods=1,
+            threshold=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(cw_actions.SnsAction(ops_topic))
+
+        # DynamoDB system errors — use a math expression over the four
+        # operations envault actually calls to stay within the 10-metric
+        # alarm limit imposed by CloudWatch.
+        sys_err_metrics: dict[str, cloudwatch.IMetric] = {}
+        for op in ("PutItem", "GetItem", "Query", "UpdateItem"):
+            sys_err_metrics[op.lower()] = cloudwatch.Metric(
+                namespace="AWS/DynamoDB",
+                metric_name="SystemErrors",
+                dimensions_map={
+                    "TableName": table.table_name,
+                    "Operation": op,
+                },
+                statistic="Sum",
+                period=Duration.minutes(5),
+            )
+        sys_err_expression = cloudwatch.MathExpression(
+            expression=" + ".join(sys_err_metrics.keys()),
+            using_metrics=sys_err_metrics,
+            label="DynamoDB SystemErrors (envault operations)",
+            period=Duration.minutes(5),
+        )
+        sys_err_expression.create_alarm(
+            self,
+            "DynamoSystemErrorAlarm",
+            alarm_name="envault-dynamodb-system-errors",
+            evaluation_periods=1,
+            threshold=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(cw_actions.SnsAction(ops_topic))
+
+        cdk.CfnOutput(self, "OpsTopicArn", value=ops_topic.topic_arn)
 
         # ------------------------------------------------------------------ #
         # CloudFormation Outputs                                               #

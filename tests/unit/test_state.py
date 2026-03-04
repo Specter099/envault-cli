@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from unittest.mock import patch
 
@@ -324,3 +325,112 @@ def test_put_current_state_fails_if_already_exists():
     record2 = _make_record()
     with pytest.raises(StateConflictError, match="Concurrent modification"):
         store.put_current_state(record2)
+
+
+@mock_aws
+def test_paginate_query_respects_max_items():
+    """_paginate_query must stop after max_items even if more results exist."""
+    store = _create_table()
+    for i in range(5):
+        sha = f"{chr(ord('a') + i)}" * 64
+        r = _make_record(
+            sha256_hash=sha,
+            current_state=ENCRYPTED,
+            encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
+        )
+        store.put_current_state(r)
+
+    records = store.list_by_state(ENCRYPTED, max_items=3)
+    assert len(records) <= 3
+
+
+@mock_aws
+def test_summary_uses_count_query():
+    """summary() must return correct counts without loading all records."""
+    store = _create_table()
+    r1 = _make_record(
+        sha256_hash="d" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
+    )
+    r2 = _make_record(
+        sha256_hash="e" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
+    )
+    store.put_current_state(r1)
+    store.put_current_state(r2)
+
+    summary = store.summary()
+    assert summary["total"] == 2
+    assert summary["encrypted"] == 1
+    assert summary["decrypted"] == 1
+    assert summary["last_activity"] == "\u2014"
+
+
+@mock_aws
+def test_count_by_state_returns_correct_count():
+    """_count_by_state must count records without loading item data."""
+    store = _create_table()
+    for i in range(4):
+        sha = f"{chr(ord('a') + i)}" * 64
+        r = _make_record(
+            sha256_hash=sha,
+            current_state=ENCRYPTED,
+            encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
+        )
+        store.put_current_state(r)
+    r_dec = _make_record(
+        sha256_hash="z" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T15:00:00+00:00"
+    )
+    store.put_current_state(r_dec)
+
+    assert store._count_by_state(ENCRYPTED) == 4
+    assert store._count_by_state(DECRYPTED) == 1
+
+
+@mock_aws
+def test_list_by_state_max_items_zero_returns_all():
+    """list_by_state with max_items=0 (default) must return all records."""
+    store = _create_table()
+    for i in range(5):
+        sha = f"{chr(ord('a') + i)}" * 64
+        r = _make_record(
+            sha256_hash=sha,
+            current_state=ENCRYPTED,
+            encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
+        )
+        store.put_current_state(r)
+
+    records = store.list_by_state(ENCRYPTED)
+    assert len(records) == 5
+
+
+@mock_aws
+def test_put_event_retry_is_idempotent():
+    """Retried put_event calls must produce the same SK (no duplicate events)."""
+    store = _create_table()
+    record = _make_record()
+
+    sks_seen: list[str] = []
+    original_put_item = store._table.put_item
+
+    def tracking_put_item(**kwargs):
+        item = kwargs.get("Item", {})
+        sk = item.get("SK", "")
+        if sk.startswith("EVENT#"):
+            sks_seen.append(sk)
+        return original_put_item(**kwargs)
+
+    call_count = 0
+
+    def flaky_put_item(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            tracking_put_item(**kwargs)
+            raise Exception("simulated network error after write")
+        return tracking_put_item(**kwargs)
+
+    with patch.object(store._table, "put_item", side_effect=flaky_put_item):
+        with contextlib.suppress(Exception):
+            store.put_event(record, operation="ENCRYPT", correlation_id="corr-idem")
+
+    if len(sks_seen) == 2:
+        assert sks_seen[0] == sks_seen[1], f"Retry used different SK: {sks_seen}"
