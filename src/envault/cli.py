@@ -69,6 +69,27 @@ def main(ctx: click.Context, verbose: bool) -> None:
         click.echo(ctx.get_help())
 
 
+# Descriptive hints for required positional arguments, keyed by argument name.
+_ARG_HINTS: dict[str, str] = {
+    "IDENTIFIER": "a SHA256 hash or filename",
+    "INPUT_PATH": "a file or directory to encrypt",
+    "FROM_PATH": "the path to output.json (NDJSON format)",
+}
+
+
+def _friendly_message(e: click.UsageError) -> str:
+    """Rewrite Click's generic error into a descriptive, human-readable message."""
+    msg = e.format_message()
+    # "Missing argument 'IDENTIFIER'." → descriptive version
+    m = re.match(r"Missing argument '(\w+)'\.", msg)
+    if m:
+        arg = m.group(1)
+        desc = _ARG_HINTS.get(arg, arg)
+        cmd = e.ctx.info_name if e.ctx else "command"
+        return f"The {cmd} command requires {desc}."
+    return msg
+
+
 def cli() -> None:
     """Entrypoint that wraps Click with human-readable error formatting."""
     try:
@@ -77,7 +98,7 @@ def cli() -> None:
         hint = ""
         if e.ctx:
             hint = f"\n  Run '{e.ctx.command_path} --help' for usage info."
-        console.print(f"{e.format_message()}{hint}")
+        console.print(f"{_friendly_message(e)}{hint}")
         sys.exit(2)
     except click.Abort:
         console.print("[yellow]Aborted.[/yellow]")
