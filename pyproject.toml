@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "envault-cli"
-version = "0.1.1"
+version = "0.1.2"
 description = "Client-side envelope encryption for files using AWS KMS, with DynamoDB state tracking"
 readme = "README.md"
 license = { text = "Apache-2.0" }
