@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 import boto3
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -42,23 +43,16 @@ class S3Store:
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
+            put_kwargs: dict[str, Any] = {
+                "Bucket": self._bucket,
+                "Key": s3_key,
+                "Body": f,
+                "ChecksumAlgorithm": "SHA256",
+            }
             if self._kms_key_id:
-                response = self._s3.put_object(
-                    Bucket=self._bucket,
-                    Key=s3_key,
-                    Body=f,
-                    ServerSideEncryption="aws:kms",
-                    SSEKMSKeyId=self._kms_key_id,
-                    ChecksumAlgorithm="SHA256",
-                )
-            else:
-                response = self._s3.put_object(
-                    Bucket=self._bucket,
-                    Key=s3_key,
-                    Body=f,
-                    ServerSideEncryption="aws:kms",
-                    ChecksumAlgorithm="SHA256",
-                )
+                put_kwargs["ServerSideEncryption"] = "aws:kms"
+                put_kwargs["SSEKMSKeyId"] = self._kms_key_id
+            response = self._s3.put_object(**put_kwargs)
         version_id: str = response.get("VersionId", "")
         logger.info(
             "Upload complete",
