@@ -87,9 +87,9 @@ def test_download_empty_version_id_logs_warning(tmp_path: Path, caplog):
     with caplog.at_level(logging.WARNING, logger="envault.s3"):
         store.download_file("encrypted/aa/aaa.../file.enc", out, version_id="")
 
-    assert any(
-        "version" in r.message.lower() for r in caplog.records
-    ), f"Expected a version warning, got: {[r.message for r in caplog.records]}"
+    assert any("version" in r.message.lower() for r in caplog.records), (
+        f"Expected a version warning, got: {[r.message for r in caplog.records]}"
+    )
 
 
 def test_s3_key_for_file_is_content_addressed():

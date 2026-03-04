@@ -454,9 +454,7 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
 
     plaintext_path = Path(input_path)
     if not plaintext_path.exists():
-        logger.warning(
-            "Plaintext file not found for migration, skipping: %s", input_path
-        )
+        logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
         return None
 
     sha256_hash = sha256_file(plaintext_path)
@@ -624,9 +622,7 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
                 "alphanumeric, underscore, or hyphen only."
             )
         if len(v) > _TAG_VALUE_MAX_LEN:
-            raise click.UsageError(
-                f"Tag value for {k!r} exceeds {_TAG_VALUE_MAX_LEN} characters."
-            )
+            raise click.UsageError(f"Tag value for {k!r} exceeds {_TAG_VALUE_MAX_LEN} characters.")
         tags[k] = v
     return tags
 

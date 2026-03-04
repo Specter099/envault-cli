@@ -18,9 +18,7 @@ def _make_entry(input_path: str) -> dict:
             "algorithm": "AES_256_GCM_HKDF_SHA512_COMMIT_KEY_ECDSA_P384",
             "message_id": "abcd1234",
             "encryption_context": {"purpose": "backup"},
-            "encrypted_data_keys": [
-                {"key_provider": {"key_info": "alias/envault"}}
-            ],
+            "encrypted_data_keys": [{"key_provider": {"key_info": "alias/envault"}}],
         },
     }
 
@@ -113,8 +111,10 @@ def test_decrypt_rejects_invalid_sha256_format():
         [
             "decrypt",
             "not-a-valid-hash",
-            "--table", "t",
-            "--bucket", "b",
+            "--table",
+            "t",
+            "--bucket",
+            "b",
         ],
         env={
             "AWS_ACCESS_KEY_ID": "testing",

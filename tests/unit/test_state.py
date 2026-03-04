@@ -258,6 +258,7 @@ def test_list_events_by_date_excludes_current_records():
     store.put_event(record, operation="ENCRYPT", correlation_id="corr-1")
 
     from datetime import datetime, timezone
+
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     events = store.list_events_by_date(today)
 
