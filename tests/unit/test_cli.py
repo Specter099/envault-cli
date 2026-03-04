@@ -5,7 +5,6 @@ from pathlib import Path
 
 import click
 import pytest
-
 from click.testing import CliRunner
 
 from envault.cli import _parse_output_json_entry, _parse_tags, _secure_delete, main

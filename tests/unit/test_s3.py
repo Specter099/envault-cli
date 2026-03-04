@@ -5,7 +5,6 @@ import logging
 from pathlib import Path
 
 import boto3
-import pytest
 from moto import mock_aws
 
 from envault.s3 import S3Store
