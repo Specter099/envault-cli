@@ -175,16 +175,29 @@ def _encrypt_one(
         encrypted_at=now,
         last_updated=now,
     )
-    store.put_current_state(
-        record,
-        expected_last_updated=existing.last_updated if existing else None,
-    )
-    store.put_event(
-        record,
-        operation="ENCRYPT",
-        correlation_id=correlation_id,
-        audit_ttl_days=config.audit_ttl_days,
-    )
+    try:
+        store.put_current_state(
+            record,
+            expected_last_updated=existing.last_updated if existing else None,
+        )
+        store.put_event(
+            record,
+            operation="ENCRYPT",
+            correlation_id=correlation_id,
+            audit_ttl_days=config.audit_ttl_days,
+        )
+    except Exception:
+        logger.error(
+            "State write failed after S3 upload. Manual recovery may be needed.",
+            extra={
+                "sha256": sha256,
+                "s3_key": s3_key,
+                "s3_version_id": version_id,
+                "bucket": config.bucket,
+                "file_name": file_path.name,
+            },
+        )
+        raise
     console.print(f"[green]✓[/green] {file_path.name} → s3://{config.bucket}/{s3_key}")
 
 
@@ -271,8 +284,20 @@ def decrypt(
     record.current_state = DECRYPTED
     record.decrypted_at = now
     record.last_updated = now
-    store.put_current_state(record, expected_last_updated=original_last_updated)
-    store.put_event(record, operation="DECRYPT", correlation_id=correlation_id)
+    try:
+        store.put_current_state(record, expected_last_updated=original_last_updated)
+        store.put_event(record, operation="DECRYPT", correlation_id=correlation_id)
+    except Exception:
+        logger.error(
+            "State write failed after successful decryption. "
+            "File was decrypted to disk but state was not updated.",
+            extra={
+                "sha256": sha256_hash,
+                "output_path": str(output_path),
+                "s3_key": record.s3_key,
+            },
+        )
+        raise
 
     console.print(f"[green]✓[/green] Decrypted → {output_path}")
 
@@ -610,8 +635,22 @@ def rotate_key(
             record.message_id = new_result.message_id
             record.s3_version_id = new_version_id
             record.last_updated = now
-            store.put_current_state(record, expected_last_updated=original_last_updated)
-            store.put_event(record, operation="ROTATE_KEY", correlation_id=correlation_id)
+            try:
+                store.put_current_state(record, expected_last_updated=original_last_updated)
+                store.put_event(record, operation="ROTATE_KEY", correlation_id=correlation_id)
+            except Exception:
+                logger.error(
+                    "State write failed after S3 re-upload during key rotation.",
+                    extra={
+                        "sha256": record.sha256_hash,
+                        "s3_key": record.s3_key,
+                        "s3_version_id": new_version_id,
+                        "old_kms_key": record.kms_key_id,
+                        "new_kms_key": new_key_id,
+                        "correlation_id": correlation_id,
+                    },
+                )
+                raise
             rotated += 1
         except (EnvaultError, ClientError, BotoCoreError) as exc:
             console.print(f"[red]Error rotating {record.file_name}: {exc}[/red]")
