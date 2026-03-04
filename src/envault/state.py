@@ -14,6 +14,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
+from envault.config import boto_config
 from envault.exceptions import StateConflictError
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,7 @@ class StateStore:
     def __init__(self, table_name: str, region: str = "us-east-1") -> None:
         self._table_name = table_name
         self._region = region
-        self._dynamodb = boto3.resource("dynamodb", region_name=region)
+        self._dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
         self._table = self._dynamodb.Table(table_name)
 
     def _paginate_query(self, **query_kwargs: Any) -> list[dict[str, Any]]:

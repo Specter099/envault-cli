@@ -299,6 +299,19 @@ def test_put_current_state_new_record_succeeds():
     assert fetched.current_state == ENCRYPTED
 
 
+def test_statestore_uses_shared_boto_config():
+    """StateStore must create its DynamoDB resource with the shared boto_config."""
+    from unittest.mock import patch
+
+    from envault.config import boto_config
+
+    with patch("envault.state.boto3") as mock_boto3:
+        StateStore(table_name="test", region="us-east-1")
+        mock_boto3.resource.assert_called_once_with(
+            "dynamodb", region_name="us-east-1", config=boto_config
+        )
+
+
 @mock_aws
 def test_put_current_state_fails_if_already_exists():
     """A new record (no expected_last_updated) must fail if the PK already exists."""

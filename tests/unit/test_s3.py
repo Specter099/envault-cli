@@ -134,6 +134,17 @@ def test_s3_key_sanitize_preserves_safe_names():
     assert "my-file_v2.tar.gz.encrypted" in key
 
 
+def test_s3store_uses_shared_boto_config():
+    """S3Store must create its client with the shared boto_config."""
+    from unittest.mock import patch
+
+    from envault.config import boto_config
+
+    with patch("envault.s3.boto3") as mock_boto3:
+        S3Store(bucket="b", region="us-east-1")
+        mock_boto3.client.assert_called_once_with("s3", region_name="us-east-1", config=boto_config)
+
+
 @mock_aws
 def test_upload_passes_sse_kms_key_id(tmp_path: Path):
     """upload_file must pass SSEKMSKeyId when kms_key_id is configured."""

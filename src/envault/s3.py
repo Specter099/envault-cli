@@ -9,6 +9,8 @@ from pathlib import Path
 import boto3
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from envault.config import boto_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,7 +21,7 @@ class S3Store:
         self._bucket = bucket
         self._region = region
         self._kms_key_id = kms_key_id
-        self._s3 = boto3.client("s3", region_name=region)
+        self._s3 = boto3.client("s3", region_name=region, config=boto_config)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def upload_file(self, local_path: Path, s3_key: str) -> str:
