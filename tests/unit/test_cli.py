@@ -914,7 +914,7 @@ class TestFriendlyErrors:
     """Test that CLI errors are human-readable (no raw Click format or tracebacks)."""
 
     def test_decrypt_no_args_friendly_error(self) -> None:
-        """cli() wrapper shows friendly error for missing IDENTIFIER argument."""
+        """cli() wrapper shows friendly guidance for missing IDENTIFIER argument."""
         from io import StringIO
 
         from rich.console import Console as RichConsole
@@ -929,13 +929,24 @@ class TestFriendlyErrors:
                 cli()
         assert exc_info.value.code == 2
         text = output.getvalue()
-        assert "Error:" in text
         assert "Missing argument" in text
-        # Should NOT start with Click's raw "Usage:" line
+        assert "envault decrypt --help" in text
+        # Should NOT have "Error:" prefix or Click's raw "Usage:" line
+        assert not text.strip().startswith("Error:")
         assert not text.strip().startswith("Usage:")
 
+    def test_no_subcommand_shows_help_cleanly(self) -> None:
+        """Running 'envault' with no subcommand shows help without error prefix."""
+        runner = CliRunner()
+        result = runner.invoke(main, [])
+        assert result.exit_code == 0
+        assert "Commands:" in result.output
+        assert "Error:" not in result.output
+        # Should NOT have a redundant --help hint at the bottom
+        assert "Run 'envault --help' for usage info." not in result.output
+
     def test_encrypt_no_args_friendly_error(self) -> None:
-        """cli() wrapper shows friendly error for missing INPUT_PATH argument."""
+        """cli() wrapper shows friendly guidance for missing INPUT_PATH argument."""
         from io import StringIO
 
         from rich.console import Console as RichConsole
@@ -950,8 +961,9 @@ class TestFriendlyErrors:
                 cli()
         assert exc_info.value.code == 2
         text = output.getvalue()
-        assert "Error:" in text
         assert "Missing argument" in text
+        assert "envault encrypt --help" in text
+        assert not text.strip().startswith("Error:")
 
     @mock_aws
     def test_status_aws_error_shows_friendly_message(self) -> None:
