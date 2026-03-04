@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from unittest.mock import patch
 
@@ -399,3 +400,37 @@ def test_list_by_state_max_items_zero_returns_all():
 
     records = store.list_by_state(ENCRYPTED)
     assert len(records) == 5
+
+
+@mock_aws
+def test_put_event_retry_is_idempotent():
+    """Retried put_event calls must produce the same SK (no duplicate events)."""
+    store = _create_table()
+    record = _make_record()
+
+    sks_seen: list[str] = []
+    original_put_item = store._table.put_item
+
+    def tracking_put_item(**kwargs):
+        item = kwargs.get("Item", {})
+        sk = item.get("SK", "")
+        if sk.startswith("EVENT#"):
+            sks_seen.append(sk)
+        return original_put_item(**kwargs)
+
+    call_count = 0
+
+    def flaky_put_item(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            tracking_put_item(**kwargs)
+            raise Exception("simulated network error after write")
+        return tracking_put_item(**kwargs)
+
+    with patch.object(store._table, "put_item", side_effect=flaky_put_item):
+        with contextlib.suppress(Exception):
+            store.put_event(record, operation="ENCRYPT", correlation_id="corr-idem")
+
+    if len(sks_seen) == 2:
+        assert sks_seen[0] == sks_seen[1], f"Retry used different SK: {sks_seen}"

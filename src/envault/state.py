@@ -159,13 +159,25 @@ class StateStore:
             extra={"sha256": record.sha256_hash[:16], "state": record.current_state},
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def put_event(
         self, record: FileRecord, operation: str, correlation_id: str, audit_ttl_days: int = 365
     ) -> None:
         """Append an immutable event record to the audit trail."""
         now = _now_iso()
         unique_suffix = uuid.uuid4().hex[:8]
+        self._put_event_inner(record, operation, correlation_id, audit_ttl_days, now, unique_suffix)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def _put_event_inner(
+        self,
+        record: FileRecord,
+        operation: str,
+        correlation_id: str,
+        audit_ttl_days: int,
+        now: str,
+        unique_suffix: str,
+    ) -> None:
+        """Inner retry loop for put_event -- uses a fixed SK across retries."""
         sk = f"{EVENT_PREFIX}{now}#{operation}#{unique_suffix}"
         item = record.to_dynamo_item(sk=sk)
         item["operation"] = operation
