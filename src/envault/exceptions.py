@@ -32,6 +32,18 @@ class ChecksumMismatchError(EnvaultError):
         )
 
 
+class EncryptionContextMismatchError(EnvaultError):
+    """Raised when ciphertext encryption context doesn't match DynamoDB."""
+
+    def __init__(self, expected: dict[str, str], actual: dict[str, str]) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"Encryption context mismatch: expected {expected!r}, got {actual!r}. "
+            "The ciphertext may have been tampered with or swapped."
+        )
+
+
 class ConfigurationError(EnvaultError):
     """Raised when required configuration is missing or invalid."""
 

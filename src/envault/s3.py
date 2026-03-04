@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import boto3
@@ -84,6 +85,16 @@ class S3Store:
         )
         logger.info("Download complete", extra={"local_path": str(local_path)})
 
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        """Sanitize a filename for use in S3 keys.
+
+        Replaces any character that is not alphanumeric, dot, hyphen, or
+        underscore with an underscore. This prevents path-traversal attacks
+        and avoids problematic characters in S3 object keys.
+        """
+        return re.sub(r"[^\w.\-]", "_", name)
+
     def s3_key_for_file(self, sha256_hash: str, file_name: str) -> str:
         """Generate a content-addressed S3 key for an encrypted file.
 
@@ -91,4 +102,5 @@ class S3Store:
         The two-character prefix shards objects across 256 virtual directories,
         preventing S3 listing bottlenecks at scale and ensuring uniqueness.
         """
-        return f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{file_name}.encrypted"
+        safe_name = self._sanitize_filename(file_name)
+        return f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{safe_name}.encrypted"

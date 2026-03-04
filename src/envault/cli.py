@@ -24,8 +24,10 @@ from envault.crypto import decrypt_file, encrypt_file
 from envault.exceptions import (
     AlreadyEncryptedError,
     ConfigurationError,
+    EncryptionContextMismatchError,
     EnvaultError,
     MigrationError,
+    StateConflictError,
 )
 from envault.s3 import S3Store
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
@@ -35,10 +37,12 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging(verbose: bool) -> None:
-    from pythonjsonlogger.jsonlogger import JsonFormatter  # type: ignore[attr-defined]
+    from pythonjsonlogger.jsonlogger import (  # type: ignore[attr-defined,unused-ignore]
+        JsonFormatter,
+    )
 
     handler = logging.StreamHandler(sys.stderr)
-    fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")  # type: ignore[no-untyped-call,unused-ignore]
     handler.setFormatter(fmt)
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, handlers=[handler])
@@ -141,12 +145,13 @@ def _encrypt_one(
     tmp_encrypted = Path(_tmp)
     s3_key = s3.s3_key_for_file(sha256_hash=sha256, file_name=file_path.name)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    enc_context = config.build_encryption_context(sha256, file_path.name)
 
     try:
         result = encrypt_file(
             input_path=file_path,
             key_id=config.key_id,
-            encryption_context=config.encryption_context,
+            encryption_context=enc_context,
             output_path=tmp_encrypted,
             region=config.region,
         )
@@ -162,7 +167,7 @@ def _encrypt_one(
         s3_key=s3_key,
         s3_version_id=version_id,
         kms_key_id=config.key_id,
-        encryption_context=config.encryption_context,
+        encryption_context=enc_context,
         algorithm=result.algorithm,
         message_id=result.message_id,
         file_size_bytes=result.file_size_bytes,
@@ -170,7 +175,10 @@ def _encrypt_one(
         encrypted_at=now,
         last_updated=now,
     )
-    store.put_current_state(record)
+    store.put_current_state(
+        record,
+        expected_last_updated=existing.last_updated if existing else None,
+    )
     store.put_event(
         record,
         operation="ENCRYPT",
@@ -224,6 +232,12 @@ def decrypt(
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
     account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
+    if not account_ids:
+        console.print(
+            "[bold red]Error:[/bold red] ENVAULT_ALLOWED_ACCOUNT_IDS is required for decryption.\n"
+            "Set it to a comma-separated list of AWS account IDs trusted to encrypt data."
+        )
+        sys.exit(1)
 
     record = store.get_current_state(sha256_hash)
     if not record:
@@ -243,7 +257,7 @@ def decrypt(
             s3_key=record.s3_key, local_path=tmp_encrypted, version_id=record.s3_version_id
         )
 
-        decrypt_file(
+        result = decrypt_file(
             input_path=tmp_encrypted,
             output_path=output_path,
             expected_sha256=sha256_hash,
@@ -253,11 +267,19 @@ def decrypt(
     finally:
         tmp_encrypted.unlink(missing_ok=True)
 
+    if result.encryption_context != record.encryption_context:
+        output_path.unlink(missing_ok=True)
+        raise EncryptionContextMismatchError(
+            expected=record.encryption_context,
+            actual=result.encryption_context,
+        )
+
+    original_last_updated = record.last_updated
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     record.current_state = DECRYPTED
     record.decrypted_at = now
     record.last_updated = now
-    store.put_current_state(record)
+    store.put_current_state(record, expected_last_updated=original_last_updated)
     store.put_event(record, operation="DECRYPT", correlation_id=correlation_id)
 
     console.print(f"[green]✓[/green] Decrypted → {output_path}")
@@ -427,6 +449,9 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
                     record, operation="ENCRYPT", correlation_id="migrated-from-output-json"
                 )
             imported += 1
+        except StateConflictError:
+            logger.info("Record already exists, skipping migration for line %d", i)
+            skipped += 1
         except (json.JSONDecodeError, KeyError, ValueError, MigrationError) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
@@ -529,6 +554,14 @@ def rotate_key(
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
     account_ids = [a.strip() for a in allowed_account_ids.split(",") if a.strip()]
+    if not account_ids:
+        console.print(
+            "[bold red]Error:[/bold red] ENVAULT_ALLOWED_ACCOUNT_IDS is required"
+            " for key rotation.\n"
+            "Set it to a comma-separated list of AWS account IDs trusted to"
+            " encrypt data."
+        )
+        sys.exit(1)
 
     records = store.list_by_state(ENCRYPTED)
     if not records:
@@ -556,7 +589,7 @@ def rotate_key(
             tmp_enc = Path(_tmp_enc)
 
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
-            decrypt_file(
+            dec_result = decrypt_file(
                 tmp_dl,
                 tmp_pt,
                 expected_sha256=record.sha256_hash,
@@ -565,20 +598,33 @@ def rotate_key(
             )
             tmp_dl.unlink(missing_ok=True)
 
-            new_result = encrypt_file(
-                tmp_pt, new_key_id, record.encryption_context, tmp_enc, region
-            )
-            _secure_delete(tmp_pt)
+            if dec_result.encryption_context != record.encryption_context:
+                _best_effort_delete(tmp_pt)
+                raise EncryptionContextMismatchError(
+                    expected=record.encryption_context,
+                    actual=dec_result.encryption_context,
+                )
+
+            new_ctx = {
+                "purpose": "envault-backup",
+                "sha256": record.sha256_hash,
+                "file_name": record.file_name,
+                "kms_key_alias": new_key_id,
+            }
+            new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
+            _best_effort_delete(tmp_pt)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
 
+            original_last_updated = record.last_updated
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
             record.kms_key_id = new_key_id
+            record.encryption_context = new_ctx
             record.algorithm = new_result.algorithm
             record.message_id = new_result.message_id
             record.s3_version_id = new_version_id
             record.last_updated = now
-            store.put_current_state(record)
+            store.put_current_state(record, expected_last_updated=original_last_updated)
             store.put_event(record, operation="ROTATE_KEY", correlation_id=correlation_id)
             rotated += 1
         except (EnvaultError, ClientError, BotoCoreError) as exc:
@@ -586,7 +632,7 @@ def rotate_key(
             errors += 1
         finally:
             tmp_dl.unlink(missing_ok=True)
-            tmp_pt.unlink(missing_ok=True)
+            _best_effort_delete(tmp_pt)
             tmp_enc.unlink(missing_ok=True)
 
     console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
@@ -627,10 +673,14 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
     return tags
 
 
-def _secure_delete(path: Path) -> None:
-    """Overwrite a file with zeros then unlink it.
+def _best_effort_delete(path: Path) -> None:
+    """Overwrite a file with zeros then unlink it (best-effort).
 
-    Prevents plaintext recovery from disk after decryption or key rotation.
+    Attempts to reduce plaintext exposure on disk after decryption or key
+    rotation. This is NOT a guarantee of secure deletion — copy-on-write
+    filesystems (APFS, Btrfs, ZFS), SSD wear-levelling, and journaling
+    filesystems may retain copies of the original data.
+
     Does nothing if the file does not exist.
     """
     try:
@@ -641,6 +691,6 @@ def _secure_delete(path: Path) -> None:
             os.fsync(f.fileno())
     except FileNotFoundError:
         return
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("Best-effort overwrite failed for %s: %s", path, exc)
     path.unlink(missing_ok=True)

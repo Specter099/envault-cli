@@ -12,6 +12,7 @@ from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_s3 as s3
+from cdk_nag import NagSuppressions
 from constructs import Construct
 
 
@@ -46,6 +47,23 @@ class EnvaultStack(Stack):
         )
 
         # ------------------------------------------------------------------ #
+        # S3 Access Logging Bucket                                              #
+        # ------------------------------------------------------------------ #
+        access_logs_bucket = s3.Bucket(
+            self,
+            "EnvaultAccessLogsBucket",
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.RETAIN,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    expiration=Duration.days(365),
+                )
+            ],
+        )
+
+        # ------------------------------------------------------------------ #
         # S3 Bucket                                                            #
         # ------------------------------------------------------------------ #
         bucket = s3.Bucket(
@@ -56,6 +74,8 @@ class EnvaultStack(Stack):
             encryption_key=encryption_key,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
+            server_access_logs_bucket=access_logs_bucket,
+            server_access_logs_prefix="envault-access-logs/",
             removal_policy=RemovalPolicy.RETAIN,
             lifecycle_rules=[
                 # Move old non-current versions to GLACIER after 90 days
@@ -85,6 +105,7 @@ class EnvaultStack(Stack):
             point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
                 point_in_time_recovery_enabled=True
             ),
+            deletion_protection=True,
             time_to_live_attribute="ttl",
             removal_policy=RemovalPolicy.RETAIN,
         )
@@ -139,6 +160,37 @@ class EnvaultStack(Stack):
                     ],
                     resources=[table.table_arn, f"{table.table_arn}/index/*"],
                 ),
+            ],
+        )
+
+        # ------------------------------------------------------------------ #
+        # cdk-nag suppressions for scoped wildcards                            #
+        # ------------------------------------------------------------------ #
+        NagSuppressions.add_resource_suppressions(
+            policy,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "S3 object-level actions (PutObject, GetObject) require"
+                        " bucket/* wildcard. Access is scoped to the single"
+                        " envault bucket."
+                    ),
+                    "applies_to": [
+                        f"Resource::<{bucket.node.id}.Arn>/*",
+                    ],
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "DynamoDB GSI queries require table/index/* wildcard."
+                        " Access is scoped to the single envault table and"
+                        " only allows read/write operations."
+                    ),
+                    "applies_to": [
+                        f"Resource::<{table.node.id}.Arn>/index/*",
+                    ],
+                },
             ],
         )
 

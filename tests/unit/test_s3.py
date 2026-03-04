@@ -108,3 +108,27 @@ def test_s3_key_for_file_is_content_addressed():
     sha2 = "b" * 64
     key2 = store.s3_key_for_file(sha256_hash=sha2, file_name="report.xlsx")
     assert key != key2
+
+
+def test_s3_key_sanitizes_traversal_characters():
+    """Filenames with path-traversal or special chars must be sanitized."""
+    store = S3Store(bucket="b", region="us-east-1")
+    sha = "c" * 64
+
+    key = store.s3_key_for_file(sha256_hash=sha, file_name="../../etc/passwd")
+    assert "../" not in key
+    assert "/" not in key.split(sha + "/")[1].replace(".encrypted", "")
+
+    key2 = store.s3_key_for_file(sha256_hash=sha, file_name="file with spaces & (parens).txt")
+    assert " " not in key2
+    assert "&" not in key2
+    assert "(" not in key2
+
+
+def test_s3_key_sanitize_preserves_safe_names():
+    """Safe filenames must pass through unchanged."""
+    store = S3Store(bucket="b", region="us-east-1")
+    sha = "d" * 64
+
+    key = store.s3_key_for_file(sha256_hash=sha, file_name="my-file_v2.tar.gz")
+    assert "my-file_v2.tar.gz.encrypted" in key
