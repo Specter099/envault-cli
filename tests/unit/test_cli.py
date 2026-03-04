@@ -221,8 +221,10 @@ def test_parse_tags_empty_key_raises():
         _parse_tags(("=value",))
 
 
+@mock_aws
 def test_decrypt_rejects_invalid_sha256_format():
-    """decrypt must reject hash arguments that are not 64-char hex strings."""
+    """decrypt treats non-SHA256 input as a filename lookup."""
+    _create_table()
     runner = CliRunner()
     result = runner.invoke(
         main,
@@ -230,7 +232,7 @@ def test_decrypt_rejects_invalid_sha256_format():
             "decrypt",
             "not-a-valid-hash",
             "--table",
-            "t",
+            TABLE_NAME,
             "--bucket",
             "b",
         ],
@@ -238,10 +240,58 @@ def test_decrypt_rejects_invalid_sha256_format():
             "AWS_ACCESS_KEY_ID": "testing",
             "AWS_SECRET_ACCESS_KEY": "testing",
             "AWS_DEFAULT_REGION": "us-east-1",
+            "ENVAULT_ALLOWED_ACCOUNT_IDS": ACCOUNT_IDS,
         },
     )
     assert result.exit_code != 0
-    assert "invalid" in result.output.lower() or "sha256" in result.output.lower()
+    assert "no encrypted files" in result.output.lower()
+
+
+@mock_aws
+def test_decrypt_accepts_filename_identifier():
+    """decrypt command should accept a filename and resolve it."""
+    _create_table()
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["decrypt", "myfile.txt", "--table", TABLE_NAME, "--bucket", "b"],
+        env={
+            "AWS_ACCESS_KEY_ID": "testing",
+            "AWS_SECRET_ACCESS_KEY": "testing",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "ENVAULT_ALLOWED_ACCOUNT_IDS": ACCOUNT_IDS,
+        },
+    )
+    assert result.exit_code != 0
+    # Should NOT say "Invalid SHA256" — should say "no encrypted files"
+    assert "invalid sha256" not in result.output.lower()
+
+
+@mock_aws
+def test_decrypt_version_flag_out_of_range():
+    """--version N where N > number of matches should error."""
+    _create_table()
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "decrypt",
+            "myfile.txt",
+            "--version",
+            "5",
+            "--table",
+            TABLE_NAME,
+            "--bucket",
+            "b",
+        ],
+        env={
+            "AWS_ACCESS_KEY_ID": "testing",
+            "AWS_SECRET_ACCESS_KEY": "testing",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "ENVAULT_ALLOWED_ACCOUNT_IDS": ACCOUNT_IDS,
+        },
+    )
+    assert result.exit_code != 0
 
 
 # ---------------------------------------------------------------------------

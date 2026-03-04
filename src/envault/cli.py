@@ -207,13 +207,21 @@ def _encrypt_one(
 
 
 @main.command()
-@click.argument("sha256_hash")
+@click.argument("identifier")
 @click.option(
     "--output", "-o", type=click.Path(path_type=Path), default=Path("."), show_default=True
 )
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
+@click.option(
+    "--version",
+    "version",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Which version to decrypt when multiple exist (1=most recent).",
+)
 @click.option(
     "--allowed-account-ids",
     envvar="ENVAULT_ALLOWED_ACCOUNT_IDS",
@@ -223,28 +231,26 @@ def _encrypt_one(
 @click.pass_context
 def decrypt(
     ctx: click.Context,
-    sha256_hash: str,
+    identifier: str,
     output: Path,
     table: str,
     bucket: str,
     region: str,
+    version: int,
     allowed_account_ids: str,
 ) -> None:
-    """Decrypt a file by its SHA256 hash.
+    """Decrypt a file by SHA256 hash or filename.
 
-    SHA256_HASH is the hash of the original plaintext file (shown by envault status).
+    IDENTIFIER is a 64-char SHA256 hash or the original filename.
+    When a filename matches multiple versions, use --version N to pick one.
     """
-    _validate_sha256(sha256_hash)
-
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
     account_ids = _validate_account_ids(allowed_account_ids)
 
-    record = store.get_current_state(sha256_hash)
-    if not record:
-        console.print(f"[red]No record found for hash {sha256_hash[:16]}...[/red]")
-        sys.exit(1)
+    record = _resolve_identifier(identifier, version, store)
+    sha256_hash = record.sha256_hash
     if record.current_state != ENCRYPTED:
         console.print(f"[yellow]File is in state {record.current_state}, not ENCRYPTED.[/yellow]")
         sys.exit(1)
@@ -682,6 +688,56 @@ def _validate_sha256(value: str) -> str:
         )
         sys.exit(1)
     return value
+
+
+def _is_sha256(value: str) -> bool:
+    """Return True if value looks like a full 64-char hex SHA256 hash."""
+    return bool(_SHA256_RE.fullmatch(value))
+
+
+def _resolve_identifier(
+    identifier: str,
+    version: int,
+    store: StateStore,
+) -> FileRecord:
+    """Resolve an identifier (SHA256 or filename) to a FileRecord.
+
+    For SHA256: direct lookup via get_current_state().
+    For filename: query by file_name, return Nth most recent version.
+    Exits with error if not found or version out of range.
+    """
+    if _is_sha256(identifier):
+        record = store.get_current_state(identifier)
+        if not record:
+            console.print(f"[red]No record found for hash {identifier[:16]}...[/red]")
+            sys.exit(1)
+        return record
+
+    # Filename lookup
+    records = store.list_by_file_name(identifier, ENCRYPTED)
+    if not records:
+        console.print(f"[red]No encrypted files found with name {identifier!r}.[/red]")
+        sys.exit(1)
+
+    if version < 1 or version > len(records):
+        console.print(
+            f"[red]Version {version} out of range. "
+            f"Found {len(records)} version(s) of"
+            f" {identifier!r}.[/red]"
+        )
+        sys.exit(1)
+
+    if len(records) > 1:
+        selected = records[version - 1]
+        label = "most recent" if version == 1 else f"version {version}"
+        console.print(
+            f"[dim]{len(records)} versions found. "
+            f"Decrypting {label} "
+            f"({selected.encrypted_at}). "
+            f"Use --version N to pick another.[/dim]"
+        )
+
+    return records[version - 1]
 
 
 _ACCOUNT_ID_RE = re.compile(r"\d{12}")
