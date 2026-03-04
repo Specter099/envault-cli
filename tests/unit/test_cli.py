@@ -12,7 +12,7 @@ from botocore.exceptions import ClientError
 from click.testing import CliRunner
 from moto import mock_aws
 
-from envault.cli import _best_effort_delete, _parse_output_json_entry, _parse_tags, main
+from envault.cli import _best_effort_delete, _parse_output_json_entry, _parse_tags, cli, main
 from envault.crypto import DecryptResult, EncryptResult
 from envault.exceptions import ChecksumMismatchError, EnvaultError
 from envault.state import ENCRYPTED, FileRecord, StateStore
@@ -903,3 +903,96 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(tmp_path: Path, ca
 
     assert result.exit_code == 0  # rotate-key catches per-file errors
     assert any("state write failed" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# friendly error formatting tests
+# ---------------------------------------------------------------------------
+
+
+class TestFriendlyErrors:
+    """Test that CLI errors are human-readable (no raw Click format or tracebacks)."""
+
+    def test_decrypt_no_args_friendly_error(self) -> None:
+        """cli() wrapper shows friendly error for missing IDENTIFIER argument."""
+        from io import StringIO
+
+        from rich.console import Console as RichConsole
+
+        output = StringIO()
+        test_console = RichConsole(file=output, force_terminal=False)
+        with (
+            patch("sys.argv", ["envault", "decrypt"]),
+            patch("envault.cli.console", test_console),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cli()
+        assert exc_info.value.code == 2
+        text = output.getvalue()
+        assert "Error:" in text
+        assert "Missing argument" in text
+        # Should NOT start with Click's raw "Usage:" line
+        assert not text.strip().startswith("Usage:")
+
+    def test_encrypt_no_args_friendly_error(self) -> None:
+        """cli() wrapper shows friendly error for missing INPUT_PATH argument."""
+        from io import StringIO
+
+        from rich.console import Console as RichConsole
+
+        output = StringIO()
+        test_console = RichConsole(file=output, force_terminal=False)
+        with (
+            patch("sys.argv", ["envault", "encrypt"]),
+            patch("envault.cli.console", test_console),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cli()
+        assert exc_info.value.code == 2
+        text = output.getvalue()
+        assert "Error:" in text
+        assert "Missing argument" in text
+
+    @mock_aws
+    def test_status_aws_error_shows_friendly_message(self) -> None:
+        """status command shows friendly message on DynamoDB failure."""
+        runner = CliRunner()
+        with patch.object(
+            StateStore,
+            "list_by_state",
+            side_effect=ClientError(
+                {"Error": {"Code": "ResourceNotFoundException", "Message": "Table not found"}},
+                "Scan",
+            ),
+        ):
+            result = runner.invoke(
+                main,
+                ["status", "--table", TABLE_NAME, "--region", REGION],
+                env=_CLI_ENV,
+            )
+        assert result.exit_code == 1
+        assert "AWS error:" in result.output
+        assert "Table not found" in result.output
+        assert "Traceback" not in result.output
+
+    @mock_aws
+    def test_dashboard_aws_error_shows_friendly_message(self) -> None:
+        """dashboard command shows friendly message on DynamoDB failure."""
+        runner = CliRunner()
+        with patch.object(
+            StateStore,
+            "summary",
+            side_effect=ClientError(
+                {"Error": {"Code": "ResourceNotFoundException", "Message": "Table not found"}},
+                "Scan",
+            ),
+        ):
+            result = runner.invoke(
+                main,
+                ["dashboard", "--table", TABLE_NAME, "--region", REGION],
+                env=_CLI_ENV,
+            )
+        assert result.exit_code == 1
+        assert "AWS error:" in result.output
+        assert "Table not found" in result.output
+        assert "Traceback" not in result.output

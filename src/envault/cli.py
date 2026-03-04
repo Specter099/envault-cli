@@ -67,6 +67,19 @@ def main(ctx: click.Context, verbose: bool) -> None:
     _setup_logging(verbose)
 
 
+def cli() -> None:
+    """Entrypoint that wraps Click with human-readable error formatting."""
+    try:
+        main(standalone_mode=False)
+    except click.UsageError as e:
+        hint = f"\n  Run '{e.ctx.command_path} --help' for usage info." if e.ctx else ""
+        console.print(f"[bold red]Error:[/bold red] {e.format_message()}{hint}")
+        sys.exit(2)
+    except click.Abort:
+        console.print("[yellow]Aborted.[/yellow]")
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # encrypt
 # ---------------------------------------------------------------------------
@@ -350,27 +363,35 @@ def decrypt(
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def status(state: str, sha256_hash: str | None, table: str, region: str) -> None:
     """Show current encryption state of files."""
-    store = StateStore(table_name=table, region=region)
+    try:
+        store = StateStore(table_name=table, region=region)
 
-    if sha256_hash:
-        _validate_sha256(sha256_hash)
-        record = store.get_current_state(sha256_hash)
-        if not record:
-            console.print(f"[red]No record found for {sha256_hash[:16]}...[/red]")
-            sys.exit(1)
-        _print_records([record])
-        return
+        if sha256_hash:
+            _validate_sha256(sha256_hash)
+            record = store.get_current_state(sha256_hash)
+            if not record:
+                console.print(f"[red]No record found for {sha256_hash[:16]}...[/red]")
+                sys.exit(1)
+            _print_records([record])
+            return
 
-    records = []
-    if state in ("encrypted", "all"):
-        records.extend(store.list_by_state(ENCRYPTED))
-    if state in ("decrypted", "all"):
-        records.extend(store.list_by_state(DECRYPTED))
+        records = []
+        if state in ("encrypted", "all"):
+            records.extend(store.list_by_state(ENCRYPTED))
+        if state in ("decrypted", "all"):
+            records.extend(store.list_by_state(DECRYPTED))
 
-    if not records:
-        console.print("[yellow]No records found.[/yellow]")
-        return
-    _print_records(records)
+        if not records:
+            console.print("[yellow]No records found.[/yellow]")
+            return
+        _print_records(records)
+    except (ClientError, BotoCoreError) as exc:
+        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
+        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        sys.exit(1)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        sys.exit(1)
 
 
 def _print_records(records: list[FileRecord]) -> None:
@@ -405,40 +426,48 @@ def _print_records(records: list[FileRecord]) -> None:
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -> None:
     """Show the full event history."""
-    store = StateStore(table_name=table, region=region)
+    try:
+        store = StateStore(table_name=table, region=region)
 
-    if sha256_hash:
-        _validate_sha256(sha256_hash)
-        events = store.list_events_for_file(sha256_hash)
-    elif since:
-        events = store.list_events_by_date(since)
-    else:
-        console.print("[yellow]Provide --file or --since.[/yellow]")
+        if sha256_hash:
+            _validate_sha256(sha256_hash)
+            events = store.list_events_for_file(sha256_hash)
+        elif since:
+            events = store.list_events_by_date(since)
+        else:
+            console.print("[yellow]Provide --file or --since.[/yellow]")
+            sys.exit(1)
+
+        if not events:
+            console.print("[yellow]No events found.[/yellow]")
+            return
+
+        t = Table(show_header=True, header_style="bold cyan")
+        t.add_column("Timestamp")
+        t.add_column("Operation")
+        t.add_column("File")
+        t.add_column("SHA256 (16)")
+        t.add_column("Correlation ID (8)")
+        for e in events:
+            sk: str = e.get("SK", "")
+            parts = sk.split("#")
+            ts = parts[1] if len(parts) > 1 else ""
+            op = parts[2] if len(parts) > 2 else e.get("operation", "")
+            t.add_row(
+                ts,
+                op,
+                e.get("file_name", ""),
+                e.get("sha256_hash", "")[:16],
+                e.get("correlation_id", "")[:8],
+            )
+        console.print(t)
+    except (ClientError, BotoCoreError) as exc:
+        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
+        console.print(f"[bold red]AWS error:[/bold red] {msg}")
         sys.exit(1)
-
-    if not events:
-        console.print("[yellow]No events found.[/yellow]")
-        return
-
-    t = Table(show_header=True, header_style="bold cyan")
-    t.add_column("Timestamp")
-    t.add_column("Operation")
-    t.add_column("File")
-    t.add_column("SHA256 (16)")
-    t.add_column("Correlation ID (8)")
-    for e in events:
-        sk: str = e.get("SK", "")
-        parts = sk.split("#")
-        ts = parts[1] if len(parts) > 1 else ""
-        op = parts[2] if len(parts) > 2 else e.get("operation", "")
-        t.add_row(
-            ts,
-            op,
-            e.get("file_name", ""),
-            e.get("sha256_hash", "")[:16],
-            e.get("correlation_id", "")[:8],
-        )
-    console.print(t)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -451,22 +480,30 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def dashboard(table: str, region: str) -> None:
     """Show a summary dashboard of all tracked files."""
-    store = StateStore(table_name=table, region=region)
-    summary = store.summary()
+    try:
+        store = StateStore(table_name=table, region=region)
+        summary = store.summary()
 
-    console.print()
-    console.print("[bold cyan]envault Dashboard[/bold cyan]")
-    console.rule()
+        console.print()
+        console.print("[bold cyan]envault Dashboard[/bold cyan]")
+        console.rule()
 
-    t = Table.grid(padding=(0, 2))
-    t.add_column(style="bold")
-    t.add_column()
-    t.add_row("Total tracked files:", str(summary["total"]))
-    t.add_row("Currently encrypted:", f"[green]{summary['encrypted']}[/green]")
-    t.add_row("Currently decrypted:", f"[yellow]{summary['decrypted']}[/yellow]")
-    t.add_row("Last activity:", summary["last_activity"])
-    console.print(t)
-    console.print()
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="bold")
+        t.add_column()
+        t.add_row("Total tracked files:", str(summary["total"]))
+        t.add_row("Currently encrypted:", f"[green]{summary['encrypted']}[/green]")
+        t.add_row("Currently decrypted:", f"[yellow]{summary['decrypted']}[/yellow]")
+        t.add_row("Last activity:", summary["last_activity"])
+        console.print(t)
+        console.print()
+    except (ClientError, BotoCoreError) as exc:
+        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
+        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        sys.exit(1)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

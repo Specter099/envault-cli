@@ -41,7 +41,7 @@ dev = [
 ]
 
 [project.scripts]
-envault = "envault.cli:main"
+envault = "envault.cli:cli"
 
 [project.urls]
 Homepage = "https://github.com/Specter099/envault-cli"
