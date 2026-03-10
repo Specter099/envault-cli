@@ -25,7 +25,7 @@ dependencies = [
     "aws-encryption-sdk>=3.1.1,<4",
     "boto3>=1.26.0,<2",
     "click>=8.1.0,<9",
-    "rich>=13.0.0,<14",
+    "rich>=13.0.0,<15",
     "tenacity>=8.2.0,<10",
     "python-json-logger>=2.0.0,<3",
 ]
