@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 
 from botocore.config import Config as BotoConfig
 
 from envault.exceptions import ConfigurationError
+
+_ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 
 # Shared boto3 client config:
 # - Explicit timeouts prevent indefinite hangs under partial network failure
@@ -30,6 +33,14 @@ class Config:
     region: str
     audit_ttl_days: int = 365
     allowed_account_ids: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Validate allowed_account_ids format at construction time."""
+        for account_id in self.allowed_account_ids:
+            if not _ACCOUNT_ID_RE.match(account_id):
+                raise ConfigurationError(
+                    f"Invalid AWS account ID: {account_id!r}. Must be exactly 12 digits."
+                )
 
     def build_encryption_context(self, sha256_hash: str, file_name: str) -> dict[str, str]:
         """Build per-file encryption context bound to the ciphertext as AAD.
@@ -88,6 +99,12 @@ class Config:
 
         _account_ids_raw = os.environ.get("ENVAULT_ALLOWED_ACCOUNT_IDS", "")
         allowed_account_ids = [a.strip() for a in _account_ids_raw.split(",") if a.strip()]
+        if "ENVAULT_ALLOWED_ACCOUNT_IDS" in os.environ and not allowed_account_ids:
+            raise ConfigurationError(
+                "ENVAULT_ALLOWED_ACCOUNT_IDS is set but contains no valid account IDs.\n"
+                "Provide a comma-separated list of 12-digit AWS account IDs, "
+                "or unset the variable."
+            )
 
         return cls(
             key_id=key_id,
