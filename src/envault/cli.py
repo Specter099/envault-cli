@@ -182,8 +182,8 @@ def _encrypt_one(
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
     os.close(_fd)
     tmp_encrypted = Path(_tmp)
-    s3_key = s3.s3_key_for_file(sha256_hash=sha256, file_name=file_path.name)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # enc_context uses the pre-read hash; it will be validated against result.sha256_hash below
     enc_context = config.build_encryption_context(sha256, file_path.name)
 
     try:
@@ -195,12 +195,20 @@ def _encrypt_one(
             region=config.region,
         )
 
+        if sha256 != result.sha256_hash:
+            raise EnvaultError(
+                f"File {file_path.name!r} was modified during encryption "
+                f"(pre-read hash {sha256[:16]}… != encrypted hash {result.sha256_hash[:16]}…). "
+                "Aborting to avoid storing mismatched metadata."
+            )
+
+        s3_key = s3.s3_key_for_file(sha256_hash=result.sha256_hash, file_name=file_path.name)
         version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
 
     record = FileRecord(
-        sha256_hash=sha256,
+        sha256_hash=result.sha256_hash,
         file_name=file_path.name,
         current_state=ENCRYPTED,
         s3_key=s3_key,
@@ -686,11 +694,13 @@ def rotate_key(
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
+        tmp_dl = tmp_pt = tmp_enc = None
         try:
             _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
             os.close(_fd_dl)
             tmp_dl = Path(_tmp_dl)
             _fd_pt, _tmp_pt = tempfile.mkstemp(prefix="envault_pt_")
+            os.fchmod(_fd_pt, 0o600)
             os.close(_fd_pt)
             tmp_pt = Path(_tmp_pt)
             _fd_enc, _tmp_enc = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
@@ -751,9 +761,12 @@ def rotate_key(
             console.print(f"[red]Error rotating {record.file_name}: {exc}[/red]")
             errors += 1
         finally:
-            tmp_dl.unlink(missing_ok=True)
-            _best_effort_delete(tmp_pt)
-            tmp_enc.unlink(missing_ok=True)
+            if tmp_dl is not None:
+                tmp_dl.unlink(missing_ok=True)
+            if tmp_pt is not None:
+                _best_effort_delete(tmp_pt)
+            if tmp_enc is not None:
+                tmp_enc.unlink(missing_ok=True)
 
     console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
 

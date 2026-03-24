@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -217,33 +218,44 @@ def decrypt_file(
         )
     )
 
-    with input_path.open("rb") as encrypted_file:
-        with client.stream(
-            source=encrypted_file,
-            mode="d",
-            key_provider=key_provider,
-        ) as decryptor:
-            enc_context = dict(decryptor.header.encryption_context)
+    # Decrypt to a temp file in the same directory so os.rename() is atomic
+    # (same filesystem). Only rename to output_path after hash verification.
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _fd_tmp, _tmp_path = tempfile.mkstemp(
+        dir=output_path.parent, prefix=".envault_dec_", suffix=".tmp"
+    )
+    os.fchmod(_fd_tmp, 0o600)
+    tmp_path = Path(_tmp_path)
 
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with input_path.open("rb") as encrypted_file:
+            with client.stream(
+                source=encrypted_file,
+                mode="d",
+                key_provider=key_provider,
+            ) as decryptor:
+                enc_context = dict(decryptor.header.encryption_context)
 
-            hasher = hashlib.sha256()
-            file_size = 0
-            with os.fdopen(fd, "wb") as out:
-                while True:
-                    chunk = decryptor.read(_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-                    out.write(chunk)
-                    file_size += len(chunk)
+                hasher = hashlib.sha256()
+                file_size = 0
+                with os.fdopen(_fd_tmp, "wb") as out:
+                    while True:
+                        chunk = decryptor.read(_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+                        out.write(chunk)
+                        file_size += len(chunk)
 
-    actual_sha256 = hasher.hexdigest()
+        actual_sha256 = hasher.hexdigest()
 
-    if expected_sha256 and actual_sha256 != expected_sha256:
-        output_path.unlink(missing_ok=True)
-        raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
+        if expected_sha256 and actual_sha256 != expected_sha256:
+            raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
+
+        os.rename(tmp_path, output_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     logger.info(
         "Decryption complete",
