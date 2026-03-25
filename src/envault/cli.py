@@ -817,9 +817,7 @@ def _validate_date(value: str) -> str:
     try:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
-        console.print(
-            f"[red]Invalid date: {value!r}. Expected format: YYYY-MM-DD.[/red]"
-        )
+        console.print(f"[red]Invalid date: {value!r}. Expected format: YYYY-MM-DD.[/red]")
         sys.exit(1)
     return value
 
