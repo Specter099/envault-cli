@@ -149,7 +149,7 @@ def encrypt_file(
     logger.info(
         "Encryption complete",
         extra={
-            "sha256": sha256_hash,
+            "sha256": sha256_hash[:16],
             "output": str(output_path),
             "algorithm": algorithm,
             "message_id": message_id,
@@ -259,7 +259,7 @@ def decrypt_file(
 
     logger.info(
         "Decryption complete",
-        extra={"sha256": actual_sha256, "output": str(output_path)},
+        extra={"sha256": actual_sha256[:16], "output": str(output_path)},
     )
 
     return DecryptResult(

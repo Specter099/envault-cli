@@ -97,11 +97,16 @@ class S3Store:
     def _sanitize_filename(name: str) -> str:
         """Sanitize a filename for use in S3 keys.
 
-        Replaces any character that is not alphanumeric, dot, hyphen, or
-        underscore with an underscore. This prevents path-traversal attacks
-        and avoids problematic characters in S3 object keys.
+        Extracts the basename (stripping directory components), replaces any
+        character that is not ASCII alphanumeric, dot, hyphen, or underscore
+        with an underscore, and collapses '..' sequences to prevent path
+        traversal.
         """
-        return re.sub(r"[^\w.\-]", "_", name)
+        name = Path(name).name
+        name = re.sub(r"[^a-zA-Z0-9._\-]", "_", name)
+        while ".." in name:
+            name = name.replace("..", ".")
+        return name or "_"
 
     def s3_key_for_file(self, sha256_hash: str, file_name: str) -> str:
         """Generate a content-addressed S3 key for an encrypted file.

@@ -466,6 +466,7 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
             _validate_sha256(sha256_hash)
             events = store.list_events_for_file(sha256_hash)
         elif since:
+            _validate_date(since)
             events = store.list_events_by_date(since)
         else:
             console.print("[yellow]Provide --file or --since.[/yellow]")
@@ -594,7 +595,16 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
 
     header = entry.get("header", {})
     input_path = entry.get("input", "")
-    file_name = Path(input_path).name if input_path else "unknown"
+    if not input_path:
+        return None
+
+    plaintext_path = Path(input_path)
+    if ".." in plaintext_path.parts:
+        raise MigrationError(f"Path traversal not allowed in migration input: {input_path!r}")
+    if plaintext_path.is_absolute():
+        logger.warning("Absolute path in migration input: %s", input_path)
+
+    file_name = S3Store._sanitize_filename(plaintext_path.name)
     algorithm = _extract_algorithm(header)
     message_id = _extract_message_id(header)
     kms_key_id = _extract_kms_key_id(header)
@@ -602,7 +612,6 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
 
     from envault.crypto import sha256_file
 
-    plaintext_path = Path(input_path)
     if not plaintext_path.exists():
         logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
         return None
@@ -620,7 +629,7 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
         encryption_context=enc_context,
         algorithm=algorithm,
         message_id=message_id,
-        file_size_bytes=0,
+        file_size_bytes=plaintext_path.stat().st_size,
         tags={"source": "migrated"},
         encrypted_at=now,
         last_updated=now,
@@ -691,6 +700,12 @@ def rotate_key(
         for r in records:
             console.print(f"  Would rotate: {r.file_name} ({r.sha256_hash[:16]}...)")
         return
+
+    console.print(
+        "[dim yellow]Note: Temporary plaintext is overwritten with zeros before deletion, "
+        "but secure erasure is not guaranteed on copy-on-write filesystems (APFS, Btrfs, "
+        "ZFS) or SSDs with wear-levelling.[/dim yellow]"
+    )
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
@@ -795,6 +810,16 @@ def _validate_sha256(value: str) -> str:
 def _is_sha256(value: str) -> bool:
     """Return True if value looks like a full 64-char hex SHA256 hash."""
     return bool(_SHA256_RE.fullmatch(value))
+
+
+def _validate_date(value: str) -> str:
+    """Validate a YYYY-MM-DD date string."""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        console.print(f"[red]Invalid date: {value!r}. Expected format: YYYY-MM-DD.[/red]")
+        sys.exit(1)
+    return value
 
 
 def _resolve_identifier(

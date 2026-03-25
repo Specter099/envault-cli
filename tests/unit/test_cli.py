@@ -17,11 +17,12 @@ from envault.cli import (
     _friendly_message,
     _parse_output_json_entry,
     _parse_tags,
+    _validate_date,
     cli,
     main,
 )
 from envault.crypto import DecryptResult, EncryptResult
-from envault.exceptions import ChecksumMismatchError, EnvaultError
+from envault.exceptions import ChecksumMismatchError, EnvaultError, MigrationError
 from envault.state import ENCRYPTED, FileRecord, StateStore
 
 TABLE_NAME = "envault-test-state"
@@ -148,14 +149,50 @@ def test_parse_entry_uses_content_hash(tmp_path: Path):
 
 def test_parse_entry_skips_missing_file(tmp_path: Path):
     """_parse_output_json_entry returns None when the plaintext file doesn't exist."""
-    entry = _make_entry("/nonexistent/path/file.txt")
+    entry = _make_entry("nonexistent/file.txt")
     record = _parse_output_json_entry(entry)
     assert record is None
 
 
 def test_parse_entry_skips_non_encrypt_mode():
-    entry = {"mode": "decrypt", "input": "/some/file"}
+    entry = {"mode": "decrypt", "input": "some/file"}
     assert _parse_output_json_entry(entry) is None
+
+
+def test_parse_entry_rejects_path_traversal():
+    """Paths with '..' components must raise MigrationError."""
+    entry = _make_entry("../../etc/passwd")
+    with pytest.raises(MigrationError, match="Path traversal not allowed"):
+        _parse_output_json_entry(entry)
+
+
+def test_parse_entry_records_file_size(tmp_path: Path):
+    """Migrated records must store actual file size, not zero."""
+    plaintext = tmp_path / "sized.txt"
+    content = b"hello world\n"
+    plaintext.write_bytes(content)
+
+    entry = _make_entry(str(plaintext))
+    record = _parse_output_json_entry(entry)
+
+    assert record is not None
+    assert record.file_size_bytes == len(content)
+
+
+def test_validate_date_accepts_valid():
+    """Valid YYYY-MM-DD dates must pass validation."""
+    assert _validate_date("2024-01-15") == "2024-01-15"
+    assert _validate_date("2026-12-31") == "2026-12-31"
+
+
+def test_validate_date_rejects_invalid():
+    """Invalid date strings must cause SystemExit."""
+    with pytest.raises(SystemExit):
+        _validate_date("not-a-date")
+    with pytest.raises(SystemExit):
+        _validate_date("01/15/2024")
+    with pytest.raises(SystemExit):
+        _validate_date("2024-13-01")
 
 
 def test_best_effort_delete_overwrites_before_removal(tmp_path: Path):
