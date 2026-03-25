@@ -147,7 +147,8 @@ def encrypt(
     errors = 0
     for file_path in track(files, description="Encrypting..."):
         try:
-            _encrypt_one(file_path, config, tags, store, s3, correlation_id, force)
+            file_correlation_id = f"{correlation_id}/{uuid.uuid4()}"
+            _encrypt_one(file_path, config, tags, store, s3, file_correlation_id, force)
         except AlreadyEncryptedError:
             console.print(
                 f"[yellow]⏭[/yellow] {file_path.name} already ENCRYPTED (use --force to re-encrypt)"
