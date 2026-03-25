@@ -121,7 +121,7 @@ jobs:
 
       - name: Install CDK dependencies
         run: |
-          npm install -g aws-cdk@2.244.0
+          npm install -g aws-cdk@2.1113.0
           pip install -r infra/cdk/requirements.txt
 
       - name: CDK synth
