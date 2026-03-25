@@ -134,6 +134,29 @@ def test_s3_key_sanitize_preserves_safe_names():
     assert "my-file_v2.tar.gz.encrypted" in key
 
 
+def test_sanitize_filename_ascii_only():
+    """Unicode word characters must be replaced with underscores."""
+    assert S3Store._sanitize_filename("caf\u00e9.txt") == "caf_.txt"
+    assert S3Store._sanitize_filename("\u4f60\u597d.txt") == "__.txt"
+
+
+def test_sanitize_filename_strips_dot_dot():
+    """Double-dot sequences must be collapsed."""
+    result = S3Store._sanitize_filename("foo..bar.txt")
+    assert ".." not in result
+
+
+def test_sanitize_filename_strips_directory():
+    """Directory components must be stripped."""
+    assert S3Store._sanitize_filename("../../etc/passwd") == "passwd"
+    assert S3Store._sanitize_filename("/absolute/path/file.txt") == "file.txt"
+
+
+def test_sanitize_filename_empty_returns_underscore():
+    """Empty input must return underscore."""
+    assert S3Store._sanitize_filename("") == "_"
+
+
 def test_s3store_uses_shared_boto_config():
     """S3Store must create its client with the shared boto_config."""
     from unittest.mock import patch

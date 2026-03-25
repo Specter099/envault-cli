@@ -43,6 +43,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: testing
           AWS_DEFAULT_REGION: us-east-1
 
+      - name: Audit dependencies
+        run: pip install pip-audit && pip-audit --ignore-vuln CVE-2026-4539
+
   build:
     name: Build distribution
     needs: ci
