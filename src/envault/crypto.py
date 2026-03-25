@@ -118,7 +118,7 @@ def encrypt_file(
     key_provider = StrictAwsKmsMasterKeyProvider(key_ids=[key_id])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
 
     with input_path.open("rb") as raw_input:
         hashing_reader = _HashingReader(raw_input)

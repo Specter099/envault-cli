@@ -10,7 +10,7 @@ from botocore.config import Config as BotoConfig
 
 from envault.exceptions import ConfigurationError
 
-_ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
+_ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
 
 # Shared boto3 client config:
 # - Explicit timeouts prevent indefinite hangs under partial network failure
