@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,7 @@ class S3Store:
             str(local_path),
             ExtraArgs=extra_args if extra_args else None,
         )
+        os.chmod(str(local_path), 0o600)
         logger.info("Download complete", extra={"local_path": str(local_path)})
 
     @staticmethod

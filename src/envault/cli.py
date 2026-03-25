@@ -868,7 +868,7 @@ def _resolve_identifier(
     return records[version - 1]
 
 
-_ACCOUNT_ID_RE = re.compile(r"\d{12}")
+_ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
 
 
 def _validate_account_ids(raw: str) -> list[str]:

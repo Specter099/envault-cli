@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+echo "WARNING: These legacy shell scripts are deprecated. Use 'envault encrypt' instead." >&2
+
 # Load only S3_BUCKET from .env to avoid leaking other credentials to subprocesses
 if [[ -f "../.env" ]]; then
     _s3_val="$(grep -E '^S3_BUCKET=' "../.env" | head -1 | cut -d= -f2-)"
