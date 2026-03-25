@@ -38,9 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging(verbose: bool) -> None:
-    from pythonjsonlogger.jsonlogger import (  # type: ignore[attr-defined,unused-ignore]
-        JsonFormatter,
-    )
+    from pythonjsonlogger.json import JsonFormatter
 
     handler = logging.StreamHandler(sys.stderr)
     fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")  # type: ignore[no-untyped-call,unused-ignore]
