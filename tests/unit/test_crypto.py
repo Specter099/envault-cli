@@ -1,23 +1,41 @@
-"""Unit tests for envault.crypto (SHA256 and checksum verification).
+"""Unit tests for envault.crypto.
 
-Note: encrypt_file/decrypt_file require real KMS calls (aws-encryption-sdk
-does not support moto KMS due to its custom cryptographic protocol). These
-functions are tested in tests/integration/. Here we test:
+Covers:
   - sha256_file: pure-Python, no AWS needed
-  - decrypt_file checksum mismatch behaviour
-  - EncryptResult / DecryptResult dataclass structure
+  - _HashingReader and result dataclasses
+  - Full encrypt/decrypt round-trips against moto-mocked KMS (the
+    aws-encryption-sdk only sends the DEK to KMS for wrapping, which moto
+    supports — the AES-GCM enveloping happens client-side)
+  - Failure-path hygiene: corrupted ciphertext, checksum mismatch, and
+    explicit region handling
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
-from envault.crypto import DecryptResult, EncryptResult, _HashingReader, sha256_file
-from envault.exceptions import ChecksumMismatchError
+import boto3
+import pytest
+from moto import mock_aws
+
+from envault.crypto import (
+    DecryptResult,
+    EncryptResult,
+    _HashingReader,
+    decrypt_file,
+    encrypt_file,
+    sha256_file,
+)
+from envault.exceptions import ChecksumMismatchError, DecryptionError
+
+KMS_KEY_ALIAS = "alias/envault-test"
+REGION = "us-east-1"
+MOTO_ACCOUNT_ID = "123456789012"
 
 
-def test_sha256_file_correct_hash(tmp_path: Path):
+def test_sha256_file_correct_hash(tmp_path: Path) -> None:
     content = b"hello world\n"
     p = tmp_path / "test.txt"
     p.write_bytes(content)
@@ -26,14 +44,14 @@ def test_sha256_file_correct_hash(tmp_path: Path):
     assert sha256_file(p) == expected
 
 
-def test_sha256_file_empty(tmp_path: Path):
+def test_sha256_file_empty(tmp_path: Path) -> None:
     p = tmp_path / "empty.txt"
     p.write_bytes(b"")
     expected = hashlib.sha256(b"").hexdigest()
     assert sha256_file(p) == expected
 
 
-def test_sha256_file_large(tmp_path: Path):
+def test_sha256_file_large(tmp_path: Path) -> None:
     # Ensure chunked reading works correctly
     content = b"X" * (200 * 1024)  # 200 KB, forces multiple 65536-byte chunks
     p = tmp_path / "large.bin"
@@ -42,7 +60,7 @@ def test_sha256_file_large(tmp_path: Path):
     assert sha256_file(p) == expected
 
 
-def test_encrypt_result_dataclass():
+def test_encrypt_result_dataclass() -> None:
     result = EncryptResult(
         sha256_hash="abc123",
         file_size_bytes=1024,
@@ -57,7 +75,7 @@ def test_encrypt_result_dataclass():
     assert result.output_path == Path("/tmp/out.enc")  # noqa: S108
 
 
-def test_decrypt_result_dataclass():
+def test_decrypt_result_dataclass() -> None:
     ctx = {"purpose": "envault-backup", "sha256": "def456"}
     result = DecryptResult(
         sha256_hash="def456",
@@ -71,11 +89,9 @@ def test_decrypt_result_dataclass():
     assert result.encryption_context == ctx
 
 
-def test_decrypt_file_requires_account_ids(tmp_path: Path):
+def test_decrypt_file_requires_account_ids(tmp_path: Path) -> None:
     """decrypt_file must raise ConfigurationError when allowed_account_ids is empty."""
-    import pytest
 
-    from envault.crypto import decrypt_file
     from envault.exceptions import ConfigurationError
 
     dummy_input = tmp_path / "dummy.enc"
@@ -99,7 +115,7 @@ def test_decrypt_file_requires_account_ids(tmp_path: Path):
         )
 
 
-def test_checksum_mismatch_error():
+def test_checksum_mismatch_error() -> None:
     err = ChecksumMismatchError(expected="aaa", actual="bbb")
     assert "aaa" in str(err)
     assert "bbb" in str(err)
@@ -110,7 +126,7 @@ def test_checksum_mismatch_error():
 # ---------------------------------------------------------------------------
 
 
-def test_hashing_reader_computes_sha256(tmp_path: Path):
+def test_hashing_reader_computes_sha256(tmp_path: Path) -> None:
     """_HashingReader must produce correct SHA256 after multiple reads."""
     content = b"hello world" * 100
     p = tmp_path / "data.bin"
@@ -129,7 +145,7 @@ def test_hashing_reader_computes_sha256(tmp_path: Path):
     assert reader.hexdigest == hashlib.sha256(content).hexdigest()
 
 
-def test_hashing_reader_empty_read(tmp_path: Path):
+def test_hashing_reader_empty_read(tmp_path: Path) -> None:
     """_HashingReader must handle empty files correctly."""
     p = tmp_path / "empty.bin"
     p.write_bytes(b"")
@@ -142,7 +158,7 @@ def test_hashing_reader_empty_read(tmp_path: Path):
     assert reader.hexdigest == hashlib.sha256(b"").hexdigest()
 
 
-def test_hashing_reader_delegates_attributes(tmp_path: Path):
+def test_hashing_reader_delegates_attributes(tmp_path: Path) -> None:
     """_HashingReader must delegate unknown attributes to the wrapped file."""
     p = tmp_path / "test.bin"
     p.write_bytes(b"some data")
@@ -153,3 +169,152 @@ def test_hashing_reader_delegates_attributes(tmp_path: Path):
         assert reader.name == f.name
         # .seekable() is a method on the file object
         assert reader.seekable() == f.seekable()
+
+
+# ---------------------------------------------------------------------------
+# Round-trip tests against moto-mocked KMS
+# ---------------------------------------------------------------------------
+
+
+def _write_multiframe_plaintext(path: Path) -> bytes:
+    """Write plaintext large enough to span multiple 64 KiB read chunks.
+
+    This matters for the corruption test: a corrupted late frame must fail
+    only after earlier chunks were already written to disk.
+    """
+    content = os.urandom(200 * 1024)
+    path.write_bytes(content)
+    return content
+
+
+def test_roundtrip_encrypt_decrypt(kms_key: str, tmp_path: Path) -> None:
+    """Encrypt then decrypt restores the exact content and encryption context."""
+    plaintext = tmp_path / "secret.txt"
+    content = _write_multiframe_plaintext(plaintext)
+    encrypted = tmp_path / "secret.enc"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "secret.txt"
+
+    result = encrypt_file(
+        input_path=plaintext,
+        key_id=KMS_KEY_ALIAS,
+        encryption_context={"purpose": "envault-backup", "file_name": "secret.txt"},
+        output_path=encrypted,
+        region=REGION,
+    )
+    assert result.sha256_hash == hashlib.sha256(content).hexdigest()
+    assert result.file_size_bytes == len(content)
+
+    dec = decrypt_file(
+        input_path=encrypted,
+        output_path=output,
+        expected_sha256=result.sha256_hash,
+        region=REGION,
+        allowed_account_ids=[MOTO_ACCOUNT_ID],
+    )
+    assert output.read_bytes() == content
+    assert dec.sha256_hash == result.sha256_hash
+    assert dec.encryption_context["purpose"] == "envault-backup"
+    assert dec.encryption_context["file_name"] == "secret.txt"
+
+
+def test_decrypt_corrupted_ciphertext_raises_and_cleans_up(kms_key: str, tmp_path: Path) -> None:
+    """A late-frame corruption surfaces as DecryptionError, is not retried,
+    and leaves no partial plaintext in the destination directory."""
+    plaintext = tmp_path / "secret.txt"
+    _write_multiframe_plaintext(plaintext)
+    encrypted = tmp_path / "secret.enc"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "secret.txt"
+
+    result = encrypt_file(
+        input_path=plaintext,
+        key_id=KMS_KEY_ALIAS,
+        encryption_context={"purpose": "envault-backup"},
+        output_path=encrypted,
+        region=REGION,
+    )
+
+    data = bytearray(encrypted.read_bytes())
+    data[int(len(data) * 0.9)] ^= 0xFF  # corrupt a late AES-GCM frame
+    encrypted.write_bytes(bytes(data))
+
+    with pytest.raises(DecryptionError):
+        decrypt_file(
+            input_path=encrypted,
+            output_path=output,
+            expected_sha256=result.sha256_hash,
+            region=REGION,
+            allowed_account_ids=[MOTO_ACCOUNT_ID],
+        )
+
+    assert not output.exists()
+    assert list(out_dir.iterdir()) == []  # no partial or temp files left behind
+    stats = decrypt_file.statistics
+    assert stats["attempt_number"] == 1  # deterministic failure must not be retried
+
+
+def test_decrypt_checksum_mismatch_leaves_no_output(kms_key: str, tmp_path: Path) -> None:
+    """On checksum mismatch the plaintext never appears at output_path and no
+    temp file remains in the destination directory."""
+    plaintext = tmp_path / "secret.txt"
+    _write_multiframe_plaintext(plaintext)
+    encrypted = tmp_path / "secret.enc"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "secret.txt"
+
+    encrypt_file(
+        input_path=plaintext,
+        key_id=KMS_KEY_ALIAS,
+        encryption_context={"purpose": "envault-backup"},
+        output_path=encrypted,
+        region=REGION,
+    )
+
+    with pytest.raises(ChecksumMismatchError):
+        decrypt_file(
+            input_path=encrypted,
+            output_path=output,
+            expected_sha256="0" * 64,
+            region=REGION,
+            allowed_account_ids=[MOTO_ACCOUNT_ID],
+        )
+
+    assert not output.exists()
+    assert list(out_dir.iterdir()) == []
+    stats = decrypt_file.statistics
+    assert stats["attempt_number"] == 1
+
+
+def test_encrypt_decrypt_respects_explicit_region(tmp_path: Path) -> None:
+    """encrypt_file must resolve the key alias in the requested region, not
+    the ambient AWS_DEFAULT_REGION (us-east-1 in the test environment)."""
+    with mock_aws():
+        kms = boto3.client("kms", region_name="us-west-2")
+        key_id = kms.create_key(Description="west-only")["KeyMetadata"]["KeyId"]
+        kms.create_alias(AliasName="alias/west-only", TargetKeyId=key_id)
+
+        plaintext = tmp_path / "secret.txt"
+        content = b"regional content\n" * 100
+        plaintext.write_bytes(content)
+        encrypted = tmp_path / "secret.enc"
+        output = tmp_path / "out.txt"
+
+        result = encrypt_file(
+            input_path=plaintext,
+            key_id="alias/west-only",
+            encryption_context={"purpose": "envault-backup"},
+            output_path=encrypted,
+            region="us-west-2",
+        )
+        decrypt_file(
+            input_path=encrypted,
+            output_path=output,
+            expected_sha256=result.sha256_hash,
+            region="us-west-2",
+            allowed_account_ids=[MOTO_ACCOUNT_ID],
+        )
+        assert output.read_bytes() == content

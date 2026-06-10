@@ -30,6 +30,7 @@ from envault.exceptions import (
     MigrationError,
     StateConflictError,
 )
+from envault.fileutils import best_effort_delete as _best_effort_delete
 from envault.s3 import S3Store
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
@@ -326,7 +327,7 @@ def decrypt(
             expected=record.encryption_context, actual=result.encryption_context
         )
     except EncryptionContextMismatchError:
-        output_path.unlink(missing_ok=True)
+        _best_effort_delete(output_path)
         console.print(
             "[bold red]Decryption failed:[/bold red] encryption context mismatch.\n"
             "The ciphertext metadata does not match the record in DynamoDB.\n"
@@ -706,9 +707,15 @@ def rotate_key(
         "ZFS) or SSDs with wear-levelling.[/dim yellow]"
     )
 
+    # Reuses the same context builder as encrypt so the two can never drift —
+    # a divergent context here would make future decrypts fail verification.
+    new_key_config = Config(key_id=new_key_id, bucket=bucket, table_name=table, region=region)
+
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
-        tmp_dl = tmp_pt = tmp_enc = None
+        tmp_dl: Path | None = None
+        tmp_pt: Path | None = None
+        tmp_enc: Path | None = None
         try:
             _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
             os.close(_fd_dl)
@@ -735,18 +742,14 @@ def rotate_key(
                 expected=record.encryption_context, actual=dec_result.encryption_context
             )
 
-            new_ctx = {
-                "purpose": "envault-backup",
-                "sha256": record.sha256_hash,
-                "file_name": record.file_name,
-                "kms_key_alias": new_key_id,
-            }
+            new_ctx = new_key_config.build_encryption_context(record.sha256_hash, record.file_name)
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
             _best_effort_delete(tmp_pt)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
 
             original_last_updated = record.last_updated
+            old_kms_key = record.kms_key_id
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
             record.kms_key_id = new_key_id
             record.encryption_context = new_ctx
@@ -764,14 +767,14 @@ def rotate_key(
                         "sha256": record.sha256_hash,
                         "s3_key": record.s3_key,
                         "s3_version_id": new_version_id,
-                        "old_kms_key": record.kms_key_id,
+                        "old_kms_key": old_kms_key,
                         "new_kms_key": new_key_id,
                         "correlation_id": correlation_id,
                     },
                 )
                 raise
             rotated += 1
-        except (EnvaultError, ClientError, BotoCoreError) as exc:
+        except (EnvaultError, ClientError, BotoCoreError, OSError) as exc:
             console.print(f"[red]Error rotating {record.file_name}: {exc}[/red]")
             errors += 1
         finally:
@@ -932,31 +935,3 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
             raise click.UsageError(f"Tag value for {k!r} exceeds {_TAG_VALUE_MAX_LEN} characters.")
         tags[k] = v
     return tags
-
-
-def _best_effort_delete(path: Path) -> None:
-    """Overwrite a file with zeros then unlink it (best-effort).
-
-    Attempts to reduce plaintext exposure on disk after decryption or key
-    rotation. This is NOT a guarantee of secure deletion — copy-on-write
-    filesystems (APFS, Btrfs, ZFS), SSD wear-levelling, and journaling
-    filesystems may retain copies of the original data.
-
-    Does nothing if the file does not exist.
-    """
-    try:
-        size = path.stat().st_size
-        chunk = b"\x00" * min(65536, size)
-        with path.open("r+b") as f:
-            remaining = size
-            while remaining > 0:
-                to_write = min(len(chunk), remaining)
-                f.write(chunk[:to_write])
-                remaining -= to_write
-            f.flush()
-            os.fsync(f.fileno())
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        logger.warning("Best-effort overwrite failed for %s: %s", path, exc)
-    path.unlink(missing_ok=True)

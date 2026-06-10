@@ -158,7 +158,9 @@ class EnvaultStack(Stack):
         # Changing projection type would cause CloudFormation table replacement.
         table.add_global_secondary_index(
             index_name="state-index",
-            partition_key=dynamodb.Attribute(name="current_state", type=dynamodb.AttributeType.STRING),
+            partition_key=dynamodb.Attribute(
+                name="current_state", type=dynamodb.AttributeType.STRING
+            ),
             sort_key=dynamodb.Attribute(name="encrypted_at", type=dynamodb.AttributeType.STRING),
             projection_type=dynamodb.ProjectionType.ALL,
         )
