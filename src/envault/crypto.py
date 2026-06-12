@@ -11,18 +11,36 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 import aws_encryption_sdk
+import botocore.session
 from aws_encryption_sdk import (
     CommitmentPolicy,
     DiscoveryAwsKmsMasterKeyProvider,
     StrictAwsKmsMasterKeyProvider,
 )
+from aws_encryption_sdk.exceptions import AWSEncryptionSDKClientError
+from cryptography.exceptions import InvalidTag
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
-from envault.exceptions import ChecksumMismatchError, ConfigurationError
+from envault.config import boto_config
+from envault.exceptions import ChecksumMismatchError, ConfigurationError, DecryptionError
+from envault.fileutils import best_effort_delete
 
 logger = logging.getLogger(__name__)
 
 _CHUNK_SIZE = 65536
+
+
+def _kms_session() -> botocore.session.Session:
+    """Botocore session for the KMS clients the encryption SDK creates.
+
+    The master key providers build their own KMS clients; without this they
+    would get default timeouts and default boto retries, which compound with
+    tenacity's application-level retries (the same amplification boto_config
+    exists to prevent for S3 and DynamoDB).
+    """
+    session = botocore.session.Session()
+    session.set_default_client_config(boto_config)
+    return session
 
 
 @dataclass
@@ -115,7 +133,11 @@ def encrypt_file(
     client = aws_encryption_sdk.EncryptionSDKClient(
         commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT
     )
-    key_provider = StrictAwsKmsMasterKeyProvider(key_ids=[key_id])
+    key_provider = StrictAwsKmsMasterKeyProvider(
+        key_ids=[key_id],
+        region_names=[region],
+        botocore_session=_kms_session(),
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -168,7 +190,7 @@ def encrypt_file(
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_not_exception_type((ConfigurationError, ChecksumMismatchError)),
+    retry=retry_if_not_exception_type((ConfigurationError, ChecksumMismatchError, DecryptionError)),
 )
 def decrypt_file(
     input_path: Path,
@@ -180,8 +202,12 @@ def decrypt_file(
     """Decrypt a file using AWS KMS (streaming).
 
     Uses streaming mode to avoid holding the full plaintext in memory.
-    SHA256 is computed incrementally as decrypted data is written to disk.
-    On checksum mismatch the partially-written output is deleted.
+    SHA256 is computed incrementally as decrypted data is written to a
+    temporary file in the destination directory; the file is renamed to
+    output_path only after decryption and checksum verification succeed, so
+    a failed, truncated, or tampered decrypt never leaves partial plaintext
+    at the destination. On any failure the temporary file is zero-overwritten
+    and removed.
 
     Args:
         input_path: Path to the encrypted file.
@@ -195,6 +221,9 @@ def decrypt_file(
 
     Raises:
         ChecksumMismatchError: If expected_sha256 is provided and doesn't match.
+        DecryptionError: If the SDK fails to decrypt (corrupted/tampered
+            ciphertext, failed frame authentication, untrusted key). Never
+            retried — these failures are deterministic.
     """
     if not allowed_account_ids:
         raise ConfigurationError(
@@ -215,30 +244,29 @@ def decrypt_file(
         discovery_filter=DiscoveryFilter(
             account_ids=tuple(allowed_account_ids),
             partition="aws",
-        )
+        ),
+        region_names=[region],
+        botocore_session=_kms_session(),
     )
 
-    # Decrypt to a temp file in the same directory so os.rename() is atomic
-    # (same filesystem). Only rename to output_path after hash verification.
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _fd_tmp, _tmp_path = tempfile.mkstemp(
-        dir=output_path.parent, prefix=".envault_dec_", suffix=".tmp"
+    # mkstemp creates the file 0o600; renamed over output_path only on success.
+    tmp_fd, _tmp_name = tempfile.mkstemp(
+        dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".part"
     )
-    os.fchmod(_fd_tmp, 0o600)
-    tmp_path = Path(_tmp_path)
+    tmp_path = Path(_tmp_name)
 
     try:
-        with input_path.open("rb") as encrypted_file:
-            with client.stream(
-                source=encrypted_file,
-                mode="d",
-                key_provider=key_provider,
-            ) as decryptor:
-                enc_context = dict(decryptor.header.encryption_context)
-
-                hasher = hashlib.sha256()
-                file_size = 0
-                with os.fdopen(_fd_tmp, "wb") as out:
+        hasher = hashlib.sha256()
+        file_size = 0
+        with os.fdopen(tmp_fd, "wb") as out:
+            with input_path.open("rb") as encrypted_file:
+                with client.stream(
+                    source=encrypted_file,
+                    mode="d",
+                    key_provider=key_provider,
+                ) as decryptor:
+                    enc_context = dict(decryptor.header.encryption_context)
                     while True:
                         chunk = decryptor.read(_CHUNK_SIZE)
                         if not chunk:
@@ -252,10 +280,18 @@ def decrypt_file(
         if expected_sha256 and actual_sha256 != expected_sha256:
             raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
 
-        os.rename(tmp_path, output_path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+        os.replace(tmp_path, output_path)
+    except (AWSEncryptionSDKClientError, InvalidTag) as exc:
+        # InvalidTag escapes the SDK raw when AES-GCM frame authentication
+        # fails (corrupted or tampered ciphertext).
+        raise DecryptionError(
+            f"Failed to decrypt {input_path.name}: {exc}. "
+            "The ciphertext may be corrupted, truncated, or tampered with."
+        ) from exc
+    finally:
+        # No-op after a successful rename; zero-overwrites partial plaintext
+        # left behind by any failure above.
+        best_effort_delete(tmp_path)
 
     logger.info(
         "Decryption complete",

@@ -34,6 +34,14 @@ class ChecksumMismatchError(EnvaultError):
         )
 
 
+class DecryptionError(EnvaultError):
+    """Raised when the AWS Encryption SDK fails to decrypt a ciphertext.
+
+    Typically indicates the ciphertext is corrupted, truncated, or was
+    tampered with — not a transient AWS error, so it is never retried.
+    """
+
+
 class EncryptionContextMismatchError(EnvaultError):
     """Raised when ciphertext encryption context doesn't match DynamoDB."""
 

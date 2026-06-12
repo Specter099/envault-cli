@@ -272,7 +272,7 @@ class StateStore:
         }
         while True:
             response = self._table.query(**query_kwargs)
-            count += response.get("Count", 0)
+            count += int(response.get("Count", 0))
             last_key = response.get("LastEvaluatedKey")
             if not last_key:
                 break

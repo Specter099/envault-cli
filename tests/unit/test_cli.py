@@ -86,7 +86,7 @@ def _upload_fake_ciphertext(s3_key: str) -> str:
     """Upload fake ciphertext to S3 and return the real VersionId."""
     s3 = boto3.client("s3", region_name=REGION)
     resp = s3.put_object(Bucket=BUCKET_NAME, Key=s3_key, Body=b"fake-ciphertext")
-    return resp.get("VersionId", "")
+    return str(resp.get("VersionId", ""))
 
 
 def _seed_encrypted_record(
@@ -120,7 +120,7 @@ def _seed_encrypted_record(
     return record
 
 
-def _make_entry(input_path: str) -> dict:
+def _make_entry(input_path: str) -> dict[str, object]:
     return {
         "mode": "encrypt",
         "input": input_path,
@@ -133,7 +133,7 @@ def _make_entry(input_path: str) -> dict:
     }
 
 
-def test_parse_entry_uses_content_hash(tmp_path: Path):
+def test_parse_entry_uses_content_hash(tmp_path: Path) -> None:
     """_parse_output_json_entry must hash file CONTENT, not the path string."""
     plaintext = tmp_path / "secret.txt"
     content = b"sensitive data\n"
@@ -147,26 +147,26 @@ def test_parse_entry_uses_content_hash(tmp_path: Path):
     assert record.sha256_hash == expected_hash
 
 
-def test_parse_entry_skips_missing_file(tmp_path: Path):
+def test_parse_entry_skips_missing_file(tmp_path: Path) -> None:
     """_parse_output_json_entry returns None when the plaintext file doesn't exist."""
     entry = _make_entry("nonexistent/file.txt")
     record = _parse_output_json_entry(entry)
     assert record is None
 
 
-def test_parse_entry_skips_non_encrypt_mode():
+def test_parse_entry_skips_non_encrypt_mode() -> None:
     entry = {"mode": "decrypt", "input": "some/file"}
     assert _parse_output_json_entry(entry) is None
 
 
-def test_parse_entry_rejects_path_traversal():
+def test_parse_entry_rejects_path_traversal() -> None:
     """Paths with '..' components must raise MigrationError."""
     entry = _make_entry("../../etc/passwd")
     with pytest.raises(MigrationError, match="Path traversal not allowed"):
         _parse_output_json_entry(entry)
 
 
-def test_parse_entry_records_file_size(tmp_path: Path):
+def test_parse_entry_records_file_size(tmp_path: Path) -> None:
     """Migrated records must store actual file size, not zero."""
     plaintext = tmp_path / "sized.txt"
     content = b"hello world\n"
@@ -179,13 +179,13 @@ def test_parse_entry_records_file_size(tmp_path: Path):
     assert record.file_size_bytes == len(content)
 
 
-def test_validate_date_accepts_valid():
+def test_validate_date_accepts_valid() -> None:
     """Valid YYYY-MM-DD dates must pass validation."""
     assert _validate_date("2024-01-15") == "2024-01-15"
     assert _validate_date("2026-12-31") == "2026-12-31"
 
 
-def test_validate_date_rejects_invalid():
+def test_validate_date_rejects_invalid() -> None:
     """Invalid date strings must cause SystemExit."""
     with pytest.raises(SystemExit):
         _validate_date("not-a-date")
@@ -195,7 +195,7 @@ def test_validate_date_rejects_invalid():
         _validate_date("2024-13-01")
 
 
-def test_best_effort_delete_overwrites_before_removal(tmp_path: Path):
+def test_best_effort_delete_overwrites_before_removal(tmp_path: Path) -> None:
     """_best_effort_delete must zero-out file contents before unlinking."""
     p = tmp_path / "sensitive.bin"
     p.write_bytes(b"TOP SECRET DATA")
@@ -206,20 +206,22 @@ def test_best_effort_delete_overwrites_before_removal(tmp_path: Path):
     assert not p.exists()
 
 
-def test_best_effort_delete_missing_file_is_noop(tmp_path: Path):
+def test_best_effort_delete_missing_file_is_noop(tmp_path: Path) -> None:
     """_best_effort_delete on a non-existent path must not raise."""
     p = tmp_path / "does_not_exist"
     _best_effort_delete(p)  # should not raise
 
 
-def test_best_effort_delete_zero_length_file(tmp_path: Path):
+def test_best_effort_delete_zero_length_file(tmp_path: Path) -> None:
     p = tmp_path / "empty"
     p.write_bytes(b"")
     _best_effort_delete(p)
     assert not p.exists()
 
 
-def test_best_effort_delete_logs_warning_on_oserror(tmp_path: Path, caplog):
+def test_best_effort_delete_logs_warning_on_oserror(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """_best_effort_delete must log a warning if overwrite fails with OSError."""
     import logging
     from unittest.mock import patch
@@ -229,45 +231,45 @@ def test_best_effort_delete_logs_warning_on_oserror(tmp_path: Path, caplog):
 
     with (
         patch.object(Path, "open", side_effect=OSError("Permission denied")),
-        caplog.at_level(logging.WARNING, logger="envault.cli"),
+        caplog.at_level(logging.WARNING, logger="envault.fileutils"),
     ):
         _best_effort_delete(p)
 
     assert any("best-effort" in r.message.lower() for r in caplog.records)
 
 
-def test_parse_tags_valid():
+def test_parse_tags_valid() -> None:
     result = _parse_tags(("project=finance", "env=prod"))
     assert result == {"project": "finance", "env": "prod"}
 
 
-def test_parse_tags_invalid_key_raises():
+def test_parse_tags_invalid_key_raises() -> None:
     """Tag keys with special characters must raise UsageError."""
     with pytest.raises(click.UsageError, match="Invalid tag key"):
         _parse_tags(("bad key!=value",))
 
 
-def test_parse_tags_key_too_long_raises():
+def test_parse_tags_key_too_long_raises() -> None:
     """Tag key longer than 64 chars must raise UsageError."""
     long_key = "k" * 65
     with pytest.raises(click.UsageError, match="Invalid tag key"):
         _parse_tags((f"{long_key}=value",))
 
 
-def test_parse_tags_value_too_long_raises():
+def test_parse_tags_value_too_long_raises() -> None:
     """Tag value longer than 256 chars must raise UsageError."""
     long_val = "v" * 257
     with pytest.raises(click.UsageError, match="exceeds"):
         _parse_tags((f"key={long_val}",))
 
 
-def test_parse_tags_empty_key_raises():
+def test_parse_tags_empty_key_raises() -> None:
     with pytest.raises(click.UsageError, match="Invalid tag key"):
         _parse_tags(("=value",))
 
 
 @mock_aws
-def test_decrypt_rejects_invalid_sha256_format():
+def test_decrypt_rejects_invalid_sha256_format() -> None:
     """decrypt treats non-SHA256 input as a filename lookup."""
     _create_table()
     runner = CliRunner()
@@ -293,7 +295,7 @@ def test_decrypt_rejects_invalid_sha256_format():
 
 
 @mock_aws
-def test_decrypt_accepts_filename_identifier():
+def test_decrypt_accepts_filename_identifier() -> None:
     """decrypt command should accept a filename and resolve it."""
     _create_table()
     runner = CliRunner()
@@ -313,7 +315,7 @@ def test_decrypt_accepts_filename_identifier():
 
 
 @mock_aws
-def test_decrypt_version_flag_out_of_range():
+def test_decrypt_version_flag_out_of_range() -> None:
     """--version N where N > number of matches should error."""
     _create_table()
     runner = CliRunner()
@@ -344,7 +346,13 @@ def test_decrypt_version_flag_out_of_range():
 # ---------------------------------------------------------------------------
 
 
-def _mock_encrypt_file(input_path, key_id, encryption_context, output_path, region="us-east-1"):
+def _mock_encrypt_file(
+    input_path: Path,
+    key_id: str,
+    encryption_context: dict[str, str],
+    output_path: Path,
+    region: str = "us-east-1",
+) -> EncryptResult:
     """Fake encrypt_file that writes dummy ciphertext and returns EncryptResult."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b"fake-ciphertext")
@@ -359,7 +367,7 @@ def _mock_encrypt_file(input_path, key_id, encryption_context, output_path, regi
 
 
 @mock_aws
-def test_encrypt_command_end_to_end(tmp_path: Path):
+def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
     """encrypt command: mocked crypto, real DynamoDB + S3."""
     _create_table()
     _create_bucket()
@@ -398,8 +406,12 @@ def test_encrypt_command_end_to_end(tmp_path: Path):
 
 
 def _mock_decrypt_file_ok(
-    input_path, output_path, expected_sha256=None, region="us-east-1", allowed_account_ids=None
-):
+    input_path: Path,
+    output_path: Path,
+    expected_sha256: str | None = None,
+    region: str = "us-east-1",
+    allowed_account_ids: list[str] | None = None,
+) -> DecryptResult:
     """Fake decrypt_file that writes plaintext and returns matching context."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b"decrypted content")
@@ -417,7 +429,7 @@ def _mock_decrypt_file_ok(
 
 
 @mock_aws
-def test_decrypt_command_end_to_end(tmp_path: Path):
+def test_decrypt_command_end_to_end(tmp_path: Path) -> None:
     """decrypt command: mocked crypto, pre-seeded DynamoDB + S3."""
     _create_table()
     _create_bucket()
@@ -452,7 +464,7 @@ def test_decrypt_command_end_to_end(tmp_path: Path):
 
 
 @mock_aws
-def test_decrypt_checksum_mismatch(tmp_path: Path):
+def test_decrypt_checksum_mismatch(tmp_path: Path) -> None:
     """decrypt must surface ChecksumMismatchError from the crypto layer."""
     _create_table()
     _create_bucket()
@@ -488,7 +500,7 @@ def test_decrypt_checksum_mismatch(tmp_path: Path):
 
 
 @mock_aws
-def test_decrypt_encryption_context_mismatch(tmp_path: Path):
+def test_decrypt_encryption_context_mismatch(tmp_path: Path) -> None:
     """decrypt must fail when encryption context from ciphertext doesn't match DynamoDB."""
     _create_table()
     _create_bucket()
@@ -497,8 +509,12 @@ def test_decrypt_encryption_context_mismatch(tmp_path: Path):
     _upload_fake_ciphertext(record.s3_key)
 
     def _mock_decrypt_mismatched_ctx(
-        input_path, output_path, expected_sha256=None, region="us-east-1", allowed_account_ids=None
-    ):
+        input_path: Path,
+        output_path: Path,
+        expected_sha256: str | None = None,
+        region: str = "us-east-1",
+        allowed_account_ids: list[str] | None = None,
+    ) -> DecryptResult:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"data")
         return DecryptResult(
@@ -537,7 +553,7 @@ def test_decrypt_encryption_context_mismatch(tmp_path: Path):
 
 
 @mock_aws
-def test_decrypt_succeeds_with_sdk_extra_keys(tmp_path: Path):
+def test_decrypt_succeeds_with_sdk_extra_keys(tmp_path: Path) -> None:
     """decrypt must pass when ciphertext has extra SDK-added keys like aws-crypto-public-key."""
     _create_table()
     _create_bucket()
@@ -547,8 +563,12 @@ def test_decrypt_succeeds_with_sdk_extra_keys(tmp_path: Path):
     _seed_encrypted_record(store, s3_version_id=version_id)
 
     def _mock_decrypt_with_extra_keys(
-        input_path, output_path, expected_sha256=None, region="us-east-1", allowed_account_ids=None
-    ):
+        input_path: Path,
+        output_path: Path,
+        expected_sha256: str | None = None,
+        region: str = "us-east-1",
+        allowed_account_ids: list[str] | None = None,
+    ) -> DecryptResult:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"decrypted content")
         return DecryptResult(
@@ -591,7 +611,7 @@ def test_decrypt_succeeds_with_sdk_extra_keys(tmp_path: Path):
 
 
 @mock_aws
-def test_decrypt_checksum_mismatch_shows_friendly_message(tmp_path: Path):
+def test_decrypt_checksum_mismatch_shows_friendly_message(tmp_path: Path) -> None:
     """decrypt surfaces ChecksumMismatchError as a human-readable message, not a traceback."""
     _create_table()
     _create_bucket()
@@ -630,7 +650,7 @@ def test_decrypt_checksum_mismatch_shows_friendly_message(tmp_path: Path):
 
 
 @mock_aws
-def test_decrypt_aws_error_shows_friendly_message(tmp_path: Path):
+def test_decrypt_aws_error_shows_friendly_message(tmp_path: Path) -> None:
     """decrypt surfaces AWS ClientError as a human-readable message, not a traceback."""
     _create_table()
     _create_bucket()
@@ -642,7 +662,7 @@ def test_decrypt_aws_error_shows_friendly_message(tmp_path: Path):
     runner = CliRunner()
     with patch(
         "envault.cli.decrypt_file",
-        side_effect=ClientError(error_response, "Decrypt"),
+        side_effect=ClientError(error_response, "Decrypt"),  # type: ignore[arg-type]
     ):
         result = runner.invoke(
             main,
@@ -670,7 +690,7 @@ def test_decrypt_aws_error_shows_friendly_message(tmp_path: Path):
 
 
 @mock_aws
-def test_rotate_key_end_to_end(tmp_path: Path):
+def test_rotate_key_end_to_end(tmp_path: Path) -> None:
     """rotate-key: mocked decrypt + re-encrypt, real DynamoDB + S3."""
     _create_table()
     _create_bucket()
@@ -682,8 +702,12 @@ def test_rotate_key_end_to_end(tmp_path: Path):
     new_key_id = "alias/new-key"
 
     def _mock_decrypt(
-        input_path, output_path, expected_sha256=None, region="us-east-1", allowed_account_ids=None
-    ):
+        input_path: Path,
+        output_path: Path,
+        expected_sha256: str | None = None,
+        region: str = "us-east-1",
+        allowed_account_ids: list[str] | None = None,
+    ) -> DecryptResult:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"plaintext")
         return DecryptResult(
@@ -728,7 +752,7 @@ def test_rotate_key_end_to_end(tmp_path: Path):
 
 
 @mock_aws
-def test_encrypt_temp_file_cleanup_on_failure(tmp_path: Path):
+def test_encrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
     """Temp encrypted file must be cleaned up even if encrypt_file raises."""
     _create_table()
     _create_bucket()
@@ -768,7 +792,7 @@ def test_encrypt_temp_file_cleanup_on_failure(tmp_path: Path):
 
 
 @mock_aws
-def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path):
+def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
     """Temp downloaded file must be cleaned up even if decrypt_file raises."""
     _create_table()
     _create_bucket()
@@ -810,7 +834,9 @@ def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path):
 
 
 @mock_aws
-def test_encrypt_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplog):
+def test_encrypt_logs_recovery_info_on_state_write_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """If DynamoDB write fails after S3 upload, log S3 key for recovery."""
     import logging
 
@@ -851,7 +877,9 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplo
 
 
 @mock_aws
-def test_decrypt_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplog):
+def test_decrypt_logs_recovery_info_on_state_write_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """If DynamoDB write fails after decryption, log output path for recovery."""
     import logging
 
@@ -892,7 +920,9 @@ def test_decrypt_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplo
 
 
 @mock_aws
-def test_rotate_key_logs_recovery_info_on_state_write_failure(tmp_path: Path, caplog):
+def test_rotate_key_logs_recovery_info_on_state_write_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """If DynamoDB write fails after S3 re-upload during rotation, log recovery info."""
     import logging
 
@@ -904,8 +934,12 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(tmp_path: Path, ca
     _seed_encrypted_record(store, s3_version_id=version_id)
 
     def _mock_decrypt(
-        input_path, output_path, expected_sha256=None, region="us-east-1", allowed_account_ids=None
-    ):
+        input_path: Path,
+        output_path: Path,
+        expected_sha256: str | None = None,
+        region: str = "us-east-1",
+        allowed_account_ids: list[str] | None = None,
+    ) -> DecryptResult:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"plaintext")
         return DecryptResult(
@@ -947,6 +981,114 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(tmp_path: Path, ca
 
     assert result.exit_code == 0  # rotate-key catches per-file errors
     assert any("state write failed" in r.message.lower() for r in caplog.records)
+
+
+@mock_aws
+def test_rotate_key_recovery_log_records_old_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The recovery log must record the PREVIOUS key as old_kms_key.
+
+    Regression: the record was mutated to the new key before the failure
+    handler logged it, so both old_kms_key and new_kms_key showed the new key.
+    """
+    import logging
+
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    def _mock_decrypt(
+        input_path: Path,
+        output_path: Path,
+        expected_sha256: str | None = None,
+        region: str = "us-east-1",
+        allowed_account_ids: list[str] | None = None,
+    ) -> DecryptResult:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"plaintext")
+        return DecryptResult(
+            sha256_hash=FAKE_SHA,
+            file_size_bytes=9,
+            output_path=output_path,
+            encryption_context={
+                "purpose": "envault-backup",
+                "sha256": FAKE_SHA,
+                "file_name": "test.txt",
+                "kms_key_alias": KEY_ID,
+            },
+        )
+
+    runner = CliRunner()
+    with (
+        patch("envault.cli.decrypt_file", side_effect=_mock_decrypt),
+        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
+        patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
+        caplog.at_level(logging.ERROR, logger="envault.cli"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/new-key",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0
+    recovery = [r for r in caplog.records if "state write failed" in r.message.lower()]
+    assert recovery, "expected a recovery log record"
+    extra = recovery[0].__dict__
+    assert extra["old_kms_key"] == KEY_ID  # the key the file was encrypted under
+    assert extra["new_kms_key"] == "alias/new-key"
+
+
+@mock_aws
+def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
+    """A temp-file creation failure must surface as a per-file error message,
+    not an UnboundLocalError from the cleanup block referencing unset paths."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    runner = CliRunner()
+    with patch("envault.cli.tempfile.mkstemp", side_effect=OSError("disk full")):
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/new-key",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "disk full" in result.output
+    assert "1 errors" in result.output
 
 
 # ---------------------------------------------------------------------------
