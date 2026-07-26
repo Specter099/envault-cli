@@ -21,9 +21,9 @@ from envault.cli import (
     cli,
     main,
 )
-from envault.crypto import DecryptResult, EncryptResult
+from envault.crypto import DecryptResult, EncryptResult, verify_encryption_context
 from envault.exceptions import ChecksumMismatchError, EnvaultError, MigrationError
-from envault.state import ENCRYPTED, FileRecord, StateStore
+from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
 TABLE_NAME = "envault-test-state"
 BUCKET_NAME = "envault-test-bucket"
@@ -405,27 +405,46 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
     assert record.current_state == ENCRYPTED
 
 
-def _mock_decrypt_file_ok(
-    input_path: Path,
-    output_path: Path,
-    expected_sha256: str | None = None,
-    region: str = "us-east-1",
-    allowed_account_ids: list[str] | None = None,
-) -> DecryptResult:
-    """Fake decrypt_file that writes plaintext and returns matching context."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(b"decrypted content")
-    return DecryptResult(
-        sha256_hash=FAKE_SHA,
-        file_size_bytes=17,
-        output_path=output_path,
-        encryption_context={
-            "purpose": "envault-backup",
-            "sha256": FAKE_SHA,
-            "file_name": "test.txt",
-            "kms_key_alias": KEY_ID,
-        },
-    )
+_MATCHING_CONTEXT = {
+    "purpose": "envault-backup",
+    "sha256": FAKE_SHA,
+    "file_name": "test.txt",
+    "kms_key_alias": KEY_ID,
+}
+
+
+def _make_mock_decrypt(header_context: dict[str, str], content: bytes = b"decrypted content"):
+    """Build a fake decrypt_file that mirrors the real ordering guarantee.
+
+    The real implementation verifies the encryption context against the
+    ciphertext header *before* writing any plaintext, so the fake does too —
+    otherwise these tests would assert against a laxer contract than the code
+    they stand in for.
+    """
+
+    def _mock(
+        input_path: Path,
+        output_path: Path,
+        expected_sha256: str | None = None,
+        region: str = "us-east-1",
+        allowed_account_ids: list[str] | None = None,
+        expected_context: dict[str, str] | None = None,
+    ) -> DecryptResult:
+        if expected_context is not None:
+            verify_encryption_context(expected_context, header_context)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(content)
+        return DecryptResult(
+            sha256_hash=FAKE_SHA,
+            file_size_bytes=len(content),
+            output_path=output_path,
+            encryption_context=header_context,
+        )
+
+    return _mock
+
+
+_mock_decrypt_file_ok = _make_mock_decrypt(_MATCHING_CONTEXT)
 
 
 @mock_aws
@@ -508,21 +527,9 @@ def test_decrypt_encryption_context_mismatch(tmp_path: Path) -> None:
     record = _seed_encrypted_record(store)
     _upload_fake_ciphertext(record.s3_key)
 
-    def _mock_decrypt_mismatched_ctx(
-        input_path: Path,
-        output_path: Path,
-        expected_sha256: str | None = None,
-        region: str = "us-east-1",
-        allowed_account_ids: list[str] | None = None,
-    ) -> DecryptResult:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"data")
-        return DecryptResult(
-            sha256_hash=FAKE_SHA,
-            file_size_bytes=4,
-            output_path=output_path,
-            encryption_context={"purpose": "TAMPERED", "sha256": FAKE_SHA},
-        )
+    _mock_decrypt_mismatched_ctx = _make_mock_decrypt(
+        {"purpose": "TAMPERED", "sha256": FAKE_SHA}, content=b"data"
+    )
 
     runner = CliRunner()
     with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_mismatched_ctx):
@@ -547,9 +554,9 @@ def test_decrypt_encryption_context_mismatch(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "encryption context mismatch" in result.output.lower()
-    # Output file should have been cleaned up
-    decrypted_files = list(tmp_path.glob("test.txt"))
-    assert not decrypted_files or not decrypted_files[0].exists()
+    # Stronger than "cleaned up afterwards": verification happens before the
+    # plaintext is written, so it must never have reached the destination.
+    assert not list(tmp_path.glob("test.txt"))
 
 
 @mock_aws
@@ -562,28 +569,10 @@ def test_decrypt_succeeds_with_sdk_extra_keys(tmp_path: Path) -> None:
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
 
-    def _mock_decrypt_with_extra_keys(
-        input_path: Path,
-        output_path: Path,
-        expected_sha256: str | None = None,
-        region: str = "us-east-1",
-        allowed_account_ids: list[str] | None = None,
-    ) -> DecryptResult:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"decrypted content")
-        return DecryptResult(
-            sha256_hash=FAKE_SHA,
-            file_size_bytes=17,
-            output_path=output_path,
-            encryption_context={
-                "purpose": "envault-backup",
-                "sha256": FAKE_SHA,
-                "file_name": "test.txt",
-                "kms_key_alias": KEY_ID,
-                # SDK-added key — must NOT cause mismatch
-                "aws-crypto-public-key": "A4f3example...",
-            },
-        )
+    _mock_decrypt_with_extra_keys = _make_mock_decrypt(
+        # SDK-added key — must NOT cause mismatch
+        {**_MATCHING_CONTEXT, "aws-crypto-public-key": "A4f3example..."}
+    )
 
     runner = CliRunner()
     with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_with_extra_keys):
@@ -701,21 +690,7 @@ def test_rotate_key_end_to_end(tmp_path: Path) -> None:
 
     new_key_id = "alias/new-key"
 
-    def _mock_decrypt(
-        input_path: Path,
-        output_path: Path,
-        expected_sha256: str | None = None,
-        region: str = "us-east-1",
-        allowed_account_ids: list[str] | None = None,
-    ) -> DecryptResult:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"plaintext")
-        return DecryptResult(
-            sha256_hash=FAKE_SHA,
-            file_size_bytes=9,
-            output_path=output_path,
-            encryption_context=record.encryption_context,
-        )
+    _mock_decrypt = _make_mock_decrypt(record.encryption_context, content=b"plaintext")
 
     runner = CliRunner()
     with (
@@ -877,10 +852,14 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(
 
 
 @mock_aws
-def test_decrypt_logs_recovery_info_on_state_write_failure(
+def test_decrypt_reports_audit_write_failure(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """If DynamoDB write fails after decryption, log output path for recovery."""
+    """A failed audit write must be surfaced, not swallowed.
+
+    The plaintext is already on disk by then, so the command cannot undo it —
+    but exiting 0 would leave an unlogged read looking like a clean one.
+    """
     import logging
 
     _create_table()
@@ -893,7 +872,7 @@ def test_decrypt_logs_recovery_info_on_state_write_failure(
     runner = CliRunner()
     with (
         patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok),
-        patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
+        patch.object(StateStore, "put_event", side_effect=EnvaultError("DynamoDB down")),
         caplog.at_level(logging.ERROR, logger="envault.cli"),
     ):
         result = runner.invoke(
@@ -916,7 +895,8 @@ def test_decrypt_logs_recovery_info_on_state_write_failure(
         )
 
     assert result.exit_code != 0
-    assert any("state write failed" in r.message.lower() for r in caplog.records)
+    assert any("audit event write failed" in r.message.lower() for r in caplog.records)
+    assert "audit trail" in result.output.lower()
 
 
 @mock_aws
@@ -933,26 +913,7 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
 
-    def _mock_decrypt(
-        input_path: Path,
-        output_path: Path,
-        expected_sha256: str | None = None,
-        region: str = "us-east-1",
-        allowed_account_ids: list[str] | None = None,
-    ) -> DecryptResult:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"plaintext")
-        return DecryptResult(
-            sha256_hash=FAKE_SHA,
-            file_size_bytes=9,
-            output_path=output_path,
-            encryption_context={
-                "purpose": "envault-backup",
-                "sha256": FAKE_SHA,
-                "file_name": "test.txt",
-                "kms_key_alias": KEY_ID,
-            },
-        )
+    _mock_decrypt = _make_mock_decrypt(_MATCHING_CONTEXT, content=b"plaintext")
 
     runner = CliRunner()
     with (
@@ -979,7 +940,9 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(
             env=_CLI_ENV,
         )
 
-    assert result.exit_code == 0  # rotate-key catches per-file errors
+    # Per-file errors are caught and counted, but a rotation that left files
+    # under the old key must still exit non-zero.
+    assert result.exit_code != 0
     assert any("state write failed" in r.message.lower() for r in caplog.records)
 
 
@@ -1001,26 +964,7 @@ def test_rotate_key_recovery_log_records_old_key(
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
 
-    def _mock_decrypt(
-        input_path: Path,
-        output_path: Path,
-        expected_sha256: str | None = None,
-        region: str = "us-east-1",
-        allowed_account_ids: list[str] | None = None,
-    ) -> DecryptResult:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"plaintext")
-        return DecryptResult(
-            sha256_hash=FAKE_SHA,
-            file_size_bytes=9,
-            output_path=output_path,
-            encryption_context={
-                "purpose": "envault-backup",
-                "sha256": FAKE_SHA,
-                "file_name": "test.txt",
-                "kms_key_alias": KEY_ID,
-            },
-        )
+    _mock_decrypt = _make_mock_decrypt(_MATCHING_CONTEXT, content=b"plaintext")
 
     runner = CliRunner()
     with (
@@ -1047,7 +991,8 @@ def test_rotate_key_recovery_log_records_old_key(
             env=_CLI_ENV,
         )
 
-    assert result.exit_code == 0
+    # The file failed to rotate, so the command must not report success.
+    assert result.exit_code != 0
     recovery = [r for r in caplog.records if "state write failed" in r.message.lower()]
     assert recovery, "expected a recovery log record"
     extra = recovery[0].__dict__
@@ -1086,9 +1031,12 @@ def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
             env=_CLI_ENV,
         )
 
-    assert result.exit_code == 0, result.output
+    # Non-zero: a partially-rotated corpus still has files under the old key,
+    # and reporting that as success is what made incomplete rotations invisible.
+    assert result.exit_code != 0, result.output
     assert "disk full" in result.output
     assert "1 errors" in result.output
+    assert "rotation incomplete" in result.output.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1216,3 +1164,198 @@ class TestFriendlyErrors:
         assert "AWS error:" in result.output
         assert "Table not found" in result.output
         assert "Traceback" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle regressions: reading a secret must not consume it
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_decrypt_is_repeatable(tmp_path: Path) -> None:
+    """C-1: decrypting must not flip state and lock the file out of a second read."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    args = [
+        "decrypt",
+        FAKE_SHA,
+        "--output",
+        str(tmp_path),
+        "--table",
+        TABLE_NAME,
+        "--bucket",
+        BUCKET_NAME,
+        "--region",
+        REGION,
+        "--allowed-account-ids",
+        ACCOUNT_IDS,
+    ]
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        first = runner.invoke(main, args, env=_CLI_ENV)
+        second = runner.invoke(main, args, env=_CLI_ENV)
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    # The stored object is still ciphertext, so the state must still say so.
+    assert store.get_current_state(FAKE_SHA).current_state == ENCRYPTED
+
+
+@mock_aws
+def test_decrypt_records_access_event_with_principal(tmp_path: Path) -> None:
+    """The read is captured in the audit trail, attributed to a principal."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0, result.output
+    events = [e for e in store.list_events_for_file(FAKE_SHA) if e["operation"] == "DECRYPT"]
+    assert len(events) == 1
+    assert events[0]["principal_arn"].startswith("arn:aws:")
+
+
+@mock_aws
+def test_rotate_key_covers_records_left_decrypted_by_old_versions(tmp_path: Path) -> None:
+    """C-2: a record stuck in DECRYPTED still has ciphertext in S3 and must rotate."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store, s3_version_id=version_id)
+
+    # Simulate the state an older envault left behind after a single decrypt.
+    record.current_state = DECRYPTED
+    store.put_current_state(record, expected_last_updated=record.last_updated)
+
+    _mock_decrypt = _make_mock_decrypt(record.encryption_context, content=b"plaintext")
+    runner = CliRunner()
+    with (
+        patch("envault.cli.decrypt_file", side_effect=_mock_decrypt),
+        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/new-key",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0, result.output
+    updated = store.get_current_state(FAKE_SHA)
+    assert updated.kms_key_id == "alias/new-key"
+    assert updated.current_state == ENCRYPTED
+
+
+@mock_aws
+def test_rotate_key_dry_run_lists_legacy_decrypted_records() -> None:
+    """The dry run must not under-report what needs rotating."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    record.current_state = DECRYPTED
+    store.put_current_state(record, expected_last_updated=record.last_updated)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "rotate-key",
+            "--new-key-id",
+            "alias/new-key",
+            "--dry-run",
+            "--table",
+            TABLE_NAME,
+            "--bucket",
+            BUCKET_NAME,
+            "--region",
+            REGION,
+            "--allowed-account-ids",
+            ACCOUNT_IDS,
+        ],
+        env=_CLI_ENV,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Found 1 files to rotate" in result.output
+
+
+@mock_aws
+def test_status_escapes_markup_in_file_names() -> None:
+    """A filename containing Rich markup must render literally, not as style."""
+    _create_table()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    record.file_name = "[bold red]not-my-name[/bold red]"
+    store.put_current_state(record, expected_last_updated=record.last_updated)
+
+    runner = CliRunner()
+    # Wide terminal so the cell is not truncated before we can inspect it.
+    result = runner.invoke(
+        main,
+        ["status", "--table", TABLE_NAME, "--region", REGION],
+        env={**_CLI_ENV, "COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.output
+    # If the markup were interpreted, the tag text would be consumed as styling
+    # and the displayed name would differ from the name actually stored.
+    assert "bold red" in result.output
+
+
+@mock_aws
+def test_status_survives_unmatched_markup_in_file_names() -> None:
+    """An unbalanced tag used to raise MarkupError and abort the whole table."""
+    _create_table()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    record.file_name = "[/nope].txt"
+    store.put_current_state(record, expected_last_updated=record.last_updated)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["status", "--table", TABLE_NAME, "--region", REGION],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code == 0, result.output

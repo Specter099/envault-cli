@@ -159,12 +159,28 @@ class StateStore:
         )
 
     def put_event(
-        self, record: FileRecord, operation: str, correlation_id: str, audit_ttl_days: int = 365
+        self,
+        record: FileRecord,
+        operation: str,
+        correlation_id: str,
+        audit_ttl_days: int = 365,
+        principal_arn: str = "",
     ) -> None:
-        """Append an immutable event record to the audit trail."""
+        """Append an immutable event record to the audit trail.
+
+        Args:
+            record: The file the event concerns.
+            operation: ENCRYPT, DECRYPT, ACCESS, ROTATE_KEY.
+            correlation_id: Groups events from a single invocation.
+            audit_ttl_days: Retention before DynamoDB TTL expires the event.
+            principal_arn: The AWS identity performing the operation. Without
+                this the trail records what happened but not who did it.
+        """
         now = _now_iso()
         unique_suffix = uuid.uuid4().hex[:8]
-        self._put_event_inner(record, operation, correlation_id, audit_ttl_days, now, unique_suffix)
+        self._put_event_inner(
+            record, operation, correlation_id, audit_ttl_days, now, unique_suffix, principal_arn
+        )
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def _put_event_inner(
@@ -175,16 +191,30 @@ class StateStore:
         audit_ttl_days: int,
         now: str,
         unique_suffix: str,
+        principal_arn: str = "",
     ) -> None:
         """Inner retry loop for put_event -- uses a fixed SK across retries."""
         sk = f"{EVENT_PREFIX}{now}#{operation}#{unique_suffix}"
         item = record.to_dynamo_item(sk=sk)
         item["operation"] = operation
         item["correlation_id"] = correlation_id
+        item["principal_arn"] = principal_arn
         item["current_state"] = record.current_state
         item["date"] = _today_str()
         item["ttl"] = _ttl_epoch(audit_ttl_days)
-        self._table.put_item(Item=item)
+        try:
+            # Enforce append-only at the write path. Without this an event can be
+            # silently overwritten at a known PK/SK by anyone holding PutItem,
+            # which is not what "immutable audit trail" should mean.
+            self._table.put_item(Item=item, ConditionExpression="attribute_not_exists(SK)")
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # The SK carries a random suffix, so a collision means this exact
+                # write already landed and tenacity is retrying a call that in
+                # fact succeeded. Treat as done rather than failing the command.
+                logger.debug("event already recorded, skipping duplicate write", extra={"sk": sk})
+                return
+            raise
         logger.debug(
             "put_event",
             extra={"sha256": record.sha256_hash[:16], "operation": operation},

@@ -58,3 +58,36 @@ After verifying all records, remove `output.json` from git history:
 ```bash
 git-filter-repo --path code/output.json --invert-paths
 ```
+
+## [Unreleased]
+
+### Added
+- `envault exec` — run a command with secrets supplied in memory. `--secret NAME=VAR`
+  injects into the child's environment; `--file NAME=VAR` writes to a sealed anonymous
+  `memfd` and passes `/proc/self/fd/N`, for programs that require a file path. A `{VAR}`
+  token in the command is substituted with that path. `--clean-env` starts the child from a
+  minimal environment.
+- `envault.isolation` — process hardening (`PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0`, best-effort
+  `mlockall`) applied before any plaintext exists, and `CredentialFd` for credential
+  material that has no filesystem path.
+- Audit events now record the calling AWS principal ARN, and `envault audit` shows it.
+- `crypto.decrypt_to_stream` — streaming decrypt to any sink, verifying the encryption
+  context from the ciphertext header before writing a single plaintext byte.
+- `S3Store.download_to_memory` for fetching ciphertext without touching disk.
+
+### Fixed
+- A file could only ever be decrypted once: `decrypt` required state `ENCRYPTED` and then
+  set `DECRYPTED`, making the record unreachable by name and invisible to `rotate-key`.
+  Reads are now recorded as events and no longer mutate the stored state, which also removes
+  optimistic-lock contention between concurrent readers.
+- `rotate-key` silently skipped every previously-decrypted file and exited 0. It now covers
+  records left in `DECRYPTED` by earlier versions and exits non-zero if any file could not be
+  rotated.
+- Audit events could be silently overwritten at a known PK/SK. Event writes now use
+  `attribute_not_exists(SK)`.
+- Encryption context was verified only after the plaintext had been written to its
+  destination; it is now checked before any plaintext is produced.
+- Untrusted file names from DynamoDB were rendered as Rich markup, misrepresenting the name
+  and raising `MarkupError` on unbalanced tags. All external strings are now escaped.
+- KMS discovery hardcoded the `aws` partition, excluding GovCloud and China regions.
+- An oversized in-memory fetch was retried three times before failing with the same answer.

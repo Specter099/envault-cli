@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 from pathlib import Path
 
 import boto3
@@ -318,3 +319,84 @@ def test_encrypt_decrypt_respects_explicit_region(tmp_path: Path) -> None:
             allowed_account_ids=[MOTO_ACCOUNT_ID],
         )
         assert output.read_bytes() == content
+
+
+# ---------------------------------------------------------------------------
+# Streaming decrypt: verification ordering
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_decrypt_to_stream_rejects_context_before_writing_plaintext():
+    """A mismatched context must be caught before any plaintext reaches the sink."""
+    import io
+
+    from envault.crypto import decrypt_to_stream
+    from envault.exceptions import EncryptionContextMismatchError
+
+    kms = boto3.client("kms", region_name=REGION)
+    key_id = kms.create_key(Description="stream-test")["KeyMetadata"]["KeyId"]
+    account = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
+    ctx = {"purpose": "envault-backup", "sha256": "a" * 64}
+
+    ciphertext = io.BytesIO()
+    plaintext = b"the actual secret bytes"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = Path(tmpdir) / "in.txt"
+        src.write_bytes(plaintext)
+        out = Path(tmpdir) / "out.enc"
+        encrypt_file(src, key_id, ctx, out, REGION)
+        ciphertext = io.BytesIO(out.read_bytes())
+
+    sink = io.BytesIO()
+    with pytest.raises(EncryptionContextMismatchError):
+        decrypt_to_stream(
+            ciphertext,
+            sink,
+            expected_context={"purpose": "SOMETHING-ELSE"},
+            region=REGION,
+            allowed_account_ids=[account],
+        )
+    assert sink.getvalue() == b"", "plaintext must not be written on a context mismatch"
+
+
+@mock_aws
+def test_decrypt_to_stream_roundtrip():
+    import io
+
+    from envault.crypto import decrypt_to_stream
+
+    kms = boto3.client("kms", region_name=REGION)
+    key_id = kms.create_key(Description="stream-test")["KeyMetadata"]["KeyId"]
+    account = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
+    plaintext = b"round trip content"
+    ctx = {"purpose": "envault-backup"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = Path(tmpdir) / "in.txt"
+        src.write_bytes(plaintext)
+        out = Path(tmpdir) / "out.enc"
+        encrypt_file(src, key_id, ctx, out, REGION)
+        ciphertext = io.BytesIO(out.read_bytes())
+
+    sink = io.BytesIO()
+    result = decrypt_to_stream(
+        ciphertext,
+        sink,
+        expected_sha256=hashlib.sha256(plaintext).hexdigest(),
+        expected_context=ctx,
+        region=REGION,
+        allowed_account_ids=[account],
+    )
+    assert sink.getvalue() == plaintext
+    assert result.output_path is None
+
+
+def test_partition_for_region():
+    """Discovery filters must not silently exclude GovCloud or China partitions."""
+    from envault.crypto import _partition_for_region
+
+    assert _partition_for_region("us-east-1") == "aws"
+    assert _partition_for_region("eu-west-2") == "aws"
+    assert _partition_for_region("us-gov-west-1") == "aws-us-gov"
+    assert _partition_for_region("cn-north-1") == "aws-cn"

@@ -111,18 +111,38 @@ You picked `exec` and *nothing else*. I'm treating that as a principle rather th
 preference: **materializing plaintext to disk stops being the default path.**
 
 - `envault exec [--secret NAME=ENV_VAR]... -- cmd args` — decrypt into the child's
-  environment, never touching disk
+  environment, never touching disk. **Shipped.**
+- `envault exec [--file NAME=ENV_VAR]...` — **the file-consuming case, and a hole in the
+  first draft of this plan.** Certificates, keystores and kubeconfigs cannot be passed as
+  environment variables; nginx, Postgres and the JVM all demand a path. Saying
+  "materializing plaintext to disk stops being the default" left half the stated content
+  type with no supported route at all.
+
+  The resolution keeps the principle rather than abandoning it: decrypt into an anonymous
+  `memfd`, seal it once the checksum and encryption context verify, and hand the child
+  `/proc/self/fd/N` by descriptor inheritance. No directory entry ever exists, so there is no
+  path for another process to open, no cleanup that can fail, and no plaintext surviving a
+  crash. A `{VAR}` token in the command is substituted with the path. **Shipped.**
+- Process hardening around both modes: `PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0`, and a
+  best-effort `mlockall`, applied before any plaintext exists. **Shipped.**
 - `.envault.yaml` manifest mapping secrets to env var names, so `envault exec -- ./server`
   works with no flags
 - `--format json|dotenv` on `get` for CI, still TTY-guarded
 - GitHub Action wrapping `exec`, with OIDC role assumption
+- systemd `LoadCredential=`/`SetCredentialEncrypted=` emitter for the long-running service
+  case — TPM-sealed and namespace-isolated, and cheaper to integrate than to reimplement
 - `envault run --watch` deferred; it's a nice demo and a large surface
 
 **Be honest in the docs about what `exec` does and doesn't buy.** On Linux a child's
 environment is readable via `/proc/PID/environ` by the same user and leaks through `ps e` on
 some configurations. `exec` is a large improvement over a file that persists after the
-process exits, but it is not isolation. Overclaiming here would undercut the trust the rest
-of the product is built on. Offer fd-passing (`--fd 3`) for the paranoid.
+process exits, but it is not isolation. `PR_SET_DUMPABLE` is reset by `execve` for non-setuid
+binaries, so it protects the envault process while the secret is in flight and cannot be
+inherited by the child. Overclaiming any of this would undercut the trust the rest of the
+product is built on.
+
+`--file` is the stronger of the two modes — the material is never in the child's environment
+at all — and should be the documented preference wherever the consumer accepts a path.
 
 ## v0.4.0 — Evidence (your chosen differentiator)
 

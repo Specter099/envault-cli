@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import boto3
+import pytest
 from moto import mock_aws
 
 from envault.s3 import S3Store
@@ -207,3 +209,55 @@ def test_upload_without_kms_key_id_omits_sse(tmp_path: Path):
         mock_put.assert_called_once()
         call_kwargs = mock_put.call_args.kwargs
         assert "SSEKMSKeyId" not in call_kwargs
+
+
+# ---------------------------------------------------------------------------
+# In-memory ciphertext fetch (used by `envault exec`)
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_download_to_memory_returns_ciphertext():
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    s3_client.put_object(Bucket=BUCKET, Key="enc/a", Body=b"ciphertext-bytes")
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    assert store.download_to_memory("enc/a").read() == b"ciphertext-bytes"
+
+
+@mock_aws
+def test_download_to_memory_honours_version_id():
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    first = s3_client.put_object(Bucket=BUCKET, Key="enc/a", Body=b"v1")["VersionId"]
+    s3_client.put_object(Bucket=BUCKET, Key="enc/a", Body=b"v2-overwritten")
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    assert store.download_to_memory("enc/a", version_id=first).read() == b"v1"
+
+
+@mock_aws
+def test_download_to_memory_rejects_oversized_object():
+    """A large object must be refused rather than exhausting memory."""
+    from envault.exceptions import EnvaultError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    s3_client.put_object(Bucket=BUCKET, Key="enc/big", Body=b"x" * 128)
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with patch("envault.s3.MAX_IN_MEMORY_BYTES", 16):
+        with pytest.raises(EnvaultError, match="limit for in-memory decryption"):
+            store.download_to_memory("enc/big")
+
+
+@mock_aws
+def test_download_to_memory_does_not_touch_disk(tmp_path):
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    s3_client.put_object(Bucket=BUCKET, Key="enc/a", Body=b"ciphertext")
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    store.download_to_memory("enc/a")
+    assert not list(tmp_path.iterdir())

@@ -7,6 +7,8 @@ import time
 from unittest.mock import patch
 
 import boto3
+import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from envault.exceptions import StateConflictError
@@ -573,3 +575,61 @@ def test_list_by_file_name_sorted_by_encrypted_at_descending():
     results = store.list_by_file_name("data.csv", ENCRYPTED)
     assert len(results) == 2
     assert results[0].encrypted_at >= results[1].encrypted_at
+
+
+# ---------------------------------------------------------------------------
+# Audit trail integrity
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_event_cannot_be_overwritten():
+    """C-3: an existing event must not be replaceable at its PK/SK."""
+    store = _create_table()
+    record = _make_record()
+    store.put_event(record, operation="ENCRYPT", correlation_id="corr")
+
+    events = store.list_events_for_file(record.sha256_hash)
+    assert len(events) == 1
+    original = events[0]
+
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    with pytest.raises(ClientError) as exc:
+        table.put_item(
+            Item={**original, "operation": "FORGED", "correlation_id": "attacker"},
+            ConditionExpression="attribute_not_exists(SK)",
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+    surviving = store.list_events_for_file(record.sha256_hash)
+    assert surviving[0]["operation"] == "ENCRYPT"
+
+
+@mock_aws
+def test_put_event_records_principal_arn():
+    """Attribution: the trail must say who, not just what."""
+    store = _create_table()
+    record = _make_record()
+    store.put_event(
+        record,
+        operation="ACCESS",
+        correlation_id="corr",
+        principal_arn="arn:aws:sts::123456789012:assumed-role/Deploy/session",
+    )
+    events = store.list_events_for_file(record.sha256_hash)
+    assert events[0]["principal_arn"] == "arn:aws:sts::123456789012:assumed-role/Deploy/session"
+
+
+@mock_aws
+def test_put_event_inner_duplicate_write_is_tolerated():
+    """The append-only condition must not break tenacity's retry path.
+
+    A retry re-uses the same SK, so the condition fails on the second attempt —
+    that means the write already landed, not that the command should error.
+    """
+    store = _create_table()
+    record = _make_record()
+    # Same fixed SK both times, as the retry path uses.
+    store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
+    store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
+    assert len(store.list_events_for_file(record.sha256_hash)) == 1
