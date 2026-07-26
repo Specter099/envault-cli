@@ -114,6 +114,7 @@ class StateStore:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
         retry=retry_if_not_exception_type(StateConflictError),
     )
     def put_current_state(
@@ -159,14 +160,34 @@ class StateStore:
         )
 
     def put_event(
-        self, record: FileRecord, operation: str, correlation_id: str, audit_ttl_days: int = 365
+        self,
+        record: FileRecord,
+        operation: str,
+        correlation_id: str,
+        audit_ttl_days: int = 365,
+        principal_arn: str = "",
     ) -> None:
-        """Append an immutable event record to the audit trail."""
+        """Append an immutable event record to the audit trail.
+
+        Args:
+            record: The file the event concerns.
+            operation: ENCRYPT, DECRYPT, ACCESS, ROTATE_KEY.
+            correlation_id: Groups events from a single invocation.
+            audit_ttl_days: Retention before DynamoDB TTL expires the event.
+            principal_arn: The AWS identity performing the operation. Without
+                this the trail records what happened but not who did it.
+        """
         now = _now_iso()
         unique_suffix = uuid.uuid4().hex[:8]
-        self._put_event_inner(record, operation, correlation_id, audit_ttl_days, now, unique_suffix)
+        self._put_event_inner(
+            record, operation, correlation_id, audit_ttl_days, now, unique_suffix, principal_arn
+        )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def _put_event_inner(
         self,
         record: FileRecord,
@@ -175,22 +196,40 @@ class StateStore:
         audit_ttl_days: int,
         now: str,
         unique_suffix: str,
+        principal_arn: str = "",
     ) -> None:
         """Inner retry loop for put_event -- uses a fixed SK across retries."""
         sk = f"{EVENT_PREFIX}{now}#{operation}#{unique_suffix}"
         item = record.to_dynamo_item(sk=sk)
         item["operation"] = operation
         item["correlation_id"] = correlation_id
+        item["principal_arn"] = principal_arn
         item["current_state"] = record.current_state
         item["date"] = _today_str()
         item["ttl"] = _ttl_epoch(audit_ttl_days)
-        self._table.put_item(Item=item)
+        try:
+            # Enforce append-only at the write path. Without this an event can be
+            # silently overwritten at a known PK/SK by anyone holding PutItem,
+            # which is not what "immutable audit trail" should mean.
+            self._table.put_item(Item=item, ConditionExpression="attribute_not_exists(SK)")
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # The SK carries a random suffix, so a collision means this exact
+                # write already landed and tenacity is retrying a call that in
+                # fact succeeded. Treat as done rather than failing the command.
+                logger.debug("event already recorded, skipping duplicate write", extra={"sk": sk})
+                return
+            raise
         logger.debug(
             "put_event",
             extra={"sha256": record.sha256_hash[:16], "operation": operation},
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def get_current_state(self, sha256_hash: str) -> FileRecord | None:
         """Return the current state record for a file, or None if not found."""
         response = self._table.get_item(Key={"PK": f"{FILE_PREFIX}{sha256_hash}", "SK": CURRENT})
@@ -199,7 +238,11 @@ class StateStore:
             return None
         return _item_to_record(item)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_by_state(self, state: str, max_items: int = 0) -> list[FileRecord]:
         """Return all files in a given state (uses state-index GSI).
 
@@ -217,7 +260,11 @@ class StateStore:
         )
         return [_item_to_record(item) for item in items]
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_by_file_name(self, file_name: str, state: str) -> list[FileRecord]:
         """Return CURRENT records matching a file_name in a given state.
 
@@ -235,7 +282,11 @@ class StateStore:
         records.sort(key=lambda r: r.encrypted_at, reverse=True)
         return records
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_events_for_file(self, sha256_hash: str) -> list[dict[str, Any]]:
         """Return all event records for a file, sorted by timestamp."""
         return self._paginate_query(
@@ -244,7 +295,11 @@ class StateStore:
             )
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_events_by_date(self, date_str: str) -> list[dict[str, Any]]:
         """Return EVENT records for a given date YYYY-MM-DD (uses date-index GSI).
 

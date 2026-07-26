@@ -16,6 +16,12 @@ _ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
 # - Explicit timeouts prevent indefinite hangs under partial network failure
 # - Retries disabled at boto3 level — tenacity handles retries at the application layer
 #   to avoid compounding (boto3 5x * tenacity 3x = 15x amplification)
+#
+# Every tenacity @retry in this package sets reraise=True. Without it, exhausting
+# the attempts raises tenacity.RetryError instead of the underlying error, which
+# slips past every `except ClientError` / `except BotoCoreError` handler in the
+# CLI and surfaces as a traceback — skipping the error message and the cleanup
+# those handlers exist to perform.
 boto_config = BotoConfig(
     connect_timeout=5,
     read_timeout=30,

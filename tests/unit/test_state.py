@@ -7,6 +7,8 @@ import time
 from unittest.mock import patch
 
 import boto3
+import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from envault.exceptions import StateConflictError
@@ -573,3 +575,85 @@ def test_list_by_file_name_sorted_by_encrypted_at_descending():
     results = store.list_by_file_name("data.csv", ENCRYPTED)
     assert len(results) == 2
     assert results[0].encrypted_at >= results[1].encrypted_at
+
+
+# ---------------------------------------------------------------------------
+# Audit trail integrity
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_event_cannot_be_overwritten():
+    """C-3: an existing event must not be replaceable at its PK/SK."""
+    store = _create_table()
+    record = _make_record()
+    store.put_event(record, operation="ENCRYPT", correlation_id="corr")
+
+    events = store.list_events_for_file(record.sha256_hash)
+    assert len(events) == 1
+    original = events[0]
+
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    with pytest.raises(ClientError) as exc:
+        table.put_item(
+            Item={**original, "operation": "FORGED", "correlation_id": "attacker"},
+            ConditionExpression="attribute_not_exists(SK)",
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+    surviving = store.list_events_for_file(record.sha256_hash)
+    assert surviving[0]["operation"] == "ENCRYPT"
+
+
+@mock_aws
+def test_put_event_records_principal_arn():
+    """Attribution: the trail must say who, not just what."""
+    store = _create_table()
+    record = _make_record()
+    store.put_event(
+        record,
+        operation="ACCESS",
+        correlation_id="corr",
+        principal_arn="arn:aws:sts::123456789012:assumed-role/Deploy/session",
+    )
+    events = store.list_events_for_file(record.sha256_hash)
+    assert events[0]["principal_arn"] == "arn:aws:sts::123456789012:assumed-role/Deploy/session"
+
+
+@mock_aws
+def test_put_event_inner_duplicate_write_is_tolerated():
+    """The append-only condition must not break tenacity's retry path.
+
+    A retry re-uses the same SK, so the condition fails on the second attempt —
+    that means the write already landed, not that the command should error.
+    """
+    store = _create_table()
+    record = _make_record()
+    # Same fixed SK both times, as the retry path uses.
+    store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
+    store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
+    assert len(store.list_events_for_file(record.sha256_hash)) == 1
+
+
+@mock_aws
+def test_retry_exhaustion_reraises_original_exception():
+    """Retries must surface the real error, not tenacity's RetryError wrapper.
+
+    Every CLI handler catches ClientError/BotoCoreError. Without reraise=True,
+    an exhausted retry raises RetryError instead, slipping past all of them and
+    skipping both the error message and the cleanup they perform.
+    """
+    store = _create_table()
+    record = _make_record()
+    throttled = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
+        "PutItem",
+    )
+    with patch.object(store._table, "put_item", side_effect=throttled):
+        with pytest.raises(ClientError):
+            store.put_event(record, operation="ACCESS", correlation_id="corr")
+        with pytest.raises(ClientError):
+            store.put_current_state(record)
+    with patch.object(store._table, "get_item", side_effect=throttled):
+        with pytest.raises(ClientError):
+            store.get_current_state(record.sha256_hash)

@@ -37,6 +37,8 @@ Requires Python 3.10+.
 export ENVAULT_KEY_ID=alias/my-kms-key
 export ENVAULT_BUCKET=my-encrypted-files-bucket
 export ENVAULT_TABLE=envault-state
+# Accounts trusted to have encrypted your data — required for every read
+export ENVAULT_ALLOWED_ACCOUNT_IDS=123456789012
 
 # Encrypt a file
 envault encrypt ./secret.txt --tag project=finance
@@ -44,7 +46,10 @@ envault encrypt ./secret.txt --tag project=finance
 # Check state
 envault dashboard
 
-# Decrypt by filename (or SHA256 hash)
+# Run a command with the secret in its environment — never written to disk
+envault exec -s secret.txt=API_TOKEN -- ./my-app
+
+# Or decrypt to a file, by filename or SHA256 hash
 envault decrypt secret.txt -o ./
 ```
 
@@ -59,6 +64,7 @@ All config via environment variables — no config files with secrets.
 | `ENVAULT_KEY_ID` | Yes | — | KMS key alias (e.g. `alias/my-key`) |
 | `ENVAULT_BUCKET` | Yes | — | S3 bucket for encrypted files |
 | `ENVAULT_TABLE` | Yes | — | DynamoDB table name |
+| `ENVAULT_ALLOWED_ACCOUNT_IDS` | For reads | — | Comma-separated AWS account IDs trusted to have encrypted the data. Required by `decrypt`, `exec`, and `rotate-key`: it constrains KMS discovery so a ciphertext header cannot name a key outside your control. |
 | `ENVAULT_REGION` | No | `us-east-1` | AWS region |
 | `ENVAULT_AUDIT_TTL_DAYS` | No | `365` | Days to retain audit events |
 
@@ -69,6 +75,9 @@ All config via environment variables — no config files with secrets.
 ```bash
 # Encrypt a file (or directory) and store in S3
 envault encrypt INPUT_PATH [--tag KEY=VALUE]... [--force]
+
+# Run a command with secrets supplied in memory, never on disk
+envault exec -s IDENTIFIER=VAR [-f IDENTIFIER=VAR]... [--clean-env] -- COMMAND [ARGS]...
 
 # Decrypt by filename or SHA256 hash
 envault decrypt IDENTIFIER [-o OUTPUT_DIR] [--version N]
@@ -91,6 +100,42 @@ envault rotate-key --new-key-id alias/new-key [--dry-run]
 # Migrate from legacy output.json (NDJSON format)
 envault migrate FROM_PATH [--dry-run]
 ```
+
+---
+
+## Running commands with secrets
+
+`envault exec` decrypts into a process and nothing else. There is no temporary file to clean
+up and no plaintext left behind if the command crashes.
+
+```bash
+# As an environment variable
+envault exec -s db.env=DATABASE_URL -- ./server
+
+# As a file, for programs that insist on a path (certs, keystores, kubeconfigs)
+envault exec -f server.pem=TLS_CERT -- curl --cert {TLS_CERT} https://api.internal
+
+# Both, from a minimal environment that drops your ambient AWS credentials
+envault exec --clean-env -s db.env=DATABASE_URL -f server.pem=TLS_CERT -- ./server
+```
+
+`--file` writes the plaintext to an anonymous in-memory descriptor (`memfd`), seals it once
+the checksum and encryption context verify, and passes `$VAR` as `/proc/self/fd/N`. No
+directory entry ever exists, so no other process can open it by name. A `{VAR}` token
+anywhere in the command is replaced with that path.
+
+Before decrypting, envault disables core dumps and sets `PR_SET_DUMPABLE=0` so a same-uid
+process cannot `ptrace` it or read `/proc/<pid>/mem` while the secret is in flight, and
+attempts to lock its pages out of swap.
+
+**What this does not protect against.** `PR_SET_DUMPABLE` is reset by `execve`, so it covers
+the envault process, not the command it launches — a same-uid attacker can still read that
+child's `/proc/<pid>/environ`. Nothing here stops root. CPython cannot reliably zero plaintext
+it has already copied, so `--file` is the stronger mode wherever the consumer accepts a path.
+
+Access is recorded in the audit trail, attributed to the calling AWS principal, **before** the
+command starts. If that write fails the command does not run: an unlogged secret read is
+treated as a failure, not a warning.
 
 ---
 
@@ -134,9 +179,14 @@ mypy src/envault/
 
 - KMS alias only in config — ARN is never stored or committed
 - `detect-secrets` pre-commit hook prevents credential leaks
-- SHA256 checksum verified before encrypt and after decrypt
-- DynamoDB events are append-only (never updated)
+- Encryption context and SHA256 checksum are both verified **before** any plaintext is
+  written or handed to a command — a substituted ciphertext never materialises
+- KMS discovery is constrained to explicitly trusted account IDs, so a ciphertext header
+  cannot direct a decrypt at a key outside your control
+- DynamoDB events are append-only, enforced by a write condition rather than convention,
+  and record the AWS principal responsible
 - S3 bucket policy enforces SSE-KMS on all objects
+- `envault exec` keeps plaintext out of the filesystem entirely (see above for the limits)
 
 ---
 

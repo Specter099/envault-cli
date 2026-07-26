@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
@@ -9,11 +10,16 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from envault.config import boto_config
+from envault.exceptions import EnvaultError
 
 logger = logging.getLogger(__name__)
+
+# Ceiling for in-memory ciphertext. Secrets are small; anything approaching this
+# belongs in the streaming `decrypt` path, not `exec`.
+MAX_IN_MEMORY_BYTES = 16 * 1024 * 1024
 
 
 class S3Store:
@@ -25,15 +31,75 @@ class S3Store:
         self._kms_key_id = kms_key_id
         self._s3 = boto3.client("s3", region_name=region, config=boto_config)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        # An oversized object is a deterministic rejection: retrying only triples
+        # the S3 read cost before failing with the same answer.
+        retry=retry_if_not_exception_type(EnvaultError),
+    )
+    def download_to_memory(self, s3_key: str, version_id: str = "") -> io.BytesIO:
+        """Fetch an encrypted object into memory instead of onto disk.
+
+        Used by :command:`envault exec`, where the whole point is that nothing
+        touches the filesystem. The buffered bytes are ciphertext, so holding
+        them in memory carries no plaintext exposure — the size cap exists to
+        stop a large or malicious object from exhausting RAM, not to protect
+        secrecy.
+
+        Args:
+            s3_key: S3 object key.
+            version_id: Optional S3 version ID for point-in-time recovery.
+
+        Returns:
+            A BytesIO positioned at the start of the ciphertext.
+
+        Raises:
+            EnvaultError: If the object is larger than MAX_IN_MEMORY_BYTES.
+        """
+        kwargs: dict[str, Any] = {"Bucket": self._bucket, "Key": s3_key}
+        if version_id:
+            kwargs["VersionId"] = version_id
+        else:
+            logger.warning(
+                "Fetching S3 object without VersionId — reading latest version. "
+                "If the object was overwritten since encryption, "
+                "the wrong ciphertext may be retrieved.",
+                extra={"bucket": self._bucket, "key": s3_key},
+            )
+
+        response = self._s3.get_object(**kwargs)
+        length = int(response.get("ContentLength", 0))
+        if length > MAX_IN_MEMORY_BYTES:
+            raise EnvaultError(
+                f"Encrypted object {s3_key} is {length} bytes, over the "
+                f"{MAX_IN_MEMORY_BYTES}-byte limit for in-memory decryption. "
+                "Use 'envault decrypt' to stream it to a file instead."
+            )
+
+        body = response["Body"].read(MAX_IN_MEMORY_BYTES + 1)
+        if len(body) > MAX_IN_MEMORY_BYTES:
+            raise EnvaultError(
+                f"Encrypted object {s3_key} exceeds the {MAX_IN_MEMORY_BYTES}-byte "
+                "limit for in-memory decryption."
+            )
+        logger.info(
+            "Fetched ciphertext to memory",
+            extra={"bucket": self._bucket, "key": s3_key, "bytes": len(body)},
+        )
+        return io.BytesIO(body)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def upload_file(self, local_path: Path, s3_key: str) -> str:
         """Upload a file to S3 and return the version ID atomically.
 
         Uses put_object (single API call) so the VersionId is returned in the
         same response, eliminating the race window of upload_file + head_object.
-
-        Uses put_object to atomically retrieve the version ID from the response,
-        avoiding a TOCTOU race between upload_file + head_object.
 
         Args:
             local_path: Local path of the file to upload.
@@ -61,7 +127,11 @@ class S3Store:
         )
         return version_id
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def download_file(self, s3_key: str, local_path: Path, version_id: str = "") -> None:
         """Download a file from S3.
 

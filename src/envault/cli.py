@@ -16,11 +16,12 @@ from typing import Any
 import click
 from botocore.exceptions import BotoCoreError, ClientError
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import track
 from rich.table import Table
 
 from envault.config import Config
-from envault.crypto import decrypt_file, encrypt_file
+from envault.crypto import decrypt_file, decrypt_to_stream, encrypt_file
 from envault.exceptions import (
     AlreadyEncryptedError,
     ChecksumMismatchError,
@@ -31,6 +32,8 @@ from envault.exceptions import (
     StateConflictError,
 )
 from envault.fileutils import best_effort_delete as _best_effort_delete
+from envault.identity import caller_arn
+from envault.isolation import CredentialFd, harden_process, wipe
 from envault.s3 import S3Store
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
@@ -52,7 +55,7 @@ def _load_config() -> Config:
     try:
         return Config.from_env()
     except ConfigurationError as e:
-        console.print(f"[bold red]Configuration error:[/bold red] {e}")
+        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(e))}")
         sys.exit(1)
 
 
@@ -97,7 +100,7 @@ def cli() -> None:
         hint = ""
         if e.ctx:
             hint = f"\n  Run '{e.ctx.command_path} --help' for usage info."
-        console.print(f"{_friendly_message(e)}{hint}")
+        console.print(f"{escape(_friendly_message(e))}{escape(hint)}")
         sys.exit(2)
     except click.Abort:
         console.print("[yellow]Aborted.[/yellow]")
@@ -140,7 +143,7 @@ def encrypt(
 
     files = _collect_files(input_path)
     if not files:
-        console.print(f"[yellow]No files found in {input_path}[/yellow]")
+        console.print(f"[yellow]No files found in {escape(str(input_path))}[/yellow]")
         return
 
     errors = 0
@@ -150,10 +153,11 @@ def encrypt(
             _encrypt_one(file_path, config, tags, store, s3, file_correlation_id, force)
         except AlreadyEncryptedError:
             console.print(
-                f"[yellow]⏭[/yellow] {file_path.name} already ENCRYPTED (use --force to re-encrypt)"
+                f"[yellow]⏭[/yellow] {escape(file_path.name)} already ENCRYPTED "
+                "(use --force to re-encrypt)"
             )
         except (EnvaultError, ClientError, BotoCoreError) as exc:
-            console.print(f"[red]✗[/red] {file_path.name}: {exc}")
+            console.print(f"[red]✗[/red] {escape(file_path.name)}: {escape(str(exc))}")
             logger.exception("Failed to encrypt %s", file_path)
             errors += 1
 
@@ -232,6 +236,7 @@ def _encrypt_one(
             operation="ENCRYPT",
             correlation_id=correlation_id,
             audit_ttl_days=config.audit_ttl_days,
+            principal_arn=caller_arn(config.region),
         )
     except Exception:
         logger.error(
@@ -245,7 +250,9 @@ def _encrypt_one(
             },
         )
         raise
-    console.print(f"[green]✓[/green] {file_path.name} → s3://{config.bucket}/{s3_key}")
+    console.print(
+        f"[green]✓[/green] {escape(file_path.name)} → s3://{escape(config.bucket)}/{escape(s3_key)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +305,6 @@ def decrypt(
 
     record = _resolve_identifier(identifier, version, store)
     sha256_hash = record.sha256_hash
-    if record.current_state != ENCRYPTED:
-        console.print(f"[yellow]File is in state {record.current_state}, not ENCRYPTED.[/yellow]")
-        sys.exit(1)
 
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
     os.close(_fd)
@@ -315,24 +319,21 @@ def decrypt(
             s3_key=record.s3_key, local_path=tmp_encrypted, version_id=record.s3_version_id
         )
 
-        result = decrypt_file(
+        decrypt_file(
             input_path=tmp_encrypted,
             output_path=output_path,
             expected_sha256=sha256_hash,
             region=region,
             allowed_account_ids=account_ids or None,
-        )
-
-        _verify_encryption_context(
-            expected=record.encryption_context, actual=result.encryption_context
+            expected_context=record.encryption_context,
         )
     except EncryptionContextMismatchError:
-        _best_effort_delete(output_path)
         console.print(
             "[bold red]Decryption failed:[/bold red] encryption context mismatch.\n"
             "The ciphertext metadata does not match the record in DynamoDB.\n"
             "This could mean the encrypted file in S3 was replaced or corrupted.\n"
-            f"  File: {record.file_name}  SHA256: {sha256_hash[:16]}..."
+            "No plaintext was written.\n"
+            f"  File: {escape(record.file_name)}  SHA256: {sha256_hash[:16]}..."
         )
         sys.exit(1)
     except ChecksumMismatchError as exc:
@@ -344,44 +345,53 @@ def decrypt(
         )
         sys.exit(1)
     except ConfigurationError as exc:
-        console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
     except (ClientError, BotoCoreError) as exc:
         error_msg = str(exc)
         if isinstance(exc, ClientError):
             error_msg = exc.response.get("Error", {}).get("Message", str(exc))
         console.print(
-            f"[bold red]AWS error during decryption:[/bold red] {error_msg}\n"
-            f"  File: {record.file_name}  S3: {record.s3_key}"
+            f"[bold red]AWS error during decryption:[/bold red] {escape(error_msg)}\n"
+            f"  File: {escape(record.file_name)}  S3: {escape(record.s3_key)}"
         )
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Decryption error:[/bold red] {exc}")
+        console.print(f"[bold red]Decryption error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
 
-    original_last_updated = record.last_updated
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    record.current_state = DECRYPTED
-    record.decrypted_at = now
-    record.last_updated = now
+    # Reading a file does not change what is stored in S3, so current_state is
+    # left alone — the ciphertext is still there and still encrypted. The read is
+    # recorded as an event instead. This is what makes a file decryptable more
+    # than once, keeps it visible to rotate-key, and avoids two concurrent reads
+    # colliding on the CURRENT record's optimistic lock.
     try:
-        store.put_current_state(record, expected_last_updated=original_last_updated)
-        store.put_event(record, operation="DECRYPT", correlation_id=correlation_id)
-    except Exception:
+        store.put_event(
+            record,
+            operation="DECRYPT",
+            correlation_id=correlation_id,
+            principal_arn=caller_arn(region),
+        )
+    except (ClientError, BotoCoreError, EnvaultError) as exc:
         logger.error(
-            "State write failed after successful decryption. "
-            "File was decrypted to disk but state was not updated.",
+            "Audit event write failed after successful decryption.",
             extra={
                 "sha256": sha256_hash,
                 "output_path": str(output_path),
                 "s3_key": record.s3_key,
             },
         )
-        raise
+        console.print(
+            f"[green]✓[/green] Decrypted → {escape(str(output_path))}\n"
+            f"[bold yellow]Warning:[/bold yellow] the access could not be recorded in the "
+            f"audit trail: {escape(str(exc))}\n"
+            "The plaintext was written but this read is missing from the audit log."
+        )
+        sys.exit(1)
 
-    console.print(f"[green]✓[/green] Decrypted → {output_path}")
+    console.print(f"[green]✓[/green] Decrypted → {escape(str(output_path))}")
 
 
 # ---------------------------------------------------------------------------
@@ -420,10 +430,10 @@ def status(state: str, sha256_hash: str | None, table: str, region: str) -> None
         _print_records(records)
     except (ClientError, BotoCoreError) as exc:
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
 
 
@@ -437,12 +447,15 @@ def _print_records(records: list[FileRecord]) -> None:
     for r in sorted(records, key=lambda x: x.encrypted_at, reverse=True):
         state_color = "green" if r.current_state == ENCRYPTED else "yellow"
         tags_str = ", ".join(f"{k}={v}" for k, v in r.tags.items())
+        # Escape everything that came back from DynamoDB: a file name containing
+        # square brackets would otherwise be interpreted as Rich markup, which
+        # both misrepresents the name and can raise MarkupError mid-table.
         t.add_row(
-            r.file_name,
-            f"[{state_color}]{r.current_state}[/{state_color}]",
-            r.sha256_hash[:16],
-            r.encrypted_at,
-            tags_str,
+            escape(r.file_name),
+            f"[{state_color}]{escape(r.current_state)}[/{state_color}]",
+            escape(r.sha256_hash[:16]),
+            escape(r.encrypted_at),
+            escape(tags_str),
         )
     console.print(t)
 
@@ -481,6 +494,7 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
         t.add_column("Operation")
         t.add_column("File")
         t.add_column("SHA256 (16)")
+        t.add_column("Principal")
         t.add_column("Correlation ID (8)")
         for e in events:
             sk: str = e.get("SK", "")
@@ -488,19 +502,20 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
             ts = parts[1] if len(parts) > 1 else ""
             op = parts[2] if len(parts) > 2 else e.get("operation", "")
             t.add_row(
-                ts,
-                op,
-                e.get("file_name", ""),
-                e.get("sha256_hash", "")[:16],
-                e.get("correlation_id", "")[:8],
+                escape(ts),
+                escape(op),
+                escape(str(e.get("file_name", ""))),
+                escape(str(e.get("sha256_hash", ""))[:16]),
+                escape(_short_principal(str(e.get("principal_arn", "")))),
+                escape(str(e.get("correlation_id", ""))[:8]),
             )
         console.print(t)
     except (ClientError, BotoCoreError) as exc:
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
 
 
@@ -533,10 +548,10 @@ def dashboard(table: str, region: str) -> None:
         console.print()
     except (ClientError, BotoCoreError) as exc:
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
 
 
@@ -689,16 +704,29 @@ def rotate_key(
     correlation_id = str(uuid.uuid4())
     account_ids = _validate_account_ids(allowed_account_ids)
 
+    # Every tracked file still has ciphertext in S3 regardless of the state
+    # recorded against it, so rotation must cover them all. Records written by
+    # earlier versions were flipped to DECRYPTED on first read; skipping those
+    # would silently leave the most-accessed files under the old key.
     records = store.list_by_state(ENCRYPTED)
+    seen = {r.sha256_hash for r in records}
+    legacy = [r for r in store.list_by_state(DECRYPTED) if r.sha256_hash not in seen]
+    if legacy:
+        console.print(
+            f"[dim]Including {len(legacy)} record(s) marked DECRYPTED by an earlier "
+            "version — their ciphertext is still in S3 and still needs rotating.[/dim]"
+        )
+    records.extend(legacy)
+
     if not records:
-        console.print("[yellow]No ENCRYPTED files found.[/yellow]")
+        console.print("[yellow]No tracked files found.[/yellow]")
         return
 
-    console.print(f"Found {len(records)} ENCRYPTED files to rotate.")
+    console.print(f"Found {len(records)} files to rotate.")
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]")
         for r in records:
-            console.print(f"  Would rotate: {r.file_name} ({r.sha256_hash[:16]}...)")
+            console.print(f"  Would rotate: {escape(r.file_name)} ({r.sha256_hash[:16]}...)")
         return
 
     console.print(
@@ -729,18 +757,15 @@ def rotate_key(
             tmp_enc = Path(_tmp_enc)
 
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
-            dec_result = decrypt_file(
+            decrypt_file(
                 tmp_dl,
                 tmp_pt,
                 expected_sha256=record.sha256_hash,
                 region=region,
                 allowed_account_ids=account_ids or None,
+                expected_context=record.encryption_context,
             )
             tmp_dl.unlink(missing_ok=True)
-
-            _verify_encryption_context(
-                expected=record.encryption_context, actual=dec_result.encryption_context
-            )
 
             new_ctx = new_key_config.build_encryption_context(record.sha256_hash, record.file_name)
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
@@ -757,9 +782,17 @@ def rotate_key(
             record.message_id = new_result.message_id
             record.s3_version_id = new_version_id
             record.last_updated = now
+            # Legacy records land back in ENCRYPTED: the ciphertext is present,
+            # which is what the field is supposed to describe.
+            record.current_state = ENCRYPTED
             try:
                 store.put_current_state(record, expected_last_updated=original_last_updated)
-                store.put_event(record, operation="ROTATE_KEY", correlation_id=correlation_id)
+                store.put_event(
+                    record,
+                    operation="ROTATE_KEY",
+                    correlation_id=correlation_id,
+                    principal_arn=caller_arn(region),
+                )
             except Exception:
                 logger.error(
                     "State write failed after S3 re-upload during key rotation.",
@@ -775,7 +808,9 @@ def rotate_key(
                 raise
             rotated += 1
         except (EnvaultError, ClientError, BotoCoreError, OSError) as exc:
-            console.print(f"[red]Error rotating {record.file_name}: {exc}[/red]")
+            console.print(
+                f"[red]Error rotating {escape(record.file_name)}: {escape(str(exc))}[/red]"
+            )
             errors += 1
         finally:
             if tmp_dl is not None:
@@ -786,6 +821,300 @@ def rotate_key(
                 tmp_enc.unlink(missing_ok=True)
 
     console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
+    if errors:
+        # A partially-rotated corpus means some files are still readable with the
+        # old key. Exiting 0 here would report an incomplete rotation as success.
+        console.print(
+            f"[bold red]Rotation incomplete:[/bold red] {errors} file(s) are still "
+            "encrypted under the previous key."
+        )
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# exec
+# ---------------------------------------------------------------------------
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Retained when --clean-env strips the inherited environment. Enough for a
+# program to find its interpreter and render output; nothing that carries
+# ambient credentials.
+_MINIMAL_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ", "USER")
+
+
+class _BufferSink:
+    """Collects decrypted bytes into a wipeable buffer.
+
+    ``bytearray`` rather than ``BytesIO`` so the accumulated plaintext can be
+    overwritten afterwards. The per-chunk ``bytes`` handed over by the SDK are
+    immutable and cannot be wiped — see :func:`envault.isolation.wipe`.
+    """
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def write(self, data: bytes) -> int:
+        self.buf += data
+        return len(data)
+
+
+@main.command("exec", context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--secret",
+    "-s",
+    "env_specs",
+    multiple=True,
+    metavar="IDENTIFIER=VAR",
+    help="Expose a secret as environment variable VAR (repeatable).",
+)
+@click.option(
+    "--file",
+    "-f",
+    "file_specs",
+    multiple=True,
+    metavar="IDENTIFIER=VAR",
+    help="Expose a secret as a readable path in $VAR, backed by an anonymous fd (repeatable).",
+)
+@click.option("--table", envvar="ENVAULT_TABLE", required=True)
+@click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
+@click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
+@click.option(
+    "--allowed-account-ids",
+    envvar="ENVAULT_ALLOWED_ACCOUNT_IDS",
+    default="",
+    help="Comma-separated AWS account IDs to trust for decryption.",
+)
+@click.option(
+    "--clean-env",
+    is_flag=True,
+    help="Start the command from a minimal environment instead of inheriting this one.",
+)
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+def exec_(
+    env_specs: tuple[str, ...],
+    file_specs: tuple[str, ...],
+    table: str,
+    bucket: str,
+    region: str,
+    allowed_account_ids: str,
+    clean_env: bool,
+    command: tuple[str, ...],
+) -> None:
+    """Run a command with secrets supplied in memory, never on disk.
+
+    \b
+      envault exec -s db.env=DATABASE_URL -- ./server
+      envault exec -f server.pem=TLS_CERT -- curl --cert {TLS_CERT} https://api
+
+    ``--secret`` places the plaintext in the child's environment. ``--file``
+    writes it to an anonymous file descriptor and puts a readable path in $VAR,
+    for programs that insist on a file — certificates, keystores, kubeconfigs.
+    A ``{VAR}`` token anywhere in COMMAND is replaced with that path.
+
+    Nothing is written to the filesystem in either mode. Access is recorded in
+    the audit trail *before* the command starts, and if that write fails the
+    command does not run — an unlogged secret read is treated as a failure, not
+    a warning.
+    """
+    # Before any plaintext exists in this address space.
+    hardening = harden_process()
+    if hardening.degraded:
+        logger.warning("process hardening incomplete", extra={"degraded": hardening.degraded})
+
+    if not command:
+        raise click.UsageError("No command given. Usage: envault exec -s NAME=VAR -- COMMAND")
+    if not env_specs and not file_specs:
+        raise click.UsageError("Provide at least one --secret or --file.")
+
+    account_ids = _validate_account_ids(allowed_account_ids)
+    store = StateStore(table_name=table, region=region)
+    s3 = S3Store(bucket=bucket, region=region)
+    correlation_id = str(uuid.uuid4())
+
+    env_pairs = [_parse_secret_spec(spec, "--secret") for spec in env_specs]
+    file_pairs = [_parse_secret_spec(spec, "--file") for spec in file_specs]
+    _reject_duplicate_targets(env_pairs + file_pairs)
+
+    child_env: dict[str, str] = (
+        {k: os.environ[k] for k in _MINIMAL_ENV_KEYS if k in os.environ}
+        if clean_env
+        else dict(os.environ)
+    )
+
+    creds: list[CredentialFd] = []
+    sinks: list[_BufferSink] = []
+    accessed: list[FileRecord] = []
+    try:
+        for identifier, var in env_pairs:
+            record = _resolve_identifier(identifier, 1, store)
+            sink = _BufferSink()
+            sinks.append(sink)
+            _stream_secret(record, sink, s3, region, account_ids)
+            child_env[var] = _decode_secret(sink.buf, identifier)
+            accessed.append(record)
+
+        for identifier, var in file_pairs:
+            record = _resolve_identifier(identifier, 1, store)
+            cred = CredentialFd(var)
+            creds.append(cred)
+            with cred.writer() as out:
+                _stream_secret(record, out, s3, region, account_ids)
+            # Sealed only after the checksum and encryption context verified.
+            cred.seal()
+            child_env[var] = cred.child_path
+            accessed.append(record)
+            if cred.backing != "memfd":
+                console.print(
+                    "[yellow]Note:[/yellow] anonymous memory files are unavailable on this "
+                    "platform; the credential is in an unlinked temp file instead. It has no "
+                    "path, but may be backed by disk storage."
+                )
+
+        # Fail closed: no audit record, no secret. This runs before the command
+        # so a crashing child still leaves the access logged.
+        principal = caller_arn(region)
+        for record in accessed:
+            store.put_event(
+                record,
+                operation="ACCESS",
+                correlation_id=correlation_id,
+                principal_arn=principal,
+            )
+    except EncryptionContextMismatchError:
+        _close_all(creds, sinks)
+        console.print(
+            "[bold red]Refusing to run:[/bold red] encryption context mismatch.\n"
+            "A ciphertext in S3 does not match its record in DynamoDB."
+        )
+        sys.exit(1)
+    except ChecksumMismatchError as exc:
+        _close_all(creds, sinks)
+        console.print(
+            "[bold red]Refusing to run:[/bold red] checksum mismatch "
+            f"(expected {exc.expected[:16]}..., got {exc.actual[:16]}...).\n"
+            "The encrypted data may have been corrupted or tampered with."
+        )
+        sys.exit(1)
+    except (EnvaultError, ClientError, BotoCoreError) as exc:
+        _close_all(creds, sinks)
+        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
+        console.print(
+            f"[bold red]Refusing to run:[/bold red] {escape(str(msg))}\n"
+            "No command was started and no secrets were delivered."
+        )
+        sys.exit(1)
+
+    argv = _substitute_paths(list(command), child_env, [var for _, var in file_pairs])
+
+    # Wipe what we can before handing over. The env values themselves are
+    # immutable strings destined for the child, and execve replaces this address
+    # space wholesale — which disposes of every plaintext copy CPython made
+    # along the way far more thoroughly than anything we could do here.
+    for sink in sinks:
+        wipe(sink.buf)
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    try:
+        # No shell, deliberately: argv is passed through untouched so a secret or
+        # filename can never be reinterpreted as shell syntax. execve (rather
+        # than fork) also replaces this address space, discarding every plaintext
+        # copy CPython made while decrypting.
+        os.execvpe(argv[0], argv, child_env)  # noqa: S606
+    except OSError as exc:
+        _close_all(creds, [])
+        console.print(f"[bold red]Could not run {escape(argv[0])}:[/bold red] {escape(str(exc))}")
+        sys.exit(127)
+
+
+def _close_all(creds: list[CredentialFd], sinks: list[_BufferSink]) -> None:
+    for cred in creds:
+        cred.close()
+    for sink in sinks:
+        wipe(sink.buf)
+
+
+def _stream_secret(
+    record: FileRecord,
+    out: Any,
+    s3: S3Store,
+    region: str,
+    account_ids: list[str],
+) -> None:
+    """Fetch a record's ciphertext and decrypt it into ``out``, verifying first."""
+    ciphertext = s3.download_to_memory(record.s3_key, record.s3_version_id)
+    decrypt_to_stream(
+        ciphertext,
+        out,
+        expected_sha256=record.sha256_hash,
+        expected_context=record.encryption_context,
+        region=region,
+        allowed_account_ids=account_ids,
+    )
+
+
+def _decode_secret(buf: bytearray, identifier: str) -> str:
+    """Decode a secret for the environment, dropping one trailing newline.
+
+    Secrets stored as files almost always end in a newline that the original
+    author did not intend as part of the value; carrying it into an environment
+    variable breaks connection strings and tokens in ways that are tedious to
+    debug. Exactly one is removed, so a deliberate blank line survives.
+    """
+    try:
+        value = bytes(buf).decode("utf-8")
+    except UnicodeDecodeError:
+        raise click.UsageError(
+            f"Secret {identifier!r} is not valid UTF-8 and cannot be an environment "
+            "variable. Use --file to expose it as a file descriptor instead."
+        ) from None
+    if value.endswith("\n"):
+        value = value[:-1]
+    if "\x00" in value:
+        raise click.UsageError(
+            f"Secret {identifier!r} contains a NUL byte and cannot be an environment "
+            "variable. Use --file instead."
+        )
+    return value
+
+
+def _parse_secret_spec(spec: str, flag: str) -> tuple[str, str]:
+    """Parse an IDENTIFIER=VAR pair, validating the target variable name."""
+    identifier, sep, var = spec.partition("=")
+    if not sep or not identifier or not var:
+        raise click.UsageError(f"{flag} expects IDENTIFIER=VAR, got {spec!r}.")
+    if not _ENV_NAME_RE.match(var):
+        raise click.UsageError(
+            f"{flag} target {var!r} is not a valid environment variable name "
+            "(letters, digits, underscore; must not start with a digit)."
+        )
+    return identifier, var
+
+
+def _reject_duplicate_targets(pairs: list[tuple[str, str]]) -> None:
+    """Refuse to silently drop a secret because two specs share a target name."""
+    seen: set[str] = set()
+    for _, var in pairs:
+        if var in seen:
+            raise click.UsageError(f"Duplicate target variable {var!r} in --secret/--file.")
+        seen.add(var)
+
+
+def _substitute_paths(argv: list[str], env: dict[str, str], file_vars: list[str]) -> list[str]:
+    """Replace ``{VAR}`` tokens in the command with the credential's fd path."""
+    for var in file_vars:
+        token = "{" + var + "}"
+        path = env[var]
+        argv = [arg.replace(token, path) for arg in argv]
+    return argv
+
+
+def _short_principal(arn: str) -> str:
+    """Trim an ARN to its identity portion for table display."""
+    if not arn:
+        return "—"
+    return arn.rsplit(":", 1)[-1] if ":" in arn else arn
 
 
 # ---------------------------------------------------------------------------
@@ -802,7 +1131,7 @@ def _validate_sha256(value: str) -> str:
     """Validate a SHA256 hash string. Exit with error if invalid."""
     if not _SHA256_RE.fullmatch(value):
         console.print(
-            f"[red]Invalid SHA256 hash: {value!r}. "
+            f"[red]Invalid SHA256 hash: {escape(repr(value))}. "
             "Expected 64 lowercase hexadecimal characters.[/red]"
         )
         sys.exit(1)
@@ -819,7 +1148,9 @@ def _validate_date(value: str) -> str:
     try:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
-        console.print(f"[red]Invalid date: {value!r}. Expected format: YYYY-MM-DD.[/red]")
+        console.print(
+            f"[red]Invalid date: {escape(repr(value))}. Expected format: YYYY-MM-DD.[/red]"
+        )
         sys.exit(1)
     return value
 
@@ -838,21 +1169,21 @@ def _resolve_identifier(
     if _is_sha256(identifier):
         record = store.get_current_state(identifier)
         if not record:
-            console.print(f"[red]No record found for hash {identifier[:16]}...[/red]")
+            console.print(f"[red]No record found for hash {escape(identifier[:16])}...[/red]")
             sys.exit(1)
         return record
 
     # Filename lookup
     records = store.list_by_file_name(identifier, ENCRYPTED)
     if not records:
-        console.print(f"[red]No encrypted files found with name {identifier!r}.[/red]")
+        console.print(f"[red]No encrypted files found with name {escape(repr(identifier))}.[/red]")
         sys.exit(1)
 
     if version < 1 or version > len(records):
         console.print(
             f"[red]Version {version} out of range. "
             f"Found {len(records)} version(s) of"
-            f" {identifier!r}.[/red]"
+            f" {escape(repr(identifier))}.[/red]"
         )
         sys.exit(1)
 
@@ -883,30 +1214,11 @@ def _validate_account_ids(raw: str) -> list[str]:
         sys.exit(1)
     for account_id in account_ids:
         if not _ACCOUNT_ID_RE.fullmatch(account_id):
-            console.print(f"[red]Invalid AWS account ID: {account_id!r}. Must be 12 digits.[/red]")
+            console.print(
+                f"[red]Invalid AWS account ID: {escape(repr(account_id))}. Must be 12 digits.[/red]"
+            )
             sys.exit(1)
     return account_ids
-
-
-def _verify_encryption_context(expected: dict[str, str], actual: dict[str, str]) -> None:
-    """Verify that all expected encryption context keys exist in the actual context.
-
-    The AWS Encryption SDK may add extra keys (e.g. ``aws-crypto-public-key``)
-    to the ciphertext header when using algorithms with key commitment.  These
-    SDK-managed keys are legitimate and should be ignored.  We only check that
-    every application-level key stored in DynamoDB is present and matches.
-
-    Raises:
-        EncryptionContextMismatchError: If any expected key is missing or has a
-            different value in the actual context.
-    """
-    mismatched: dict[str, tuple[str, str | None]] = {}
-    for key, expected_value in expected.items():
-        actual_value = actual.get(key)
-        if actual_value != expected_value:
-            mismatched[key] = (expected_value, actual_value)
-    if mismatched:
-        raise EncryptionContextMismatchError(expected=expected, actual=actual)
 
 
 def _collect_files(path: Path) -> list[Path]:
@@ -921,7 +1233,9 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
     tags: dict[str, str] = {}
     for t in tag_strs:
         if "=" not in t:
-            console.print(f"[yellow]Ignoring invalid tag '{t}' (expected KEY=VALUE)[/yellow]")
+            console.print(
+                f"[yellow]Ignoring invalid tag '{escape(t)}' (expected KEY=VALUE)[/yellow]"
+            )
             continue
         k, _, v = t.partition("=")
         k = k.strip()
