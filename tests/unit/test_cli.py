@@ -1414,3 +1414,37 @@ def test_status_reports_persistent_aws_failure_cleanly() -> None:
     assert result.exit_code != 0
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "AWS error" in result.output
+
+
+def test_cli_entrypoint_escapes_markup_in_usage_errors() -> None:
+    """The error handler must not itself become a crash path.
+
+    Usage errors echo back the value the user typed, so an argument containing
+    an unbalanced Rich tag would replace the help message with a MarkupError.
+    """
+    from io import StringIO
+
+    from rich.console import Console as RichConsole
+
+    output = StringIO()
+    test_console = RichConsole(file=output, force_terminal=False, width=200)
+    argv = ["envault", "exec", "-s", "[/nope]", "--", "/bin/true"]
+    with (
+        patch("sys.argv", argv),
+        patch("envault.cli.console", test_console),
+        patch.dict(
+            "os.environ",
+            {
+                "ENVAULT_TABLE": "t",
+                "ENVAULT_BUCKET": "b",
+                # Set so validation reaches the spec parse, which is what echoes
+                # the user's argument back into the error message.
+                "ENVAULT_ALLOWED_ACCOUNT_IDS": "123456789012",
+            },
+            clear=False,
+        ),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            cli()
+    assert exc_info.value.code == 2
+    assert "[/nope]" in output.getvalue()

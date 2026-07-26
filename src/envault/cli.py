@@ -55,7 +55,7 @@ def _load_config() -> Config:
     try:
         return Config.from_env()
     except ConfigurationError as e:
-        console.print(f"[bold red]Configuration error:[/bold red] {e}")
+        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(e))}")
         sys.exit(1)
 
 
@@ -100,7 +100,7 @@ def cli() -> None:
         hint = ""
         if e.ctx:
             hint = f"\n  Run '{e.ctx.command_path} --help' for usage info."
-        console.print(f"{_friendly_message(e)}{hint}")
+        console.print(f"{escape(_friendly_message(e))}{escape(hint)}")
         sys.exit(2)
     except click.Abort:
         console.print("[yellow]Aborted.[/yellow]")
@@ -1183,7 +1183,7 @@ def _resolve_identifier(
         console.print(
             f"[red]Version {version} out of range. "
             f"Found {len(records)} version(s) of"
-            f" {identifier!r}.[/red]"
+            f" {escape(repr(identifier))}.[/red]"
         )
         sys.exit(1)
 
