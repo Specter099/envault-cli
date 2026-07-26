@@ -1359,3 +1359,58 @@ def test_status_survives_unmatched_markup_in_file_names() -> None:
         env=_CLI_ENV,
     )
     assert result.exit_code == 0, result.output
+
+
+@mock_aws
+def test_rotate_key_dry_run_escapes_markup_in_file_names() -> None:
+    """The preview for a destructive operation must not abort on a crafted name."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    record.file_name = "[/nope].txt"
+    store.put_current_state(record, expected_last_updated=record.last_updated)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "rotate-key",
+            "--new-key-id",
+            "alias/new-key",
+            "--dry-run",
+            "--table",
+            TABLE_NAME,
+            "--bucket",
+            BUCKET_NAME,
+            "--region",
+            REGION,
+            "--allowed-account-ids",
+            ACCOUNT_IDS,
+        ],
+        env={**_CLI_ENV, "COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Would rotate" in result.output
+
+
+@mock_aws
+def test_status_reports_persistent_aws_failure_cleanly() -> None:
+    """Retry exhaustion must surface as a message, not a tenacity traceback."""
+    _create_table()
+    runner = CliRunner()
+    with patch.object(
+        StateStore,
+        "list_by_state",
+        side_effect=ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
+            "Query",
+        ),
+    ):
+        result = runner.invoke(
+            main, ["status", "--table", TABLE_NAME, "--region", REGION], env=_CLI_ENV
+        )
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "AWS error" in result.output

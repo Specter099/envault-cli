@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from click.testing import CliRunner
 from moto import mock_aws
 
@@ -251,15 +252,25 @@ def test_exec_refuses_to_run_when_audit_write_fails() -> None:
     with runner.isolated_filesystem():
         _seed_secret(runner, env)
         rec = _ExecRecorder()
+        throttled = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
+            "PutItem",
+        )
         with (
             patch("os.execvpe", rec),
-            patch.object(StateStore, "put_event", side_effect=OSError("dynamo down")),
+            patch.object(StateStore, "put_event", side_effect=throttled),
         ):
             result = runner.invoke(
                 main, ["exec", "-s", "db.env=DATABASE_URL", "--", "/bin/true"], env=env
             )
-        assert not rec.called
+        assert not rec.called, "the command must not run without an audit record"
         assert result.exit_code != 0
+        # A clean refusal, not a traceback: the handler also performs the
+        # credential-fd cleanup that an escaping exception would skip.
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            f"expected a clean exit, got {result.exception!r}"
+        )
+        assert "Refusing to run" in result.output
 
 
 @mock_aws
@@ -391,3 +402,23 @@ def test_exec_usage_errors(args: list[str]) -> None:
         result = runner.invoke(main, args, env=_env(account))
     assert not rec.called
     assert result.exit_code != 0
+
+
+@mock_aws
+def test_exec_file_mode_survives_markup_in_secret_name() -> None:
+    """A file name carrying Rich markup must not break the exec path."""
+    account = _provision()
+    env = _env(account)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        _seed_secret(runner, env, "[bold]cert.pem")
+        rec = _ExecRecorder(read_files=("TLS_CERT",))
+        with patch("os.execvpe", rec):
+            result = runner.invoke(
+                main,
+                ["exec", "-f", "[bold]cert.pem=TLS_CERT", "--", "/bin/true"],
+                env=env,
+                catch_exceptions=False,
+            )
+        assert rec.called, result.output
+        assert rec.file_contents["TLS_CERT"] == SECRET_VALUE

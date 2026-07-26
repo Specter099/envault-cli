@@ -143,7 +143,7 @@ def encrypt(
 
     files = _collect_files(input_path)
     if not files:
-        console.print(f"[yellow]No files found in {input_path}[/yellow]")
+        console.print(f"[yellow]No files found in {escape(str(input_path))}[/yellow]")
         return
 
     errors = 0
@@ -345,7 +345,7 @@ def decrypt(
         )
         sys.exit(1)
     except ConfigurationError as exc:
-        console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
     except (ClientError, BotoCoreError) as exc:
         error_msg = str(exc)
@@ -430,10 +430,10 @@ def status(state: str, sha256_hash: str | None, table: str, region: str) -> None
         _print_records(records)
     except (ClientError, BotoCoreError) as exc:
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
 
 
@@ -512,10 +512,10 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
         console.print(t)
     except (ClientError, BotoCoreError) as exc:
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
 
 
@@ -548,10 +548,10 @@ def dashboard(table: str, region: str) -> None:
         console.print()
     except (ClientError, BotoCoreError) as exc:
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {msg}")
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
 
 
@@ -726,7 +726,7 @@ def rotate_key(
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]")
         for r in records:
-            console.print(f"  Would rotate: {r.file_name} ({r.sha256_hash[:16]}...)")
+            console.print(f"  Would rotate: {escape(r.file_name)} ({r.sha256_hash[:16]}...)")
         return
 
     console.print(
@@ -1131,7 +1131,7 @@ def _validate_sha256(value: str) -> str:
     """Validate a SHA256 hash string. Exit with error if invalid."""
     if not _SHA256_RE.fullmatch(value):
         console.print(
-            f"[red]Invalid SHA256 hash: {value!r}. "
+            f"[red]Invalid SHA256 hash: {escape(repr(value))}. "
             "Expected 64 lowercase hexadecimal characters.[/red]"
         )
         sys.exit(1)
@@ -1148,7 +1148,9 @@ def _validate_date(value: str) -> str:
     try:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
-        console.print(f"[red]Invalid date: {value!r}. Expected format: YYYY-MM-DD.[/red]")
+        console.print(
+            f"[red]Invalid date: {escape(repr(value))}. Expected format: YYYY-MM-DD.[/red]"
+        )
         sys.exit(1)
     return value
 
@@ -1167,14 +1169,14 @@ def _resolve_identifier(
     if _is_sha256(identifier):
         record = store.get_current_state(identifier)
         if not record:
-            console.print(f"[red]No record found for hash {identifier[:16]}...[/red]")
+            console.print(f"[red]No record found for hash {escape(identifier[:16])}...[/red]")
             sys.exit(1)
         return record
 
     # Filename lookup
     records = store.list_by_file_name(identifier, ENCRYPTED)
     if not records:
-        console.print(f"[red]No encrypted files found with name {identifier!r}.[/red]")
+        console.print(f"[red]No encrypted files found with name {escape(repr(identifier))}.[/red]")
         sys.exit(1)
 
     if version < 1 or version > len(records):
@@ -1212,7 +1214,9 @@ def _validate_account_ids(raw: str) -> list[str]:
         sys.exit(1)
     for account_id in account_ids:
         if not _ACCOUNT_ID_RE.fullmatch(account_id):
-            console.print(f"[red]Invalid AWS account ID: {account_id!r}. Must be 12 digits.[/red]")
+            console.print(
+                f"[red]Invalid AWS account ID: {escape(repr(account_id))}. Must be 12 digits.[/red]"
+            )
             sys.exit(1)
     return account_ids
 
@@ -1229,7 +1233,9 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
     tags: dict[str, str] = {}
     for t in tag_strs:
         if "=" not in t:
-            console.print(f"[yellow]Ignoring invalid tag '{t}' (expected KEY=VALUE)[/yellow]")
+            console.print(
+                f"[yellow]Ignoring invalid tag '{escape(t)}' (expected KEY=VALUE)[/yellow]"
+            )
             continue
         k, _, v = t.partition("=")
         k = k.strip()

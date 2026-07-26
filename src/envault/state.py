@@ -114,6 +114,7 @@ class StateStore:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
         retry=retry_if_not_exception_type(StateConflictError),
     )
     def put_current_state(
@@ -182,7 +183,11 @@ class StateStore:
             record, operation, correlation_id, audit_ttl_days, now, unique_suffix, principal_arn
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def _put_event_inner(
         self,
         record: FileRecord,
@@ -220,7 +225,11 @@ class StateStore:
             extra={"sha256": record.sha256_hash[:16], "operation": operation},
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def get_current_state(self, sha256_hash: str) -> FileRecord | None:
         """Return the current state record for a file, or None if not found."""
         response = self._table.get_item(Key={"PK": f"{FILE_PREFIX}{sha256_hash}", "SK": CURRENT})
@@ -229,7 +238,11 @@ class StateStore:
             return None
         return _item_to_record(item)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_by_state(self, state: str, max_items: int = 0) -> list[FileRecord]:
         """Return all files in a given state (uses state-index GSI).
 
@@ -247,7 +260,11 @@ class StateStore:
         )
         return [_item_to_record(item) for item in items]
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_by_file_name(self, file_name: str, state: str) -> list[FileRecord]:
         """Return CURRENT records matching a file_name in a given state.
 
@@ -265,7 +282,11 @@ class StateStore:
         records.sort(key=lambda r: r.encrypted_at, reverse=True)
         return records
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_events_for_file(self, sha256_hash: str) -> list[dict[str, Any]]:
         """Return all event records for a file, sorted by timestamp."""
         return self._paginate_query(
@@ -274,7 +295,11 @@ class StateStore:
             )
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def list_events_by_date(self, date_str: str) -> list[dict[str, Any]]:
         """Return EVENT records for a given date YYYY-MM-DD (uses date-index GSI).
 

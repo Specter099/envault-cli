@@ -34,6 +34,7 @@ class S3Store:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
         # An oversized object is a deterministic rejection: retrying only triples
         # the S3 read cost before failing with the same answer.
         retry=retry_if_not_exception_type(EnvaultError),
@@ -89,7 +90,11 @@ class S3Store:
         )
         return io.BytesIO(body)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def upload_file(self, local_path: Path, s3_key: str) -> str:
         """Upload a file to S3 and return the version ID atomically.
 
@@ -122,7 +127,11 @@ class S3Store:
         )
         return version_id
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     def download_file(self, s3_key: str, local_path: Path, version_id: str = "") -> None:
         """Download a file from S3.
 

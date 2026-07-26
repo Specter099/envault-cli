@@ -120,6 +120,7 @@ def sha256_file(path: Path) -> str:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
+    reraise=True,
     retry=retry_if_not_exception_type(ConfigurationError),
 )
 def encrypt_file(
@@ -328,6 +329,7 @@ def decrypt_to_stream(
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
+    reraise=True,
     retry=retry_if_not_exception_type(
         (
             ConfigurationError,

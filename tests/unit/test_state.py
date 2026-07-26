@@ -633,3 +633,27 @@ def test_put_event_inner_duplicate_write_is_tolerated():
     store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
     store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
     assert len(store.list_events_for_file(record.sha256_hash)) == 1
+
+
+@mock_aws
+def test_retry_exhaustion_reraises_original_exception():
+    """Retries must surface the real error, not tenacity's RetryError wrapper.
+
+    Every CLI handler catches ClientError/BotoCoreError. Without reraise=True,
+    an exhausted retry raises RetryError instead, slipping past all of them and
+    skipping both the error message and the cleanup they perform.
+    """
+    store = _create_table()
+    record = _make_record()
+    throttled = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
+        "PutItem",
+    )
+    with patch.object(store._table, "put_item", side_effect=throttled):
+        with pytest.raises(ClientError):
+            store.put_event(record, operation="ACCESS", correlation_id="corr")
+        with pytest.raises(ClientError):
+            store.put_current_state(record)
+    with patch.object(store._table, "get_item", side_effect=throttled):
+        with pytest.raises(ClientError):
+            store.get_current_state(record.sha256_hash)
