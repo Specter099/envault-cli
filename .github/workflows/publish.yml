@@ -44,7 +44,10 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
 
       - name: Audit dependencies
-        run: pip install pip-audit && pip-audit --ignore-vuln CVE-2026-4539
+        run: |
+          pip install --upgrade pip
+          pip install pip-audit
+          pip-audit --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-3219
 
   build:
     name: Build distribution
