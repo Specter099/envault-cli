@@ -27,7 +27,6 @@ class S3Store:
 
     def __init__(self, bucket: str, region: str = "us-east-1", kms_key_id: str = "") -> None:
         self._bucket = bucket
-        self._region = region
         self._kms_key_id = kms_key_id
         self._s3 = boto3.client("s3", region_name=region, config=boto_config)
 
