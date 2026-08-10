@@ -57,7 +57,7 @@ Original shell-based encrypt/decrypt using `aws-encryption-cli` with `@filename.
 
 ## Testing
 
-Tests use **moto** to mock AWS services — no real credentials needed. Shared fixtures in `tests/conftest.py` create mocked DynamoDB tables, S3 buckets, and KMS keys. CI runs against Python 3.10, 3.11, 3.12.
+Tests use **moto** to mock AWS services — no real credentials needed. `tests/conftest.py` holds the shared fixtures: fake AWS credentials (autouse) and a mocked KMS key. Test modules that need a DynamoDB table or S3 bucket create their own inline (see `_create_table`/`_create_bucket` in `tests/unit/test_cli.py`). CI runs against Python 3.10, 3.11, 3.12.
 
 ## Configuration
 
