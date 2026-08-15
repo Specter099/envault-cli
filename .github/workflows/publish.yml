@@ -47,6 +47,8 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pip-audit
+          # CVE-2026-4539: pygments AdlLexer ReDoS (transitive via rich).
+          # CVE-2026-3219: pip archive-format confusion in the installer.
           pip-audit --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-3219
 
   build:

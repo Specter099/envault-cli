@@ -70,6 +70,11 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pip-audit
+          # CVE-2026-4539: pygments AdlLexer ReDoS (transitive via rich).
+          # envault never lexes untrusted source with pygments.
+          # CVE-2026-3219: pip archive-format confusion in the installer.
+          # Affects the CI image's pip, not the published package; we upgrade
+          # pip first. Keep the ignore until the runner ships pip >= 26.1.
           pip-audit --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-3219
 
   test:
