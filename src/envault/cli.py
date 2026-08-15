@@ -34,7 +34,7 @@ from envault.exceptions import (
 from envault.fileutils import best_effort_delete as _best_effort_delete
 from envault.identity import caller_arn
 from envault.isolation import CredentialFd, harden_process, wipe
-from envault.s3 import S3Store
+from envault.s3 import S3Store, assert_safe_s3_key
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
 console = Console()
@@ -57,6 +57,33 @@ def _load_config() -> Config:
     except ConfigurationError as e:
         console.print(f"[bold red]Configuration error:[/bold red] {escape(str(e))}")
         sys.exit(1)
+
+
+def _audit_ttl_days() -> int:
+    """Honour ENVAULT_AUDIT_TTL_DAYS for every command that writes events.
+
+    Click envvar wiring does not construct :class:`Config`, so reading the
+    variable here is what actually reaches ``put_event``.
+    """
+    raw = os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365")
+    try:
+        days = int(raw)
+        if days <= 0:
+            raise ValueError("must be positive")
+    except ValueError:
+        console.print(
+            f"[bold red]Configuration error:[/bold red] ENVAULT_AUDIT_TTL_DAYS "
+            f"must be a positive integer (days). Got: {escape(repr(raw))}"
+        )
+        sys.exit(1)
+    return days
+
+
+def _require_envault_s3_key(s3_key: str) -> None:
+    """Refuse DynamoDB-supplied keys that do not look like an envault object."""
+    assert_safe_s3_key(s3_key)
+    if not s3_key.startswith("encrypted/"):
+        raise EnvaultError(f"Refusing S3 key outside the encrypted/ prefix: {s3_key!r}")
 
 
 @click.group(invoke_without_command=True)
@@ -135,7 +162,13 @@ def encrypt(
 
     INPUT_PATH can be a single file or a directory (processed recursively).
     """
-    config = Config(key_id=key_id, bucket=bucket, table_name=table, region=region)
+    config = Config(
+        key_id=key_id,
+        bucket=bucket,
+        table_name=table,
+        region=region,
+        audit_ttl_days=_audit_ttl_days(),
+    )
     tags = _parse_tags(tag)
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region, kms_key_id=key_id)
@@ -282,6 +315,7 @@ def _encrypt_one(
     default="",
     help="Comma-separated AWS account IDs to trust for decryption.",
 )
+@click.option("--force", is_flag=True, help="Overwrite an existing destination file.")
 @click.pass_context
 def decrypt(
     ctx: click.Context,
@@ -292,6 +326,7 @@ def decrypt(
     region: str,
     version: int,
     allowed_account_ids: str,
+    force: bool,
 ) -> None:
     """Decrypt a file by SHA256 hash or filename.
 
@@ -305,14 +340,26 @@ def decrypt(
 
     record = _resolve_identifier(identifier, version, store)
     sha256_hash = record.sha256_hash
+    try:
+        _require_envault_s3_key(record.s3_key)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Refusing to decrypt:[/bold red] {escape(str(exc))}")
+        sys.exit(1)
 
-    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
-    os.close(_fd)
-    tmp_encrypted = Path(_tmp)
     safe_name = Path(record.file_name).name
     if not safe_name or safe_name.startswith("."):
         safe_name = f"decrypted_{sha256_hash[:16]}"
     output_path = (output if output.is_dir() else output.parent) / safe_name
+    if output_path.exists() and not force:
+        console.print(
+            f"[bold red]Refusing to overwrite:[/bold red] {escape(str(output_path))} "
+            "already exists. Pass --force to replace it."
+        )
+        sys.exit(1)
+
+    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
+    os.close(_fd)
+    tmp_encrypted = Path(_tmp)
 
     try:
         s3.download_file(
@@ -372,6 +419,7 @@ def decrypt(
             record,
             operation="DECRYPT",
             correlation_id=correlation_id,
+            audit_ttl_days=_audit_ttl_days(),
             principal_arn=caller_arn(region),
         )
     except (ClientError, BotoCoreError, EnvaultError) as exc:
@@ -587,7 +635,10 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
             if not dry_run:
                 store.put_current_state(record)
                 store.put_event(
-                    record, operation="ENCRYPT", correlation_id="migrated-from-output-json"
+                    record,
+                    operation="ENCRYPT",
+                    correlation_id="migrated-from-output-json",
+                    audit_ttl_days=_audit_ttl_days(),
                 )
             imported += 1
         except StateConflictError:
@@ -618,6 +669,8 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
         raise MigrationError(f"Path traversal not allowed in migration input: {input_path!r}")
     if plaintext_path.is_absolute():
         logger.warning("Absolute path in migration input: %s", input_path)
+    if plaintext_path.is_symlink():
+        raise MigrationError(f"Symlink not allowed in migration input: {input_path!r}")
 
     file_name = S3Store._sanitize_filename(plaintext_path.name)
     algorithm = _extract_algorithm(header)
@@ -729,6 +782,8 @@ def rotate_key(
             console.print(f"  Would rotate: {escape(r.file_name)} ({r.sha256_hash[:16]}...)")
         return
 
+    _assert_kms_key_usable(new_key_id, region)
+
     console.print(
         "[dim yellow]Note: Temporary plaintext is overwritten with zeros before deletion, "
         "but secure erasure is not guaranteed on copy-on-write filesystems (APFS, Btrfs, "
@@ -756,6 +811,7 @@ def rotate_key(
             os.close(_fd_enc)
             tmp_enc = Path(_tmp_enc)
 
+            _require_envault_s3_key(record.s3_key)
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
             decrypt_file(
                 tmp_dl,
@@ -791,6 +847,7 @@ def rotate_key(
                     record,
                     operation="ROTATE_KEY",
                     correlation_id=correlation_id,
+                    audit_ttl_days=_audit_ttl_days(),
                     principal_arn=caller_arn(region),
                 )
             except Exception:
@@ -928,6 +985,14 @@ def exec_(
         raise click.UsageError("Provide at least one --secret or --file.")
 
     account_ids = _validate_account_ids(allowed_account_ids)
+    if not clean_env and any(
+        key in os.environ
+        for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
+    ):
+        console.print(
+            "[yellow]Note:[/yellow] the child will inherit your AWS credentials. "
+            "Use --clean-env to drop them so a compromised command cannot call AWS."
+        )
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
@@ -979,6 +1044,7 @@ def exec_(
                 record,
                 operation="ACCESS",
                 correlation_id=correlation_id,
+                audit_ttl_days=_audit_ttl_days(),
                 principal_arn=principal,
             )
     except EncryptionContextMismatchError:
@@ -1043,6 +1109,7 @@ def _stream_secret(
     account_ids: list[str],
 ) -> None:
     """Fetch a record's ciphertext and decrypt it into ``out``, verifying first."""
+    _require_envault_s3_key(record.s3_key)
     ciphertext = s3.download_to_memory(record.s3_key, record.s3_version_id)
     decrypt_to_stream(
         ciphertext,
@@ -1198,6 +1265,31 @@ def _resolve_identifier(
         )
 
     return records[version - 1]
+
+
+def _assert_kms_key_usable(key_id: str, region: str) -> None:
+    """Fail before any plaintext is written if the rotation target is unreachable.
+
+    The stack IAM policy scopes KMS to the original CMK, so rotate-key against
+    a new key often dies with AccessDenied — after decrypting to /tmp. Checking
+    DescribeKey first turns that into a clean configuration error.
+    """
+    import boto3
+
+    from envault.config import boto_config
+
+    try:
+        boto3.client("kms", region_name=region, config=boto_config).describe_key(KeyId=key_id)
+    except (ClientError, BotoCoreError) as exc:
+        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
+        console.print(
+            f"[bold red]Cannot use rotation target {escape(key_id)}:[/bold red] "
+            f"{escape(str(msg))}\n"
+            "DescribeKey must succeed before any file is decrypted. Grant "
+            "kms:DescribeKey / kms:GenerateDataKey / kms:Decrypt on the new key "
+            "and confirm the alias exists."
+        )
+        sys.exit(1)
 
 
 _ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")

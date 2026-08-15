@@ -9,7 +9,8 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from envault.s3 import S3Store
+from envault.exceptions import EnvaultError
+from envault.s3 import S3Store, assert_safe_s3_key
 
 BUCKET = "test-bucket"
 REGION = "us-east-1"
@@ -261,3 +262,22 @@ def test_download_to_memory_does_not_touch_disk(tmp_path):
     store = S3Store(bucket=BUCKET, region=REGION)
     store.download_to_memory("enc/a")
     assert not list(tmp_path.iterdir())
+
+
+def test_assert_safe_s3_key_rejects_traversal() -> None:
+    with pytest.raises(EnvaultError, match="unsafe S3 object key"):
+        assert_safe_s3_key("encrypted/../secret")
+    with pytest.raises(EnvaultError, match="unsafe S3 object key"):
+        assert_safe_s3_key("/absolute/key")
+    with pytest.raises(EnvaultError, match="unsafe S3 object key"):
+        assert_safe_s3_key("")
+    assert_safe_s3_key("encrypted/aa/aaa.../file.enc")
+
+
+@mock_aws
+def test_download_file_rejects_unsafe_key(tmp_path: Path) -> None:
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with pytest.raises(EnvaultError, match="unsafe S3 object key"):
+        store.download_file("encrypted/../x", tmp_path / "out")

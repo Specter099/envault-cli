@@ -63,7 +63,9 @@ class FileRecord:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Microseconds so two writers in the same wall-clock second cannot share a
+    # last_updated CAS token (second-granularity made optimistic locking a no-op).
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _today_str() -> str:
@@ -335,21 +337,31 @@ class StateStore:
         return count
 
     def _latest_record_timestamp(self, state: str) -> str | None:
-        """Return the last_updated timestamp of the most recent CURRENT record in a state."""
+        """Return the last_updated timestamp of the most recent CURRENT record in a state.
+
+        DynamoDB applies ``Limit`` *before* ``FilterExpression``, and EVENT
+        items also carry ``current_state``, so ``Limit=1`` plus a CURRENT
+        filter frequently returns an empty page. Page until a CURRENT item
+        survives the filter.
+        """
         from boto3.dynamodb.conditions import Attr
 
-        response = self._table.query(
-            IndexName="state-index",
-            KeyConditionExpression=Key("current_state").eq(state),
-            FilterExpression=Attr("SK").eq(CURRENT),
-            ScanIndexForward=False,
-            Limit=1,
-        )
-        items = response.get("Items", [])
-        if not items:
-            return None
-        value = items[0].get("last_updated")
-        return str(value) if value is not None else None
+        query_kwargs: dict[str, Any] = {
+            "IndexName": "state-index",
+            "KeyConditionExpression": Key("current_state").eq(state),
+            "FilterExpression": Attr("SK").eq(CURRENT),
+            "ScanIndexForward": False,
+        }
+        while True:
+            response = self._table.query(**query_kwargs)
+            items = response.get("Items", [])
+            if items:
+                value = items[0].get("last_updated")
+                return str(value) if value is not None else None
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                return None
+            query_kwargs["ExclusiveStartKey"] = last_key
 
     def summary(self) -> dict[str, Any]:
         """Return aggregate counts and last activity timestamp for the dashboard."""

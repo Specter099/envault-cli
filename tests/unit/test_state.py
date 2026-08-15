@@ -490,6 +490,9 @@ def test_summary_counts_exclude_events():
     assert summary["total"] == 2, f"Expected 2, got {summary['total']} — events double-counted"
     assert summary["encrypted"] == 1, f"Expected 1, got {summary['encrypted']}"
     assert summary["decrypted"] == 1, f"Expected 1, got {summary['decrypted']}"
+    assert summary["last_activity"] != "\u2014", (
+        "last_activity must survive EVENT items sharing the state-index partition"
+    )
 
 
 @mock_aws
