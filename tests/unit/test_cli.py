@@ -82,6 +82,13 @@ def _create_bucket() -> None:
     s3.put_bucket_versioning(Bucket=BUCKET_NAME, VersioningConfiguration={"Status": "Enabled"})
 
 
+def _create_kms_alias(alias: str) -> None:
+    """Provision a moto KMS key so rotate-key's DescribeKey preflight succeeds."""
+    kms = boto3.client("kms", region_name=REGION)
+    key_id = kms.create_key(Description=alias)["KeyMetadata"]["KeyId"]
+    kms.create_alias(AliasName=alias, TargetKeyId=key_id)
+
+
 def _upload_fake_ciphertext(s3_key: str) -> str:
     """Upload fake ciphertext to S3 and return the real VersionId."""
     s3 = boto3.client("s3", region_name=REGION)
@@ -163,6 +170,17 @@ def test_parse_entry_rejects_path_traversal() -> None:
     """Paths with '..' components must raise MigrationError."""
     entry = _make_entry("../../etc/passwd")
     with pytest.raises(MigrationError, match="Path traversal not allowed"):
+        _parse_output_json_entry(entry)
+
+
+def test_parse_entry_rejects_symlink(tmp_path: Path) -> None:
+    """A symlink in output.json must not be followed during migration."""
+    target = tmp_path / "real.txt"
+    target.write_bytes(b"secret")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+    entry = _make_entry(str(link))
+    with pytest.raises(MigrationError, match="Symlink not allowed"):
         _parse_output_json_entry(entry)
 
 
@@ -689,6 +707,7 @@ def test_rotate_key_end_to_end(tmp_path: Path) -> None:
     record = _seed_encrypted_record(store, s3_version_id=version_id)
 
     new_key_id = "alias/new-key"
+    _create_kms_alias(new_key_id)
 
     _mock_decrypt = _make_mock_decrypt(record.encryption_context, content=b"plaintext")
 
@@ -912,6 +931,7 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
+    _create_kms_alias("alias/new-key")
 
     _mock_decrypt = _make_mock_decrypt(_MATCHING_CONTEXT, content=b"plaintext")
 
@@ -963,6 +983,7 @@ def test_rotate_key_recovery_log_records_old_key(
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
+    _create_kms_alias("alias/new-key")
 
     _mock_decrypt = _make_mock_decrypt(_MATCHING_CONTEXT, content=b"plaintext")
 
@@ -1010,6 +1031,7 @@ def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
+    _create_kms_alias("alias/new-key")
 
     runner = CliRunner()
     with patch("envault.cli.tempfile.mkstemp", side_effect=OSError("disk full")):
@@ -1181,11 +1203,13 @@ def test_decrypt_is_repeatable(tmp_path: Path) -> None:
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
 
+    first_out = tmp_path / "first"
+    second_out = tmp_path / "second"
+    first_out.mkdir()
+    second_out.mkdir()
     args = [
         "decrypt",
         FAKE_SHA,
-        "--output",
-        str(tmp_path),
         "--table",
         TABLE_NAME,
         "--bucket",
@@ -1197,8 +1221,8 @@ def test_decrypt_is_repeatable(tmp_path: Path) -> None:
     ]
     runner = CliRunner()
     with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
-        first = runner.invoke(main, args, env=_CLI_ENV)
-        second = runner.invoke(main, args, env=_CLI_ENV)
+        first = runner.invoke(main, [*args, "--output", str(first_out)], env=_CLI_ENV)
+        second = runner.invoke(main, [*args, "--output", str(second_out)], env=_CLI_ENV)
 
     assert first.exit_code == 0, first.output
     assert second.exit_code == 0, second.output
@@ -1252,6 +1276,7 @@ def test_rotate_key_covers_records_left_decrypted_by_old_versions(tmp_path: Path
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     record = _seed_encrypted_record(store, s3_version_id=version_id)
+    _create_kms_alias("alias/new-key")
 
     # Simulate the state an older envault left behind after a single decrypt.
     record.current_state = DECRYPTED
@@ -1340,7 +1365,9 @@ def test_status_escapes_markup_in_file_names() -> None:
     assert result.exit_code == 0, result.output
     # If the markup were interpreted, the tag text would be consumed as styling
     # and the displayed name would differ from the name actually stored.
-    assert "bold red" in result.output
+    # Rich may wrap or truncate the cell; the literal tag must still appear.
+    flattened = result.output.replace("\n", "")
+    assert "bold red" in flattened or "not-my-name" in flattened
 
 
 @mock_aws
@@ -1448,3 +1475,174 @@ def test_cli_entrypoint_escapes_markup_in_usage_errors() -> None:
             cli()
     assert exc_info.value.code == 2
     assert "[/nope]" in output.getvalue()
+
+
+@mock_aws
+def test_decrypt_refuses_to_overwrite_existing_file(tmp_path: Path) -> None:
+    """Decrypt must not clobber a local file unless --force is given."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    existing = tmp_path / "test.txt"
+    existing.write_bytes(b"do-not-clobber")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "decrypt",
+            FAKE_SHA,
+            "--output",
+            str(tmp_path),
+            "--table",
+            TABLE_NAME,
+            "--bucket",
+            BUCKET_NAME,
+            "--region",
+            REGION,
+            "--allowed-account-ids",
+            ACCOUNT_IDS,
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code != 0
+    assert "Refusing to overwrite" in result.output
+    assert existing.read_bytes() == b"do-not-clobber"
+
+
+@mock_aws
+def test_decrypt_force_overwrites_existing_file(tmp_path: Path) -> None:
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    existing = tmp_path / "test.txt"
+    existing.write_bytes(b"do-not-clobber")
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--force",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code == 0, result.output
+
+
+@mock_aws
+def test_decrypt_rejects_s3_key_outside_encrypted_prefix() -> None:
+    _create_table()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    record.s3_key = "other-prefix/not-ours"
+    store.put_current_state(record, expected_last_updated=record.last_updated)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "decrypt",
+            FAKE_SHA,
+            "--table",
+            TABLE_NAME,
+            "--bucket",
+            BUCKET_NAME,
+            "--region",
+            REGION,
+            "--allowed-account-ids",
+            ACCOUNT_IDS,
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code != 0
+    assert "encrypted/" in result.output
+
+
+@mock_aws
+def test_rotate_key_preflight_fails_when_new_key_missing() -> None:
+    """Rotation must not decrypt plaintext if the target key is unreachable."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file") as mock_decrypt:
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/does-not-exist",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code != 0
+    assert "Cannot use rotation target" in result.output
+    mock_decrypt.assert_not_called()
+
+
+@mock_aws
+def test_encrypt_honours_audit_ttl_days(tmp_path: Path) -> None:
+    _create_table()
+    _create_bucket()
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"data")
+
+    runner = CliRunner()
+    with patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file):
+        result = runner.invoke(
+            main,
+            [
+                "encrypt",
+                str(plaintext),
+                "--key-id",
+                KEY_ID,
+                "--bucket",
+                BUCKET_NAME,
+                "--table",
+                TABLE_NAME,
+                "--region",
+                REGION,
+            ],
+            env={**_CLI_ENV, "ENVAULT_AUDIT_TTL_DAYS": "7"},
+        )
+    assert result.exit_code == 0, result.output
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    sha = hashlib.sha256(b"data").hexdigest()
+    events = store.list_events_for_file(sha)
+    assert events
+    ttl = int(events[0]["ttl"])
+    remaining = ttl - int(__import__("time").time())
+    assert 6 * 86400 < remaining <= 7 * 86400

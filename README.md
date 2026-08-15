@@ -80,7 +80,7 @@ envault encrypt INPUT_PATH [--tag KEY=VALUE]... [--force]
 envault exec -s IDENTIFIER=VAR [-f IDENTIFIER=VAR]... [--clean-env] -- COMMAND [ARGS]...
 
 # Decrypt by filename or SHA256 hash
-envault decrypt IDENTIFIER [-o OUTPUT_DIR] [--version N]
+envault decrypt IDENTIFIER [-o OUTPUT_DIR] [--version N] [--force]
 
 # List all encrypted/decrypted files
 envault status [--state encrypted|decrypted|all]

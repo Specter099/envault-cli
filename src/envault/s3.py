@@ -22,6 +22,20 @@ logger = logging.getLogger(__name__)
 MAX_IN_MEMORY_BYTES = 16 * 1024 * 1024
 
 
+def assert_safe_s3_key(s3_key: str) -> None:
+    """Reject object keys that could address something other than a stored blob.
+
+    S3 keys are not filesystem paths, but a DynamoDB-tampered ``s3_key`` with
+    ``..`` components or a leading slash is never a legitimate envault object
+    and must not be forwarded to the API.
+    """
+    if not s3_key or s3_key.startswith("/") or "\x00" in s3_key:
+        raise EnvaultError(f"Refusing unsafe S3 object key: {s3_key!r}")
+    parts = s3_key.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise EnvaultError(f"Refusing unsafe S3 object key: {s3_key!r}")
+
+
 class S3Store:
     """Handles upload and download of encrypted files to/from S3."""
 
@@ -56,8 +70,10 @@ class S3Store:
             A BytesIO positioned at the start of the ciphertext.
 
         Raises:
-            EnvaultError: If the object is larger than MAX_IN_MEMORY_BYTES.
+            EnvaultError: If the object is larger than MAX_IN_MEMORY_BYTES
+                or the key is malformed.
         """
+        assert_safe_s3_key(s3_key)
         kwargs: dict[str, Any] = {"Bucket": self._bucket, "Key": s3_key}
         if version_id:
             kwargs["VersionId"] = version_id
@@ -108,6 +124,7 @@ class S3Store:
         Returns:
             The S3 VersionId of the uploaded object (empty string if bucket not versioned).
         """
+        assert_safe_s3_key(s3_key)
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
             put_kwargs: dict[str, Any] = {
@@ -140,6 +157,7 @@ class S3Store:
             local_path: Destination path on disk.
             version_id: Optional S3 version ID for point-in-time recovery.
         """
+        assert_safe_s3_key(s3_key)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         extra_args: dict[str, str] = {}
         if not version_id:

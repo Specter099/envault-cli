@@ -73,14 +73,17 @@ class EnvaultStack(Stack):
             target_key=encryption_key,
         )
 
-        # Deny key deletion for all principals — requires removing this
-        # policy statement first (break-glass procedure).
+        # Deny key *deletion* for all principals — requires removing this
+        # statement first (break-glass). DisableKey is intentionally omitted:
+        # disabling the CMK is the primary incident-response step after a
+        # suspected compromise, and a blanket deny would force a CloudFormation
+        # change under time pressure.
         encryption_key.add_to_resource_policy(
             iam.PolicyStatement(
                 sid="DenyScheduleKeyDeletion",
                 effect=iam.Effect.DENY,
                 principals=[iam.AnyPrincipal()],
-                actions=["kms:ScheduleKeyDeletion", "kms:DisableKey"],
+                actions=["kms:ScheduleKeyDeletion"],
                 resources=["*"],
             )
         )
@@ -94,6 +97,7 @@ class EnvaultStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
+            versioned=True,
             removal_policy=RemovalPolicy.RETAIN,
             lifecycle_rules=[
                 s3.LifecycleRule(
@@ -185,10 +189,18 @@ class EnvaultStack(Stack):
             managed_policy_name=policy_name_param.value_as_string,
             description="Least-privilege access for envault CLI users",
             statements=[
+                # Scoped to this stack's CMK. rotate-key --new-key-id against a
+                # *different* key needs a matching grant on that ARN; the CLI
+                # now fails closed on DescribeKey before decrypting plaintext.
                 iam.PolicyStatement(
                     sid="KmsEnvelopeEncryption",
                     actions=["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
                     resources=[encryption_key.key_arn],
+                ),
+                iam.PolicyStatement(
+                    sid="S3ListBucket",
+                    actions=["s3:ListBucket"],
+                    resources=[bucket.bucket_arn],
                 ),
                 iam.PolicyStatement(
                     sid="S3EncryptedObjects",
@@ -196,9 +208,8 @@ class EnvaultStack(Stack):
                         "s3:PutObject",
                         "s3:GetObject",
                         "s3:GetObjectVersion",
-                        "s3:ListBucket",
                     ],
-                    resources=[bucket.bucket_arn, f"{bucket.bucket_arn}/*"],
+                    resources=[f"{bucket.bucket_arn}/*"],
                 ),
                 iam.PolicyStatement(
                     sid="DynamoDBStateAccess",
@@ -206,7 +217,6 @@ class EnvaultStack(Stack):
                         "dynamodb:PutItem",
                         "dynamodb:GetItem",
                         "dynamodb:Query",
-                        "dynamodb:UpdateItem",
                     ],
                     resources=[table.table_arn, f"{table.table_arn}/index/*"],
                 ),
