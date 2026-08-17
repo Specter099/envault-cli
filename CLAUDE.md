@@ -43,7 +43,7 @@ CLI (cli.py) → crypto / s3 / state → AWS (KMS, S3, DynamoDB)
 - **`cli.py`** — Click command group: `encrypt`, `decrypt`, `status`, `audit`, `dashboard`, `rotate-key`, `migrate`. Orchestrates the other modules. Uses Rich for terminal output.
 - **`crypto.py`** — Pure-Python encryption/decryption via `aws-encryption-sdk`. `encrypt_file()` uses `StrictAwsKmsMasterKeyProvider` (requires explicit key ID); `decrypt_file()` uses `DiscoveryAwsKmsMasterKeyProvider` (discovers key from ciphertext). SHA256 checksum verification on decrypt.
 - **`s3.py`** — `S3Store` class for upload/download with tenacity retry. Captures S3 version IDs.
-- **`state.py`** — `StateStore` with DynamoDB single-table design. PK=`FILE#{sha256}`, SK=`CURRENT` (upserted) or `EVENT#{timestamp}#{operation}` (append-only audit trail). Three GSIs: `state-index`, `date-index`, `tag-index`.
+- **`state.py`** — `StateStore` with DynamoDB single-table design. PK=`FILE#{sha256}`, SK=`CURRENT` (upserted) or `EVENT#{timestamp}#{operation}` (append-only audit trail). Two GSIs: `state-index`, `date-index`.
 - **`config.py`** — `Config` dataclass loaded from `ENVAULT_*` environment variables.
 - **`exceptions.py`** — Exception hierarchy rooted at `EnvaultError`.
 
