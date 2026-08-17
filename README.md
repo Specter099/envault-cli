@@ -80,7 +80,7 @@ envault encrypt INPUT_PATH [--tag KEY=VALUE]... [--force]
 envault exec -s IDENTIFIER=VAR [-f IDENTIFIER=VAR]... [--clean-env] -- COMMAND [ARGS]...
 
 # Decrypt by filename or SHA256 hash
-envault decrypt IDENTIFIER [-o OUTPUT_DIR] [--version N]
+envault decrypt IDENTIFIER [-o OUTPUT_DIR] [--version N] [--force]
 
 # List all encrypted/decrypted files
 envault status [--state encrypted|decrypted|all]
@@ -136,6 +136,27 @@ it has already copied, so `--file` is the stronger mode wherever the consumer ac
 Access is recorded in the audit trail, attributed to the calling AWS principal, **before** the
 command starts. If that write fails the command does not run: an unlogged secret read is
 treated as a failure, not a warning.
+
+Without `--clean-env`, the child inherits this process's environment, including `AWS_*`
+credentials. envault prints a warning when those variables are present. Prefer `--clean-env`
+unless the child itself must call AWS.
+
+---
+
+## Key rotation
+
+`envault rotate-key --new-key-id alias/new-key` re-wraps every tracked object. The CDK
+managed policy grants `kms:GenerateDataKey` / `kms:Decrypt` / `kms:DescribeKey` only on
+**this stack's CMK**. Before rotating to a different key, attach a matching statement for
+that key's ARN. The CLI calls `DescribeKey` on `--new-key-id` *before* downloading or
+decrypting anything; an `AccessDenied` fails closed with no plaintext on disk.
+
+S3 versioning keeps the previous ciphertext (wrapped under the old key) as a noncurrent
+version for 365 days. Rotation is not a revocation primitive — disable the old CMK
+(`kms:DisableKey` is allowed; `kms:ScheduleKeyDeletion` is denied) and shorten noncurrent
+version expiration if the old key may be compromised.
+
+`decrypt` will not overwrite an existing destination file unless you pass `--force`.
 
 ---
 
