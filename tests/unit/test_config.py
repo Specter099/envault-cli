@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from envault.config import Config
+from envault.config import Config, parse_audit_ttl_days
 from envault.exceptions import ConfigurationError
 
 
@@ -149,3 +149,13 @@ def test_config_build_encryption_context_unique_per_file():
     assert ctx1 != ctx2
     assert ctx1["sha256"] == "aaa"
     assert ctx2["sha256"] == "bbb"
+
+
+def test_parse_audit_ttl_days_from_env(monkeypatch):
+    monkeypatch.setenv("ENVAULT_AUDIT_TTL_DAYS", "14")
+    assert parse_audit_ttl_days() == 14
+
+
+def test_parse_audit_ttl_days_rejects_zero():
+    with pytest.raises(ConfigurationError, match="ENVAULT_AUDIT_TTL_DAYS"):
+        parse_audit_ttl_days("0")

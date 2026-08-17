@@ -74,13 +74,16 @@ class EnvaultStack(Stack):
         )
 
         # Deny key deletion for all principals — requires removing this
-        # policy statement first (break-glass procedure).
+        # policy statement first (break-glass procedure). DisableKey is
+        # intentionally *not* denied: it is the primary incident-response
+        # action when a CMK may be compromised, and blocking it forces a
+        # CloudFormation change during an incident.
         encryption_key.add_to_resource_policy(
             iam.PolicyStatement(
                 sid="DenyScheduleKeyDeletion",
                 effect=iam.Effect.DENY,
                 principals=[iam.AnyPrincipal()],
-                actions=["kms:ScheduleKeyDeletion", "kms:DisableKey"],
+                actions=["kms:ScheduleKeyDeletion"],
                 resources=["*"],
             )
         )
@@ -190,15 +193,24 @@ class EnvaultStack(Stack):
                     actions=["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
                     resources=[encryption_key.key_arn],
                 ),
+                # rotate-key --new-key-id needs the same actions on the *target*
+                # key. Attach a separate grant for that ARN; this statement
+                # covers only the stack CMK so a leaked CLI principal cannot
+                # wrap data keys with arbitrary KMS keys in the account.
+                iam.PolicyStatement(
+                    sid="StsCallerIdentity",
+                    actions=["sts:GetCallerIdentity"],
+                    # GetCallerIdentity does not support resource-level restrictions.
+                    resources=["*"],
+                ),
                 iam.PolicyStatement(
                     sid="S3EncryptedObjects",
                     actions=[
                         "s3:PutObject",
                         "s3:GetObject",
                         "s3:GetObjectVersion",
-                        "s3:ListBucket",
                     ],
-                    resources=[bucket.bucket_arn, f"{bucket.bucket_arn}/*"],
+                    resources=[f"{bucket.bucket_arn}/encrypted/*"],
                 ),
                 iam.PolicyStatement(
                     sid="DynamoDBStateAccess",
@@ -206,7 +218,6 @@ class EnvaultStack(Stack):
                         "dynamodb:PutItem",
                         "dynamodb:GetItem",
                         "dynamodb:Query",
-                        "dynamodb:UpdateItem",
                     ],
                     resources=[table.table_arn, f"{table.table_arn}/index/*"],
                 ),
@@ -222,13 +233,23 @@ class EnvaultStack(Stack):
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "S3 object-level actions (PutObject, GetObject) require"
-                        " bucket/* wildcard. Access is scoped to the single"
-                        " envault bucket."
+                        "S3 object-level actions (PutObject, GetObject, GetObjectVersion) "
+                        "require a key wildcard. Access is scoped to the envault bucket's "
+                        "encrypted/ prefix; ListBucket is not granted because the CLI "
+                        "never lists the bucket."
                     ),
                     "applies_to": [
-                        f"Resource::<{bucket.node.id}.Arn>/*",
+                        f"Resource::<{bucket.node.id}.Arn>/encrypted/*",
                     ],
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "sts:GetCallerIdentity does not support resource-level "
+                        "restrictions. The action reveals only the caller's own "
+                        "identity, which is written to the audit trail."
+                    ),
+                    "applies_to": ["Resource::*"],
                 },
                 {
                     "id": "AwsSolutions-IAM5",
@@ -269,7 +290,7 @@ class EnvaultStack(Stack):
         # operations envault actually calls to stay within the 10-metric
         # alarm limit imposed by CloudWatch.
         sys_err_metrics: dict[str, cloudwatch.IMetric] = {}
-        for op in ("PutItem", "GetItem", "Query", "UpdateItem"):
+        for op in ("PutItem", "GetItem", "Query"):
             sys_err_metrics[op.lower()] = cloudwatch.Metric(
                 namespace="AWS/DynamoDB",
                 metric_name="SystemErrors",
