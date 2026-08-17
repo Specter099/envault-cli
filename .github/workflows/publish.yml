@@ -47,6 +47,11 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pip-audit
+          # CVE-2026-4539: pygments AdlLexer ReDoS, dev-only transitive (rich).
+          # Fixed in pygments>=2.20; not reachable from envault (we never lex
+          # untrusted source). Remove when the resolver picks 2.20+.
+          # CVE-2026-3219: pip concatenated-archive handling. pip is upgraded
+          # on the line above; ignore until the runner default is pip>=26.1.
           pip-audit --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-3219
 
   build:

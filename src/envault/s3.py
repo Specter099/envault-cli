@@ -21,6 +21,24 @@ logger = logging.getLogger(__name__)
 # belongs in the streaming `decrypt` path, not `exec`.
 MAX_IN_MEMORY_BYTES = 16 * 1024 * 1024
 
+# Keys written by envault are content-addressed under encrypted/{aa}/{sha256}/...
+# Records from DynamoDB are untrusted; refuse anything outside that prefix.
+_ENVAULT_S3_KEY_RE = re.compile(r"^encrypted/[0-9a-f]{2}/[0-9a-f]{64}/[A-Za-z0-9._\-]+\.encrypted$")
+
+
+def assert_envault_s3_key(s3_key: str) -> None:
+    """Reject S3 keys that are not envault content-addressed objects.
+
+    ``file_name`` and ``s3_key`` in DynamoDB are attacker-controlled if the table
+    is writable. Without this check a forged record can point GetObject at any
+    object in the bucket (or, with a crafted key, confuse operators).
+    """
+    if not _ENVAULT_S3_KEY_RE.fullmatch(s3_key):
+        raise EnvaultError(
+            "Refusing to access an S3 object outside the envault encrypted/ prefix "
+            f"(got {s3_key!r})."
+        )
+
 
 class S3Store:
     """Handles upload and download of encrypted files to/from S3."""

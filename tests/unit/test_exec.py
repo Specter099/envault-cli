@@ -348,6 +348,22 @@ def test_exec_clean_env_drops_inherited_variables() -> None:
 
 
 @mock_aws
+def test_exec_warns_when_inheriting_aws_credentials() -> None:
+    account = _provision()
+    env = _env(account)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        _seed_secret(runner, env)
+        rec = _ExecRecorder()
+        with patch("os.execvpe", rec):
+            result = runner.invoke(
+                main, ["exec", "-s", "db.env=DATABASE_URL", "--", "/bin/true"], env=env
+            )
+        assert rec.called, result.output
+        assert "clean-env" in result.output.lower()
+
+
+@mock_aws
 def test_exec_rejects_binary_secret_for_env() -> None:
     account = _provision()
     env = _env(account)

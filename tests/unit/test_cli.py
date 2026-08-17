@@ -14,6 +14,7 @@ from moto import mock_aws
 
 from envault.cli import (
     _best_effort_delete,
+    _collect_files,
     _friendly_message,
     _parse_output_json_entry,
     _parse_tags,
@@ -80,6 +81,10 @@ def _create_bucket() -> None:
     s3 = boto3.client("s3", region_name=REGION)
     s3.create_bucket(Bucket=BUCKET_NAME)
     s3.put_bucket_versioning(Bucket=BUCKET_NAME, VersioningConfiguration={"Status": "Enabled"})
+    # rotate-key preflights kms:DescribeKey on --new-key-id before decrypting.
+    kms = boto3.client("kms", region_name=REGION)
+    key_id = kms.create_key(Description="envault-test-rotation-key")["KeyMetadata"]["KeyId"]
+    kms.create_alias(AliasName="alias/new-key", TargetKeyId=key_id)
 
 
 def _upload_fake_ciphertext(s3_key: str) -> str:
@@ -140,8 +145,8 @@ def test_parse_entry_uses_content_hash(tmp_path: Path) -> None:
     plaintext.write_bytes(content)
     expected_hash = hashlib.sha256(content).hexdigest()
 
-    entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry)
+    entry = _make_entry("secret.txt")
+    record = _parse_output_json_entry(entry, base_dir=tmp_path)
 
     assert record is not None
     assert record.sha256_hash == expected_hash
@@ -172,11 +177,35 @@ def test_parse_entry_records_file_size(tmp_path: Path) -> None:
     content = b"hello world\n"
     plaintext.write_bytes(content)
 
-    entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry)
+    entry = _make_entry("sized.txt")
+    record = _parse_output_json_entry(entry, base_dir=tmp_path)
 
     assert record is not None
     assert record.file_size_bytes == len(content)
+
+
+def test_parse_entry_rejects_absolute_path(tmp_path: Path) -> None:
+    """Absolute paths must not be hashed — they can point at system files."""
+    target = tmp_path / "secret.txt"
+    target.write_bytes(b"nope")
+    entry = _make_entry(str(target))
+    with pytest.raises(MigrationError, match="Absolute path not allowed"):
+        _parse_output_json_entry(entry, base_dir=tmp_path)
+
+
+def test_parse_entry_rejects_symlink(tmp_path: Path) -> None:
+    """Migration must not follow a symlink to a file outside the tree."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "id_rsa"
+    secret.write_bytes(b"ssh-private-key")
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    link = tree / "innocent.txt"
+    link.symlink_to(secret)
+    entry = _make_entry("innocent.txt")
+    with pytest.raises(MigrationError, match="symlink"):
+        _parse_output_json_entry(entry, base_dir=tree)
 
 
 def test_validate_date_accepts_valid() -> None:
@@ -1181,11 +1210,13 @@ def test_decrypt_is_repeatable(tmp_path: Path) -> None:
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
 
-    args = [
+    out1 = tmp_path / "first"
+    out2 = tmp_path / "second"
+    out1.mkdir()
+    out2.mkdir()
+    base_args = [
         "decrypt",
         FAKE_SHA,
-        "--output",
-        str(tmp_path),
         "--table",
         TABLE_NAME,
         "--bucket",
@@ -1197,8 +1228,8 @@ def test_decrypt_is_repeatable(tmp_path: Path) -> None:
     ]
     runner = CliRunner()
     with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
-        first = runner.invoke(main, args, env=_CLI_ENV)
-        second = runner.invoke(main, args, env=_CLI_ENV)
+        first = runner.invoke(main, [*base_args, "--output", str(out1)], env=_CLI_ENV)
+        second = runner.invoke(main, [*base_args, "--output", str(out2)], env=_CLI_ENV)
 
     assert first.exit_code == 0, first.output
     assert second.exit_code == 0, second.output
@@ -1339,8 +1370,10 @@ def test_status_escapes_markup_in_file_names() -> None:
     )
     assert result.exit_code == 0, result.output
     # If the markup were interpreted, the tag text would be consumed as styling
-    # and the displayed name would differ from the name actually stored.
-    assert "bold red" in result.output
+    # and would not appear as literal square brackets in the table.
+    collapsed = "".join(result.output.split())
+    assert "[bold" in collapsed
+    assert "not-my-name" in collapsed
 
 
 @mock_aws
@@ -1448,3 +1481,151 @@ def test_cli_entrypoint_escapes_markup_in_usage_errors() -> None:
             cli()
     assert exc_info.value.code == 2
     assert "[/nope]" in output.getvalue()
+
+
+def test_collect_files_skips_directory_symlink(tmp_path: Path) -> None:
+    """A directory symlink must not pull files from outside the target tree."""
+    outside = tmp_path / "victim"
+    outside.mkdir()
+    (outside / "id_rsa").write_bytes(b"ssh-private-key")
+    tree = tmp_path / "shared"
+    tree.mkdir()
+    (tree / "ok.txt").write_bytes(b"ok")
+    (tree / "escape").symlink_to(outside)
+
+    names = {p.name for p in _collect_files(tree)}
+    assert names == {"ok.txt"}
+
+
+def test_collect_files_skips_file_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "secret.env"
+    outside.write_bytes(b"TOKEN=1")
+    tree = tmp_path / "shared"
+    tree.mkdir()
+    (tree / "ok.txt").write_bytes(b"ok")
+    (tree / "link.env").symlink_to(outside)
+
+    names = {p.name for p in _collect_files(tree)}
+    assert names == {"ok.txt"}
+
+
+def test_collect_files_skips_symlink_root(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "a.txt").write_bytes(b"a")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert _collect_files(link) == []
+
+
+@mock_aws
+def test_decrypt_refuses_overwrite_without_force(tmp_path: Path) -> None:
+    """decrypt must not clobber an existing destination unless --force is given."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    existing = tmp_path / "test.txt"
+    existing.write_bytes(b"do-not-clobber")
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code != 0
+    assert "overwrite" in result.output.lower()
+    assert existing.read_bytes() == b"do-not-clobber"
+
+
+@mock_aws
+def test_decrypt_overwrite_with_force(tmp_path: Path) -> None:
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    existing = tmp_path / "test.txt"
+    existing.write_bytes(b"old")
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--force",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0, result.output
+    assert existing.read_bytes() == b"decrypted content"
+
+
+@mock_aws
+def test_decrypt_rejects_forged_s3_key(tmp_path: Path) -> None:
+    """A DynamoDB record pointing outside encrypted/ must not trigger GetObject."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    record.s3_key = "secrets/not-envault"
+    store.put_current_state(record, expected_last_updated=record.last_updated)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok) as mock_decrypt:
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code != 0
+    mock_decrypt.assert_not_called()
+    assert "encrypted/" in result.output.lower() or "s3" in result.output.lower()
