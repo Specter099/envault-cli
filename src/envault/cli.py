@@ -310,7 +310,7 @@ def decrypt(
             output_path=output_path,
             expected_sha256=sha256_hash,
             region=region,
-            allowed_account_ids=account_ids or None,
+            allowed_account_ids=account_ids,
             expected_context=record.encryption_context,
         )
     except EncryptionContextMismatchError:
@@ -748,7 +748,7 @@ def rotate_key(
                 tmp_pt,
                 expected_sha256=record.sha256_hash,
                 region=region,
-                allowed_account_ids=account_ids or None,
+                allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
             )
             tmp_dl.unlink(missing_ok=True)
