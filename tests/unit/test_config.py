@@ -149,3 +149,15 @@ def test_config_build_encryption_context_unique_per_file():
     assert ctx1 != ctx2
     assert ctx1["sha256"] == "aaa"
     assert ctx2["sha256"] == "bbb"
+
+
+def test_parse_audit_ttl_days_reads_env_without_full_config(monkeypatch):
+    """CLI commands that skip from_env() still need the TTL env var applied."""
+    monkeypatch.setenv("ENVAULT_AUDIT_TTL_DAYS", "14")
+    assert Config.parse_audit_ttl_days() == 14
+
+
+def test_parse_audit_ttl_days_rejects_zero(monkeypatch):
+    monkeypatch.setenv("ENVAULT_AUDIT_TTL_DAYS", "0")
+    with pytest.raises(ConfigurationError, match="ENVAULT_AUDIT_TTL_DAYS"):
+        Config.parse_audit_ttl_days()
