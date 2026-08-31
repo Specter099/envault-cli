@@ -56,8 +56,6 @@ def _setup_logging(verbose: bool) -> None:
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
     """envault — client-side envelope encryption with AWS KMS + DynamoDB state tracking."""
-    ctx.ensure_object(dict)
-    ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
@@ -112,9 +110,7 @@ def cli() -> None:
 @click.option("--tag", "-t", multiple=True, metavar="KEY=VALUE", help="File tags (repeatable).")
 @click.option("--force", is_flag=True, help="Re-encrypt even if already ENCRYPTED.")
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1", show_default=True)
-@click.pass_context
 def encrypt(
-    ctx: click.Context,
     input_path: Path,
     key_id: str,
     bucket: str,
@@ -274,9 +270,7 @@ def _encrypt_one(
     default="",
     help="Comma-separated AWS account IDs to trust for decryption.",
 )
-@click.pass_context
 def decrypt(
-    ctx: click.Context,
     identifier: str,
     output: Path,
     table: str,
