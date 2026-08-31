@@ -74,13 +74,15 @@ class EnvaultStack(Stack):
         )
 
         # Deny key deletion for all principals — requires removing this
-        # policy statement first (break-glass procedure).
+        # policy statement first (break-glass procedure). DisableKey is
+        # intentionally omitted so incident response can freeze a compromised
+        # CMK without first editing this resource policy.
         encryption_key.add_to_resource_policy(
             iam.PolicyStatement(
                 sid="DenyScheduleKeyDeletion",
                 effect=iam.Effect.DENY,
                 principals=[iam.AnyPrincipal()],
-                actions=["kms:ScheduleKeyDeletion", "kms:DisableKey"],
+                actions=["kms:ScheduleKeyDeletion"],
                 resources=["*"],
             )
         )
@@ -196,9 +198,8 @@ class EnvaultStack(Stack):
                         "s3:PutObject",
                         "s3:GetObject",
                         "s3:GetObjectVersion",
-                        "s3:ListBucket",
                     ],
-                    resources=[bucket.bucket_arn, f"{bucket.bucket_arn}/*"],
+                    resources=[f"{bucket.bucket_arn}/encrypted/*"],
                 ),
                 iam.PolicyStatement(
                     sid="DynamoDBStateAccess",
@@ -206,9 +207,13 @@ class EnvaultStack(Stack):
                         "dynamodb:PutItem",
                         "dynamodb:GetItem",
                         "dynamodb:Query",
-                        "dynamodb:UpdateItem",
                     ],
                     resources=[table.table_arn, f"{table.table_arn}/index/*"],
+                ),
+                iam.PolicyStatement(
+                    sid="StsCallerIdentity",
+                    actions=["sts:GetCallerIdentity"],
+                    resources=["*"],
                 ),
             ],
         )
@@ -222,12 +227,12 @@ class EnvaultStack(Stack):
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "S3 object-level actions (PutObject, GetObject) require"
-                        " bucket/* wildcard. Access is scoped to the single"
-                        " envault bucket."
+                        "S3 object-level actions (PutObject, GetObject,"
+                        " GetObjectVersion) require an object-key wildcard."
+                        " Access is scoped to encrypted/* in the envault bucket."
                     ),
                     "applies_to": [
-                        f"Resource::<{bucket.node.id}.Arn>/*",
+                        f"Resource::<{bucket.node.id}.Arn>/encrypted/*",
                     ],
                 },
                 {
@@ -241,6 +246,14 @@ class EnvaultStack(Stack):
                         f"Resource::<{table.node.id}.Arn>/index/*",
                     ],
                 },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "sts:GetCallerIdentity does not support resource-level"
+                        " permissions; Resource '*' is required by the API."
+                    ),
+                    "applies_to": ["Action::sts:GetCallerIdentity"],
+                },
             ],
         )
 
@@ -252,6 +265,7 @@ class EnvaultStack(Stack):
             "EnvaultOpsTopic",
             display_name="envault operational alerts",
             enforce_ssl=True,
+            master_key=encryption_key,
         )
 
         # DynamoDB throttle alarm
