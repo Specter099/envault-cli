@@ -166,22 +166,27 @@ def encrypt_file(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
 
-    with input_path.open("rb") as raw_input:
-        hashing_reader = _HashingReader(raw_input)
-        with client.stream(
-            source=hashing_reader,
-            mode="e",
-            key_provider=key_provider,
-            encryption_context=encryption_context,
-            frame_length=4096,
-        ) as encryptor:
-            with os.fdopen(fd, "wb") as out:
-                while True:
-                    chunk = encryptor.read(_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-            header = encryptor.header
+    try:
+        with input_path.open("rb") as raw_input:
+            hashing_reader = _HashingReader(raw_input)
+            with client.stream(
+                source=hashing_reader,
+                mode="e",
+                key_provider=key_provider,
+                encryption_context=encryption_context,
+                frame_length=4096,
+            ) as encryptor:
+                with os.fdopen(fd, "wb") as out:
+                    fd = -1  # ownership transferred to fdopen
+                    while True:
+                        chunk = encryptor.read(_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                header = encryptor.header
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
     sha256_hash = hashing_reader.hexdigest
 

@@ -657,3 +657,35 @@ def test_retry_exhaustion_reraises_original_exception():
     with patch.object(store._table, "get_item", side_effect=throttled):
         with pytest.raises(ClientError):
             store.get_current_state(record.sha256_hash)
+
+
+@mock_aws
+def test_latest_record_timestamp_pages_past_events():
+    """Limit=1 + FilterExpression can return only EVENT items; paging must continue."""
+    store = _create_table()
+    calls = {"n": 0}
+
+    def paged_query(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Limit applied before FilterExpression: the EVENT item is consumed
+            # and filtered out, leaving an empty page with a continuation token.
+            return {
+                "Items": [],
+                "LastEvaluatedKey": {"PK": "FILE#" + "a" * 64, "SK": "EVENT#x"},
+            }
+        return {
+            "Items": [
+                {
+                    "SK": "CURRENT",
+                    "last_updated": "2026-08-31T12:00:00.000001+00:00",
+                    "current_state": ENCRYPTED,
+                }
+            ]
+        }
+
+    with patch.object(store._table, "query", side_effect=paged_query):
+        ts = store._latest_record_timestamp(ENCRYPTED)
+
+    assert calls["n"] == 2
+    assert ts == "2026-08-31T12:00:00.000001+00:00"

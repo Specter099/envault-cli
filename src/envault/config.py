@@ -48,6 +48,24 @@ class Config:
                     f"Invalid AWS account ID: {account_id!r}. Must be exactly 12 digits."
                 )
 
+    @staticmethod
+    def parse_audit_ttl_days(raw: str | None = None) -> int:
+        """Parse ENVAULT_AUDIT_TTL_DAYS (or ``raw``) as a positive integer.
+
+        CLI commands that construct :class:`Config` from flags still need this
+        so the env var is not silently ignored.
+        """
+        ttl_raw = raw if raw is not None else os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365")
+        try:
+            audit_ttl_days = int(ttl_raw)
+            if audit_ttl_days <= 0:
+                raise ValueError("must be positive")
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {ttl_raw!r}"
+            ) from exc
+        return audit_ttl_days
+
     def build_encryption_context(self, sha256_hash: str, file_name: str) -> dict[str, str]:
         """Build per-file encryption context bound to the ciphertext as AAD.
 
@@ -93,15 +111,7 @@ class Config:
             )
 
         region = os.environ.get("ENVAULT_REGION", "us-east-1")
-        _ttl_raw = os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365")
-        try:
-            audit_ttl_days = int(_ttl_raw)
-            if audit_ttl_days <= 0:
-                raise ValueError("must be positive")
-        except ValueError as exc:
-            raise ConfigurationError(
-                f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {_ttl_raw!r}"
-            ) from exc
+        audit_ttl_days = cls.parse_audit_ttl_days()
 
         _account_ids_raw = os.environ.get("ENVAULT_ALLOWED_ACCOUNT_IDS", "")
         allowed_account_ids = [a.strip() for a in _account_ids_raw.split(",") if a.strip()]

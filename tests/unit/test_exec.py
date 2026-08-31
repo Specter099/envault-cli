@@ -138,6 +138,7 @@ def test_exec_injects_secret_into_environment() -> None:
         # Trailing newline from the file is not part of the value.
         assert rec.env["DATABASE_URL"] == SECRET_VALUE.decode().rstrip("\n")
         assert rec.argv == ["/bin/true"]
+        assert "inherits AWS credentials" in result.output
 
 
 @mock_aws
@@ -284,10 +285,22 @@ def test_exec_refuses_on_checksum_mismatch() -> None:
         store = StateStore(table_name=TABLE_NAME, region=REGION)
         record = store.list_by_state("ENCRYPTED")[0]
         table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
+        new_hash = "b" * 64
+        new_key = f"encrypted/{new_hash[:2]}/{new_hash}/db.env.encrypted"
+        s3 = boto3.client("s3", region_name=REGION)
+        get_kwargs = {"Bucket": BUCKET_NAME, "Key": record.s3_key}
+        if record.s3_version_id:
+            get_kwargs["VersionId"] = record.s3_version_id
+        body = s3.get_object(**get_kwargs)["Body"].read()
+        put = s3.put_object(Bucket=BUCKET_NAME, Key=new_key, Body=body)
         table.update_item(
             Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
-            UpdateExpression="SET sha256_hash = :h",
-            ExpressionAttributeValues={":h": "b" * 64},
+            UpdateExpression="SET sha256_hash = :h, s3_key = :k, s3_version_id = :v",
+            ExpressionAttributeValues={
+                ":h": new_hash,
+                ":k": new_key,
+                ":v": put.get("VersionId", ""),
+            },
         )
         rec = _ExecRecorder()
         with patch("os.execvpe", rec):
