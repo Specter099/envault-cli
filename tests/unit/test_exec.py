@@ -283,11 +283,20 @@ def test_exec_refuses_on_checksum_mismatch() -> None:
         _seed_secret(runner, env)
         store = StateStore(table_name=TABLE_NAME, region=REGION)
         record = store.list_by_state("ENCRYPTED")[0]
+        new_hash = "b" * 64
+        new_key = f"encrypted/{new_hash[:2]}/{new_hash}/{record.file_name}.encrypted"
+        s3 = boto3.client("s3", region_name=REGION)
+        body = s3.get_object(Bucket=BUCKET_NAME, Key=record.s3_key)["Body"].read()
+        put = s3.put_object(Bucket=BUCKET_NAME, Key=new_key, Body=body)
         table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
         table.update_item(
             Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
-            UpdateExpression="SET sha256_hash = :h",
-            ExpressionAttributeValues={":h": "b" * 64},
+            UpdateExpression="SET sha256_hash = :h, s3_key = :k, s3_version_id = :v",
+            ExpressionAttributeValues={
+                ":h": new_hash,
+                ":k": new_key,
+                ":v": put.get("VersionId", ""),
+            },
         )
         rec = _ExecRecorder()
         with patch("os.execvpe", rec):
@@ -422,3 +431,19 @@ def test_exec_file_mode_survives_markup_in_secret_name() -> None:
             )
         assert rec.called, result.output
         assert rec.file_contents["TLS_CERT"] == SECRET_VALUE
+
+
+@mock_aws
+def test_exec_warns_when_inheriting_aws_credentials() -> None:
+    account = _provision()
+    env = _env(account)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        _seed_secret(runner, env)
+        rec = _ExecRecorder()
+        with patch("os.execvpe", rec):
+            result = runner.invoke(
+                main, ["exec", "-s", "db.env=DATABASE_URL", "--", "/bin/true"], env=env
+            )
+        assert rec.called, result.output
+        assert "inherit AWS credentials" in result.output

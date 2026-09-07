@@ -166,49 +166,55 @@ def encrypt_file(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
 
-    with input_path.open("rb") as raw_input:
-        hashing_reader = _HashingReader(raw_input)
-        with client.stream(
-            source=hashing_reader,
-            mode="e",
-            key_provider=key_provider,
-            encryption_context=encryption_context,
-            frame_length=4096,
-        ) as encryptor:
-            with os.fdopen(fd, "wb") as out:
-                while True:
-                    chunk = encryptor.read(_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-            header = encryptor.header
+    try:
+        with input_path.open("rb") as raw_input:
+            hashing_reader = _HashingReader(raw_input)
+            with client.stream(
+                source=hashing_reader,
+                mode="e",
+                key_provider=key_provider,
+                encryption_context=encryption_context,
+                frame_length=4096,
+            ) as encryptor:
+                with os.fdopen(fd, "wb") as out:
+                    fd = -1  # ownership transferred; fdopen closes on exit
+                    while True:
+                        chunk = encryptor.read(_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                header = encryptor.header
 
-    sha256_hash = hashing_reader.hexdigest
-
-    algorithm = (
-        header.algorithm.name if hasattr(header.algorithm, "name") else str(header.algorithm)
-    )
-    message_id = (
-        header.message_id.hex() if isinstance(header.message_id, bytes) else str(header.message_id)
-    )
-
-    logger.info(
-        "Encryption complete",
-        extra={
-            "sha256": sha256_hash[:16],
-            "output": str(output_path),
-            "algorithm": algorithm,
-            "message_id": message_id,
-        },
-    )
-
-    return EncryptResult(
-        sha256_hash=sha256_hash,
-        file_size_bytes=file_size,
-        algorithm=algorithm,
-        message_id=message_id,
-        output_path=output_path,
-    )
+        sha256_hash = hashing_reader.hexdigest
+        algorithm = (
+            header.algorithm.name if hasattr(header.algorithm, "name") else str(header.algorithm)
+        )
+        message_id = (
+            header.message_id.hex()
+            if isinstance(header.message_id, bytes)
+            else str(header.message_id)
+        )
+        logger.info(
+            "Encryption complete",
+            extra={
+                "sha256": sha256_hash[:16],
+                "output": str(output_path),
+                "algorithm": algorithm,
+                "message_id": message_id,
+            },
+        )
+        return EncryptResult(
+            sha256_hash=sha256_hash,
+            file_size_bytes=file_size,
+            algorithm=algorithm,
+            message_id=message_id,
+            output_path=output_path,
+        )
+    finally:
+        # If stream() (or anything before fdopen) fails, close the raw fd so
+        # we neither leak descriptors nor leave an unlinked 0600 file open.
+        if fd >= 0:
+            os.close(fd)
 
 
 def _discovery_key_provider(
@@ -385,6 +391,7 @@ def decrypt_file(
 
     try:
         with os.fdopen(tmp_fd, "wb") as out, input_path.open("rb") as encrypted_file:
+            tmp_fd = -1  # ownership transferred; fdopen closes on exit
             result = decrypt_to_stream(
                 encrypted_file,
                 out,
@@ -395,6 +402,8 @@ def decrypt_file(
             )
         os.replace(tmp_path, output_path)
     finally:
+        if tmp_fd >= 0:
+            os.close(tmp_fd)
         # No-op after a successful rename; zero-overwrites partial plaintext
         # left behind by any failure above.
         best_effort_delete(tmp_path)
