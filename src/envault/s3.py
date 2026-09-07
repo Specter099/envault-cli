@@ -21,6 +21,23 @@ logger = logging.getLogger(__name__)
 # belongs in the streaming `decrypt` path, not `exec`.
 MAX_IN_MEMORY_BYTES = 16 * 1024 * 1024
 
+# Content-addressed object keys: encrypted/{sha256[:2]}/{sha256}/{name}.encrypted
+_S3_KEY_RE = re.compile(r"^encrypted/([0-9a-f]{2})/([0-9a-f]{64})/[^/]+\.encrypted$")
+
+
+def assert_s3_key_matches_hash(s3_key: str, sha256_hash: str) -> None:
+    """Reject DynamoDB-sourced keys that are not this file's content-addressed path.
+
+    A poisoned ``s3_key`` must not be able to make the CLI fetch an arbitrary
+    object from the bucket (or a different file's ciphertext).
+    """
+    match = _S3_KEY_RE.fullmatch(s3_key)
+    if not match or match.group(1) != sha256_hash[:2] or match.group(2) != sha256_hash:
+        raise EnvaultError(
+            "Refusing to fetch S3 object: key is not the content-addressed "
+            f"path for hash {sha256_hash[:16]}...."
+        )
+
 
 class S3Store:
     """Handles upload and download of encrypted files to/from S3."""
