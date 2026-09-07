@@ -261,3 +261,29 @@ def test_download_to_memory_does_not_touch_disk(tmp_path):
     store = S3Store(bucket=BUCKET, region=REGION)
     store.download_to_memory("enc/a")
     assert not list(tmp_path.iterdir())
+
+
+def test_assert_s3_key_matches_hash_accepts_content_addressed_key():
+    from envault.s3 import assert_s3_key_matches_hash
+
+    sha = "a" * 64
+    assert_s3_key_matches_hash(f"encrypted/{sha[:2]}/{sha}/file.txt.encrypted", sha)
+
+
+def test_assert_s3_key_matches_hash_rejects_wrong_prefix():
+    from envault.exceptions import EnvaultError
+    from envault.s3 import assert_s3_key_matches_hash
+
+    sha = "a" * 64
+    with pytest.raises(EnvaultError, match="content-addressed"):
+        assert_s3_key_matches_hash("other/prefix/file.encrypted", sha)
+
+
+def test_assert_s3_key_matches_hash_rejects_hash_mismatch():
+    from envault.exceptions import EnvaultError
+    from envault.s3 import assert_s3_key_matches_hash
+
+    sha = "a" * 64
+    other = "b" * 64
+    with pytest.raises(EnvaultError, match="content-addressed"):
+        assert_s3_key_matches_hash(f"encrypted/{other[:2]}/{other}/file.txt.encrypted", sha)
