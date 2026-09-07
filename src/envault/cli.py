@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import boto3
 import click
 from botocore.exceptions import BotoCoreError, ClientError
 from rich.console import Console
@@ -20,7 +21,7 @@ from rich.markup import escape
 from rich.progress import track
 from rich.table import Table
 
-from envault.config import Config
+from envault.config import Config, boto_config, parse_audit_ttl_days
 from envault.crypto import decrypt_file, decrypt_to_stream, encrypt_file
 from envault.exceptions import (
     AlreadyEncryptedError,
@@ -34,7 +35,7 @@ from envault.exceptions import (
 from envault.fileutils import best_effort_delete as _best_effort_delete
 from envault.identity import caller_arn
 from envault.isolation import CredentialFd, harden_process, wipe
-from envault.s3 import S3Store
+from envault.s3 import S3Store, assert_s3_key_matches_hash
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
 console = Console()
@@ -135,7 +136,13 @@ def encrypt(
 
     INPUT_PATH can be a single file or a directory (processed recursively).
     """
-    config = Config(key_id=key_id, bucket=bucket, table_name=table, region=region)
+    config = Config(
+        key_id=key_id,
+        bucket=bucket,
+        table_name=table,
+        region=region,
+        audit_ttl_days=_audit_ttl_days(),
+    )
     tags = _parse_tags(tag)
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region, kms_key_id=key_id)
@@ -282,6 +289,7 @@ def _encrypt_one(
     default="",
     help="Comma-separated AWS account IDs to trust for decryption.",
 )
+@click.option("--force", is_flag=True, help="Overwrite an existing destination file.")
 @click.pass_context
 def decrypt(
     ctx: click.Context,
@@ -292,6 +300,7 @@ def decrypt(
     region: str,
     version: int,
     allowed_account_ids: str,
+    force: bool,
 ) -> None:
     """Decrypt a file by SHA256 hash or filename.
 
@@ -305,14 +314,29 @@ def decrypt(
 
     record = _resolve_identifier(identifier, version, store)
     sha256_hash = record.sha256_hash
+    try:
+        assert_s3_key_matches_hash(record.s3_key, sha256_hash)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Decryption error:[/bold red] {escape(str(exc))}")
+        sys.exit(1)
+    audit_ttl_days = _audit_ttl_days()
 
-    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
-    os.close(_fd)
-    tmp_encrypted = Path(_tmp)
     safe_name = Path(record.file_name).name
     if not safe_name or safe_name.startswith("."):
         safe_name = f"decrypted_{sha256_hash[:16]}"
     output_path = (output if output.is_dir() else output.parent) / safe_name
+
+    # Refuse before creating temps so a no-op collision leaves no residue.
+    if output_path.exists() and not force:
+        console.print(
+            f"[red]Refusing to overwrite {escape(str(output_path))}. "
+            "Pass --force to replace the existing file.[/red]"
+        )
+        sys.exit(1)
+
+    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
+    os.close(_fd)
+    tmp_encrypted = Path(_tmp)
 
     try:
         s3.download_file(
@@ -372,6 +396,7 @@ def decrypt(
             record,
             operation="DECRYPT",
             correlation_id=correlation_id,
+            audit_ttl_days=audit_ttl_days,
             principal_arn=caller_arn(region),
         )
     except (ClientError, BotoCoreError, EnvaultError) as exc:
@@ -572,6 +597,8 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
     """
     store = StateStore(table_name=table, region=region)
     imported = skipped = errors = 0
+    audit_ttl_days = _audit_ttl_days()
+    import_root = from_path.parent.resolve()
 
     lines = from_path.read_text().splitlines()
     for i, line in enumerate(track(lines, description="Migrating records..."), start=1):
@@ -580,14 +607,18 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
             continue
         try:
             entry = json.loads(line)
-            record = _parse_output_json_entry(entry)
+            record = _parse_output_json_entry(entry, import_root=import_root)
             if record is None:
                 skipped += 1
                 continue
             if not dry_run:
                 store.put_current_state(record)
                 store.put_event(
-                    record, operation="ENCRYPT", correlation_id="migrated-from-output-json"
+                    record,
+                    operation="ENCRYPT",
+                    correlation_id="migrated-from-output-json",
+                    audit_ttl_days=audit_ttl_days,
+                    principal_arn=caller_arn(region),
                 )
             imported += 1
         except StateConflictError:
@@ -603,7 +634,9 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
     )
 
 
-def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
+def _parse_output_json_entry(
+    entry: dict[str, Any], *, import_root: Path | None = None
+) -> FileRecord | None:
     """Convert an output.json record to a FileRecord. Returns None if not an encrypt record."""
     if entry.get("mode") != "encrypt":
         return None
@@ -613,11 +646,7 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
     if not input_path:
         return None
 
-    plaintext_path = Path(input_path)
-    if ".." in plaintext_path.parts:
-        raise MigrationError(f"Path traversal not allowed in migration input: {input_path!r}")
-    if plaintext_path.is_absolute():
-        logger.warning("Absolute path in migration input: %s", input_path)
+    plaintext_path = _confine_migration_path(input_path, import_root)
 
     file_name = S3Store._sanitize_filename(plaintext_path.name)
     algorithm = _extract_algorithm(header)
@@ -704,6 +733,9 @@ def rotate_key(
     correlation_id = str(uuid.uuid4())
     account_ids = _validate_account_ids(allowed_account_ids)
 
+    if not dry_run:
+        _preflight_kms_key(new_key_id, region)
+
     # Every tracked file still has ciphertext in S3 regardless of the state
     # recorded against it, so rotation must cover them all. Records written by
     # earlier versions were flipped to DECRYPTED on first read; skipping those
@@ -728,6 +760,8 @@ def rotate_key(
         for r in records:
             console.print(f"  Would rotate: {escape(r.file_name)} ({r.sha256_hash[:16]}...)")
         return
+
+    audit_ttl_days = _audit_ttl_days()
 
     console.print(
         "[dim yellow]Note: Temporary plaintext is overwritten with zeros before deletion, "
@@ -756,6 +790,7 @@ def rotate_key(
             os.close(_fd_enc)
             tmp_enc = Path(_tmp_enc)
 
+            assert_s3_key_matches_hash(record.s3_key, record.sha256_hash)
             s3.download_file(record.s3_key, tmp_dl, record.s3_version_id)
             decrypt_file(
                 tmp_dl,
@@ -791,6 +826,7 @@ def rotate_key(
                     record,
                     operation="ROTATE_KEY",
                     correlation_id=correlation_id,
+                    audit_ttl_days=audit_ttl_days,
                     principal_arn=caller_arn(region),
                 )
             except Exception:
@@ -931,6 +967,7 @@ def exec_(
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
+    audit_ttl_days = _audit_ttl_days()
 
     env_pairs = [_parse_secret_spec(spec, "--secret") for spec in env_specs]
     file_pairs = [_parse_secret_spec(spec, "--file") for spec in file_specs]
@@ -941,6 +978,11 @@ def exec_(
         if clean_env
         else dict(os.environ)
     )
+    if not clean_env and any(key.startswith("AWS_") for key in child_env):
+        console.print(
+            "[yellow]Warning:[/yellow] the child will inherit AWS credentials from this "
+            "environment. Pass --clean-env to start it from a minimal environment."
+        )
 
     creds: list[CredentialFd] = []
     sinks: list[_BufferSink] = []
@@ -979,6 +1021,7 @@ def exec_(
                 record,
                 operation="ACCESS",
                 correlation_id=correlation_id,
+                audit_ttl_days=audit_ttl_days,
                 principal_arn=principal,
             )
     except EncryptionContextMismatchError:
@@ -1043,6 +1086,7 @@ def _stream_secret(
     account_ids: list[str],
 ) -> None:
     """Fetch a record's ciphertext and decrypt it into ``out``, verifying first."""
+    assert_s3_key_matches_hash(record.s3_key, record.sha256_hash)
     ciphertext = s3.download_to_memory(record.s3_key, record.s3_version_id)
     decrypt_to_stream(
         ciphertext,
@@ -1125,6 +1169,77 @@ def _short_principal(arn: str) -> str:
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TAG_KEY_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 _TAG_VALUE_MAX_LEN = 256
+
+
+def _audit_ttl_days() -> int:
+    """Read ENVAULT_AUDIT_TTL_DAYS; exit on invalid values."""
+    try:
+        return parse_audit_ttl_days()
+    except ConfigurationError as exc:
+        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(exc))}")
+        sys.exit(1)
+
+
+def _preflight_kms_key(key_id: str, region: str) -> None:
+    """Fail before any plaintext is written if the target CMK is unreachable."""
+    kms = boto3.client("kms", region_name=region, config=boto_config)
+    try:
+        kms.describe_key(KeyId=key_id)
+    except ClientError as exc:
+        msg = exc.response.get("Error", {}).get("Message", str(exc))
+        console.print(
+            f"[bold red]Cannot use KMS key {escape(key_id)}:[/bold red] {escape(msg)}\n"
+            "Rotation did not download or decrypt any files. Grant kms:DescribeKey "
+            "(and GenerateDataKey) on the target key, or pass a key this principal can use."
+        )
+        sys.exit(1)
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    """True if any existing component of ``path`` is a symlink."""
+    parts = path.parts
+    if not parts:
+        return False
+    if path.is_absolute():
+        current = Path(parts[0])
+        rest = parts[1:]
+    else:
+        current = Path()
+        rest = parts
+    for part in rest:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _confine_migration_path(input_path: str, import_root: Path | None) -> Path:
+    """Resolve a migration input path, rejecting traversal and per-component symlinks."""
+    candidate = Path(input_path)
+    if ".." in candidate.parts:
+        raise MigrationError(f"Path traversal not allowed in migration input: {input_path!r}")
+
+    if import_root is None:
+        if _path_has_symlink_component(candidate):
+            raise MigrationError(f"Symlink not allowed in migration input: {input_path!r}")
+        return candidate
+
+    root = import_root.resolve()
+    joined = candidate if candidate.is_absolute() else root / candidate
+    if _path_has_symlink_component(joined):
+        raise MigrationError(f"Symlink not allowed in migration input: {input_path!r}")
+
+    resolved = joined.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise MigrationError(
+            f"Path {input_path!r} is outside the import directory {str(root)!r}"
+        ) from exc
+    return resolved
 
 
 def _validate_sha256(value: str) -> str:
@@ -1222,11 +1337,21 @@ def _validate_account_ids(raw: str) -> list[str]:
 
 
 def _collect_files(path: Path) -> list[Path]:
+    """Return regular files under ``path``, never following directory or file symlinks."""
     if path.is_symlink():
         return []
     if path.is_file():
         return [path]
-    return [p for p in path.rglob("*") if p.is_file() and not p.is_symlink()]
+    files: list[Path] = []
+    for root, dirnames, filenames in os.walk(path, followlinks=False):
+        # os.walk(followlinks=False) still lists symlink directories; drop them
+        # so we never encrypt a tree the operator did not intend to include.
+        dirnames[:] = [d for d in dirnames if not Path(root, d).is_symlink()]
+        for name in filenames:
+            candidate = Path(root) / name
+            if candidate.is_file() and not candidate.is_symlink():
+                files.append(candidate)
+    return files
 
 
 def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:

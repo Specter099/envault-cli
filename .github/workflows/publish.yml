@@ -47,6 +47,8 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pip-audit
+          # CVE-2026-4539: pygments (dev/docs highlighter, not a runtime dep)
+          # CVE-2026-3219: pip itself (CI installer), not shipped in the wheel
           pip-audit --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-3219
 
   build:
