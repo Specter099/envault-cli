@@ -1770,11 +1770,15 @@ def test_rotate_key_preflight_rejects_disabled_key() -> None:
     assert "not enabled" in result.output.lower() or "key state" in result.output.lower()
 
 
-def test_parse_entry_rejects_null_header() -> None:
-    """A null header must not abort parsing with AttributeError."""
-    entry = {"mode": "encrypt", "input": "secret.txt", "header": None}
-    with pytest.raises(MigrationError, match="header"):
-        _parse_output_json_entry(entry)
+def test_parse_entry_null_header_does_not_crash(tmp_path: Path) -> None:
+    """A null header must be treated as empty, not raise AttributeError."""
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"x")
+    entry = {"mode": "encrypt", "input": str(plaintext), "header": None}
+    record = _parse_output_json_entry(entry)
+    assert record is not None
+    assert record.algorithm == ""
+    assert record.kms_key_id == "alias/s3_key"
 
 
 @mock_aws
