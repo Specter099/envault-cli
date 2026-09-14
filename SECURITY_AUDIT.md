@@ -37,6 +37,9 @@ Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryp
 | M-1 | Medium | `exec` warns when inheriting `AWS_*` (default unchanged — breaking if flipped) |
 | M-2 | Medium | Close encrypt output fd if the SDK stream fails before `fdopen` |
 | M-3 | Medium | Document pip-audit CVE ignore rationale in CI |
+| M-4 | Medium | Decrypt nests `fdopen` so a missing ciphertext cannot skip `.part` cleanup |
+| M-5 | Medium | `migrate` catches non-object NDJSON / null headers per line instead of aborting |
+| M-6 | Medium | `rotate-key` preflight requires `KeyState == Enabled` |
 
 ---
 

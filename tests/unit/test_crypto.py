@@ -400,3 +400,21 @@ def test_partition_for_region():
     assert _partition_for_region("eu-west-2") == "aws"
     assert _partition_for_region("us-gov-west-1") == "aws-us-gov"
     assert _partition_for_region("cn-north-1") == "aws-cn"
+
+
+def test_decrypt_missing_ciphertext_cleans_temp(tmp_path: Path) -> None:
+    """If the ciphertext path cannot be opened, no .part file must remain."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "secret.txt"
+    missing = tmp_path / "nope.enc"
+
+    with pytest.raises(FileNotFoundError):
+        decrypt_file(
+            input_path=missing,
+            output_path=output,
+            allowed_account_ids=[MOTO_ACCOUNT_ID],
+        )
+
+    assert not output.exists()
+    assert list(out_dir.iterdir()) == []
