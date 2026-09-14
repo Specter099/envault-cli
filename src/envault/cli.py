@@ -607,6 +607,10 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
             continue
         try:
             entry = json.loads(line)
+            if not isinstance(entry, dict):
+                raise MigrationError(
+                    f"Expected a JSON object at line {i}, got {type(entry).__name__}"
+                )
             record = _parse_output_json_entry(entry, import_root=import_root)
             if record is None:
                 skipped += 1
@@ -624,7 +628,14 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
         except StateConflictError:
             logger.info("Record already exists, skipping migration for line %d", i)
             skipped += 1
-        except (json.JSONDecodeError, KeyError, ValueError, MigrationError) as exc:
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            MigrationError,
+        ) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
 
@@ -641,7 +652,9 @@ def _parse_output_json_entry(
     if entry.get("mode") != "encrypt":
         return None
 
-    header = entry.get("header", {})
+    header = entry.get("header", {}) or {}
+    if not isinstance(header, dict):
+        raise MigrationError("header must be a JSON object")
     input_path = entry.get("input", "")
     if not input_path:
         return None
@@ -652,7 +665,9 @@ def _parse_output_json_entry(
     algorithm = _extract_algorithm(header)
     message_id = _extract_message_id(header)
     kms_key_id = _extract_kms_key_id(header)
-    enc_context = header.get("encryption_context", {})
+    enc_context = header.get("encryption_context", {}) or {}
+    if not isinstance(enc_context, dict):
+        raise MigrationError("encryption_context must be a JSON object")
 
     from envault.crypto import sha256_file
 
@@ -693,9 +708,15 @@ def _extract_message_id(header: dict[str, Any]) -> str:
 
 def _extract_kms_key_id(header: dict[str, Any]) -> str:
     edks = header.get("encrypted_data_keys", [])
-    if edks:
-        return str(edks[0].get("key_provider", {}).get("key_info", ""))
-    return ""
+    if not isinstance(edks, list) or not edks:
+        return ""
+    first = edks[0]
+    if not isinstance(first, dict):
+        return ""
+    provider = first.get("key_provider", {})
+    if not isinstance(provider, dict):
+        return ""
+    return str(provider.get("key_info", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -1181,16 +1202,24 @@ def _audit_ttl_days() -> int:
 
 
 def _preflight_kms_key(key_id: str, region: str) -> None:
-    """Fail before any plaintext is written if the target CMK is unreachable."""
+    """Fail before any plaintext is written if the target CMK is unusable."""
     kms = boto3.client("kms", region_name=region, config=boto_config)
     try:
-        kms.describe_key(KeyId=key_id)
+        metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
     except ClientError as exc:
         msg = exc.response.get("Error", {}).get("Message", str(exc))
         console.print(
             f"[bold red]Cannot use KMS key {escape(key_id)}:[/bold red] {escape(msg)}\n"
             "Rotation did not download or decrypt any files. Grant kms:DescribeKey "
             "(and GenerateDataKey) on the target key, or pass a key this principal can use."
+        )
+        sys.exit(1)
+    state = str(metadata.get("KeyState", ""))
+    if state != "Enabled":
+        console.print(
+            f"[bold red]Cannot use KMS key {escape(key_id)}:[/bold red] "
+            f"key state is {escape(state) or 'unknown'}, not Enabled.\n"
+            "Rotation did not download or decrypt any files."
         )
         sys.exit(1)
 

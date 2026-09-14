@@ -390,20 +390,28 @@ def decrypt_file(
     tmp_path = Path(_tmp_name)
 
     try:
-        with os.fdopen(tmp_fd, "wb") as out, input_path.open("rb") as encrypted_file:
+        # Nest fdopen so ownership is marked transferred before any later
+        # open() can fail; a combined `with a, b` would leave tmp_fd >= 0
+        # after fdopen already closed it, and os.close in finally would
+        # raise EBADF and skip cleanup.
+        with os.fdopen(tmp_fd, "wb") as out:
             tmp_fd = -1  # ownership transferred; fdopen closes on exit
-            result = decrypt_to_stream(
-                encrypted_file,
-                out,
-                expected_sha256=expected_sha256,
-                expected_context=expected_context,
-                region=region,
-                allowed_account_ids=allowed_account_ids,
-            )
+            with input_path.open("rb") as encrypted_file:
+                result = decrypt_to_stream(
+                    encrypted_file,
+                    out,
+                    expected_sha256=expected_sha256,
+                    expected_context=expected_context,
+                    region=region,
+                    allowed_account_ids=allowed_account_ids,
+                )
         os.replace(tmp_path, output_path)
     finally:
         if tmp_fd >= 0:
-            os.close(tmp_fd)
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
         # No-op after a successful rename; zero-overwrites partial plaintext
         # left behind by any failure above.
         best_effort_delete(tmp_path)

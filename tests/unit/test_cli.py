@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1731,3 +1732,85 @@ def test_rotate_key_preflight_fails_before_download() -> None:
     assert result.exit_code != 0
     assert decrypt_mock.call_count == 0
     assert "cannot use kms key" in result.output.lower()
+
+
+@mock_aws
+def test_rotate_key_preflight_rejects_disabled_key() -> None:
+    """A disabled CMK must fail closed before any decrypt, even if DescribeKey works."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store)
+
+    kms = boto3.client("kms", region_name=REGION)
+    key_id = kms.create_key()["KeyMetadata"]["KeyId"]
+    kms.disable_key(KeyId=key_id)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file") as decrypt_mock:
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                key_id,
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code != 0
+    assert decrypt_mock.call_count == 0
+    assert "not enabled" in result.output.lower() or "key state" in result.output.lower()
+
+
+def test_parse_entry_rejects_null_header() -> None:
+    """A null header must not abort parsing with AttributeError."""
+    entry = {"mode": "encrypt", "input": "secret.txt", "header": None}
+    with pytest.raises(MigrationError, match="header"):
+        _parse_output_json_entry(entry)
+
+
+@mock_aws
+def test_migrate_skips_non_object_json_and_continues(tmp_path: Path) -> None:
+    """A bad NDJSON line must increment errors without aborting the rest of the file."""
+    _create_table()
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    secret = import_root / "secret.txt"
+    secret.write_bytes(b"payload\n")
+    ndjson = tmp_path / "import" / "output.json"
+    ndjson.write_text(
+        "\n".join(
+            [
+                "[]",
+                json.dumps(_make_entry("secret.txt")),
+                "null",
+            ]
+        )
+        + "\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "migrate",
+            str(ndjson),
+            "--table",
+            TABLE_NAME,
+            "--region",
+            REGION,
+            "--dry-run",
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code == 0, result.output
+    assert "Migrated 1" in result.output
+    assert "errors 2" in result.output

@@ -24,6 +24,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dashboard `last_activity` pages the state-index until a CURRENT item survives the filter.
 - `exec` warns when the child will inherit `AWS_*` credentials; `--clean-env` remains opt-in.
 - Encrypt closes the output fd if the SDK stream fails before `fdopen`.
+- Decrypt closes the temp fd and always unlinks `.part` files if opening ciphertext fails after `fdopen`.
+- `migrate` treats non-object NDJSON lines as per-record errors instead of aborting the import.
+- `rotate-key` `DescribeKey` preflight rejects keys whose state is not `Enabled`.
 
 ## [0.2.0] - 2026-07-26
 
