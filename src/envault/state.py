@@ -88,8 +88,6 @@ class StateStore:
     """
 
     def __init__(self, table_name: str, region: str = "us-east-1") -> None:
-        self._table_name = table_name
-        self._region = region
         self._dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
         self._table = self._dynamodb.Table(table_name)
 
