@@ -1,9 +1,9 @@
 # Weekly Security Audit — envault-cli
 
 **Reviewer:** Automated weekly static security review
-**Date:** 2026-09-07
-**Codebase:** `main` at start of this run, remediations on `cursor/repository-security-audit-*`
-**Scope:** `src/envault/`, `infra/cdk/`, `.github/workflows/`, `code/`, tests, dependency manifests, git tree. Static analysis only.
+**Date:** 2026-09-14
+**Codebase:** `main` @ `4b98446`; remediations on `cursor/repository-security-audit-9cfa`
+**Scope:** `src/envault/`, `infra/cdk/`, `.github/workflows/`, `code/`, tests, dependency manifests, git history (secret patterns). Static analysis only — no exploit code, no execution of untrusted payloads, no fetches of URLs found in the repo.
 
 ---
 
@@ -11,9 +11,11 @@
 
 Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryption SDK, `REQUIRE_ENCRYPT_REQUIRE_DECRYPT`, mandatory `DiscoveryFilter` with 12-digit account IDs, checksum-before-rename decrypt, and SHA-pinned GitHub Actions with OIDC PyPI publish.
 
-This week's scan found **0 Critical**, **8 High**, **7 Medium**, and **6 Low** issues still present on `main`. The High items were leftover from the 2026-08-31 audit branch that never merged. This PR remediates the High findings that are safe to land without a DynamoDB GSI replacement or a breaking CLI default.
+`main` has not moved since the 2026-09-07 audit (`4b98446`). Prior weekly PRs (#110–#113) that remediate these items are still unmerged drafts. This week's scan reproduced the same open findings on `main` and re-lands those remediations here.
 
-**After this PR:** 0 Critical, 3 High (accepted / requires operator action), 5 Medium, 5 Low.
+**This scan (on `main` before remediations):** 0 Critical, 8 High, 7 Medium, 6 Low
+
+**After this PR:** 0 Critical, 3 High (accepted / requires operator action), 5 Medium, 5 Low
 
 ---
 
