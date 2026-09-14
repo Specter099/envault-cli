@@ -9,6 +9,25 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- KMS key policy no longer denies `DisableKey`, so a compromised CMK can be frozen during incident response without a CloudFormation change.
+- IAM policy no longer grants unused `dynamodb:UpdateItem` / `s3:ListBucket`; S3 object actions are scoped to `encrypted/*`; `sts:GetCallerIdentity` is granted for audit attribution.
+- Ops SNS topic is encrypted with the envault CMK.
+- `decrypt` refuses to overwrite an existing destination unless `--force` is passed, and checks before creating temp files.
+- S3 downloads require a content-addressed key (`encrypted/{aa}/{sha256}/{name}.encrypted`) so a poisoned DynamoDB `s3_key` cannot fetch an arbitrary object.
+- Directory-symlink trees are skipped by `os.walk(followlinks=False)` during encrypt.
+- `migrate` confines input paths to the import directory and rejects per-component symlinks.
+- `ENVAULT_AUDIT_TTL_DAYS` is applied on encrypt, decrypt, exec, rotate-key, and migrate event writes.
+- `rotate-key` calls `DescribeKey` on the target CMK before downloading or decrypting anything.
+- `last_updated` CAS tokens use microsecond timestamps.
+- Dashboard `last_activity` pages the state-index until a CURRENT item survives the filter.
+- `exec` warns when the child will inherit `AWS_*` credentials; `--clean-env` remains opt-in.
+- Encrypt closes the output fd if the SDK stream fails before `fdopen`.
+- Decrypt closes the temp fd and always unlinks `.part` files if opening ciphertext fails after `fdopen`.
+- `migrate` treats non-object NDJSON lines as per-record errors instead of aborting the import.
+- `rotate-key` `DescribeKey` preflight rejects keys whose state is not `Enabled`.
+
 ## [0.2.0] - 2026-07-26
 
 ### Added

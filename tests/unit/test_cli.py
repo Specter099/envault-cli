@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from moto import mock_aws
 
 from envault.cli import (
     _best_effort_delete,
+    _collect_files,
     _friendly_message,
     _parse_output_json_entry,
     _parse_tags,
@@ -36,6 +38,13 @@ _CLI_ENV = {
     "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
     "AWS_DEFAULT_REGION": REGION,
 }
+
+
+def _ensure_kms_alias(alias: str = "alias/new-key") -> None:
+    """Create a moto KMS alias so rotate-key's DescribeKey preflight succeeds."""
+    kms = boto3.client("kms", region_name=REGION)
+    key = kms.create_key(Description="rotation-target")
+    kms.create_alias(AliasName=alias, TargetKeyId=key["KeyMetadata"]["KeyId"])
 
 
 def _create_table() -> None:
@@ -164,6 +173,42 @@ def test_parse_entry_rejects_path_traversal() -> None:
     entry = _make_entry("../../etc/passwd")
     with pytest.raises(MigrationError, match="Path traversal not allowed"):
         _parse_output_json_entry(entry)
+
+
+def test_parse_entry_rejects_path_outside_import_root(tmp_path: Path) -> None:
+    """Absolute paths outside the import directory must not be hashed."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_bytes(b"x")
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    with pytest.raises(MigrationError, match="outside the import directory"):
+        _parse_output_json_entry(_make_entry(str(secret)), import_root=import_root)
+
+
+def test_parse_entry_confined_relative_path(tmp_path: Path) -> None:
+    """Relative paths are resolved inside the import directory."""
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    content = b"sensitive data\n"
+    (import_root / "secret.txt").write_bytes(content)
+    expected_hash = hashlib.sha256(content).hexdigest()
+    record = _parse_output_json_entry(_make_entry("secret.txt"), import_root=import_root)
+    assert record is not None
+    assert record.sha256_hash == expected_hash
+
+
+def test_parse_entry_rejects_symlink_component(tmp_path: Path) -> None:
+    """A symlink anywhere in the migration path must be rejected before I/O."""
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    real = tmp_path / "realdir"
+    real.mkdir()
+    (real / "secret.txt").write_bytes(b"x")
+    (import_root / "link").symlink_to(real)
+    with pytest.raises(MigrationError, match="Symlink"):
+        _parse_output_json_entry(_make_entry("link/secret.txt"), import_root=import_root)
 
 
 def test_parse_entry_records_file_size(tmp_path: Path) -> None:
@@ -683,6 +728,7 @@ def test_rotate_key_end_to_end(tmp_path: Path) -> None:
     """rotate-key: mocked decrypt + re-encrypt, real DynamoDB + S3."""
     _create_table()
     _create_bucket()
+    _ensure_kms_alias()
     s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
@@ -908,6 +954,7 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(
 
     _create_table()
     _create_bucket()
+    _ensure_kms_alias()
     s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
@@ -959,6 +1006,7 @@ def test_rotate_key_recovery_log_records_old_key(
 
     _create_table()
     _create_bucket()
+    _ensure_kms_alias()
     s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
@@ -1006,6 +1054,7 @@ def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
     not an UnboundLocalError from the cleanup block referencing unset paths."""
     _create_table()
     _create_bucket()
+    _ensure_kms_alias()
     s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
@@ -1181,24 +1230,48 @@ def test_decrypt_is_repeatable(tmp_path: Path) -> None:
     store = StateStore(table_name=TABLE_NAME, region=REGION)
     _seed_encrypted_record(store, s3_version_id=version_id)
 
-    args = [
-        "decrypt",
-        FAKE_SHA,
-        "--output",
-        str(tmp_path),
-        "--table",
-        TABLE_NAME,
-        "--bucket",
-        BUCKET_NAME,
-        "--region",
-        REGION,
-        "--allowed-account-ids",
-        ACCOUNT_IDS,
-    ]
+    out1 = tmp_path / "first"
+    out2 = tmp_path / "second"
+    out1.mkdir()
+    out2.mkdir()
     runner = CliRunner()
     with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
-        first = runner.invoke(main, args, env=_CLI_ENV)
-        second = runner.invoke(main, args, env=_CLI_ENV)
+        first = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(out1),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+        second = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(out2),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
 
     assert first.exit_code == 0, first.output
     assert second.exit_code == 0, second.output
@@ -1248,6 +1321,7 @@ def test_rotate_key_covers_records_left_decrypted_by_old_versions(tmp_path: Path
     """C-2: a record stuck in DECRYPTED still has ciphertext in S3 and must rotate."""
     _create_table()
     _create_bucket()
+    _ensure_kms_alias()
     s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)
@@ -1340,7 +1414,9 @@ def test_status_escapes_markup_in_file_names() -> None:
     assert result.exit_code == 0, result.output
     # If the markup were interpreted, the tag text would be consumed as styling
     # and the displayed name would differ from the name actually stored.
-    assert "bold red" in result.output
+    # Rich may wrap the cell, so match the tag in pieces.
+    assert "[bold" in result.output
+    assert "not-my-name" in result.output
 
 
 @mock_aws
@@ -1448,3 +1524,297 @@ def test_cli_entrypoint_escapes_markup_in_usage_errors() -> None:
             cli()
     assert exc_info.value.code == 2
     assert "[/nope]" in output.getvalue()
+
+
+def test_collect_files_skips_directory_symlinks(tmp_path: Path) -> None:
+    """os.walk must not follow a symlink into an unrelated tree."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "ok.txt").write_bytes(b"ok")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "id_rsa").write_bytes(b"secret-key")
+    (root / "link").symlink_to(outside)
+
+    names = {p.name for p in _collect_files(root)}
+    assert names == {"ok.txt"}
+
+
+def test_collect_files_skips_file_symlinks(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "secret.env"
+    target.write_bytes(b"TOKEN=1")
+    (root / "alias.env").symlink_to(target)
+    (root / "real.txt").write_bytes(b"ok")
+    names = {p.name for p in _collect_files(root)}
+    assert names == {"real.txt"}
+
+
+@mock_aws
+def test_decrypt_refuses_to_overwrite_existing_file(tmp_path: Path) -> None:
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    dest = tmp_path / "test.txt"
+    dest.write_bytes(b"do not clobber")
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code != 0
+    assert "overwrite" in result.output.lower()
+    assert dest.read_bytes() == b"do not clobber"
+
+
+@mock_aws
+def test_decrypt_force_overwrites_existing_file(tmp_path: Path) -> None:
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    dest = tmp_path / "test.txt"
+    dest.write_bytes(b"old")
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--force",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0, result.output
+    assert dest.read_bytes() == b"decrypted content"
+
+
+@mock_aws
+def test_decrypt_rejects_poisoned_s3_key(tmp_path: Path) -> None:
+    """A DynamoDB s3_key that is not content-addressed must not be fetched."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
+    table.update_item(
+        Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+        UpdateExpression="SET s3_key = :k",
+        ExpressionAttributeValues={":k": "other-prefix/not-ours"},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "decrypt",
+            FAKE_SHA,
+            "--output",
+            str(tmp_path),
+            "--table",
+            TABLE_NAME,
+            "--bucket",
+            BUCKET_NAME,
+            "--region",
+            REGION,
+            "--allowed-account-ids",
+            ACCOUNT_IDS,
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code != 0
+    assert "content-addressed" in result.output.lower() or "refusing" in result.output.lower()
+
+
+@mock_aws
+def test_decrypt_honours_audit_ttl_days(tmp_path: Path) -> None:
+    import time
+
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env={**_CLI_ENV, "ENVAULT_AUDIT_TTL_DAYS": "7"},
+        )
+    assert result.exit_code == 0, result.output
+    events = [e for e in store.list_events_for_file(FAKE_SHA) if e["operation"] == "DECRYPT"]
+    assert len(events) == 1
+    expected = int(time.time()) + 7 * 86400
+    assert abs(int(events[0]["ttl"]) - expected) < 15
+
+
+@mock_aws
+def test_rotate_key_preflight_fails_before_download() -> None:
+    """DescribeKey on an unknown target key must fail closed with no decrypt."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file") as decrypt_mock:
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/does-not-exist",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code != 0
+    assert decrypt_mock.call_count == 0
+    assert "cannot use kms key" in result.output.lower()
+
+
+@mock_aws
+def test_rotate_key_preflight_rejects_disabled_key() -> None:
+    """A disabled CMK must fail closed before any decrypt, even if DescribeKey works."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store)
+
+    kms = boto3.client("kms", region_name=REGION)
+    key_id = kms.create_key()["KeyMetadata"]["KeyId"]
+    kms.disable_key(KeyId=key_id)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file") as decrypt_mock:
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                key_id,
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code != 0
+    assert decrypt_mock.call_count == 0
+    assert "not enabled" in result.output.lower() or "key state" in result.output.lower()
+
+
+def test_parse_entry_null_header_does_not_crash(tmp_path: Path) -> None:
+    """A null header must be treated as empty, not raise AttributeError."""
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"x")
+    entry = {"mode": "encrypt", "input": str(plaintext), "header": None}
+    record = _parse_output_json_entry(entry)
+    assert record is not None
+    assert record.algorithm == ""
+    assert record.kms_key_id == "alias/s3_key"
+
+
+@mock_aws
+def test_migrate_skips_non_object_json_and_continues(tmp_path: Path) -> None:
+    """A bad NDJSON line must increment errors without aborting the rest of the file."""
+    _create_table()
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    secret = import_root / "secret.txt"
+    secret.write_bytes(b"payload\n")
+    ndjson = tmp_path / "import" / "output.json"
+    ndjson.write_text(
+        "\n".join(
+            [
+                "[]",
+                json.dumps(_make_entry("secret.txt")),
+                "null",
+            ]
+        )
+        + "\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "migrate",
+            str(ndjson),
+            "--table",
+            TABLE_NAME,
+            "--region",
+            REGION,
+            "--dry-run",
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code == 0, result.output
+    assert "Migrated 1" in result.output
+    assert "errors 2" in result.output

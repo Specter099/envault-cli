@@ -29,6 +29,25 @@ boto_config = BotoConfig(
 )
 
 
+def parse_audit_ttl_days(raw: str | None = None) -> int:
+    """Parse ``ENVAULT_AUDIT_TTL_DAYS`` (or ``raw``) into a positive integer.
+
+    Click commands construct :class:`Config` without going through
+    :meth:`Config.from_env`, so they must call this directly or audit TTL
+    silently stays at the dataclass default of 365.
+    """
+    _ttl_raw = raw if raw is not None else os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365")
+    try:
+        audit_ttl_days = int(_ttl_raw)
+        if audit_ttl_days <= 0:
+            raise ValueError("must be positive")
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {_ttl_raw!r}"
+        ) from exc
+    return audit_ttl_days
+
+
 @dataclass
 class Config:
     """Runtime configuration loaded from environment variables."""
@@ -93,15 +112,7 @@ class Config:
             )
 
         region = os.environ.get("ENVAULT_REGION", "us-east-1")
-        _ttl_raw = os.environ.get("ENVAULT_AUDIT_TTL_DAYS", "365")
-        try:
-            audit_ttl_days = int(_ttl_raw)
-            if audit_ttl_days <= 0:
-                raise ValueError("must be positive")
-        except ValueError as exc:
-            raise ConfigurationError(
-                f"ENVAULT_AUDIT_TTL_DAYS must be a positive integer (days). Got: {_ttl_raw!r}"
-            ) from exc
+        audit_ttl_days = parse_audit_ttl_days()
 
         _account_ids_raw = os.environ.get("ENVAULT_ALLOWED_ACCOUNT_IDS", "")
         allowed_account_ids = [a.strip() for a in _account_ids_raw.split(",") if a.strip()]
