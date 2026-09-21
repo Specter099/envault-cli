@@ -51,14 +51,6 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, handlers=[handler])
 
 
-def _load_config() -> Config:
-    try:
-        return Config.from_env()
-    except ConfigurationError as e:
-        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(e))}")
-        sys.exit(1)
-
-
 @click.group(invoke_without_command=True)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose JSON logging to stderr.")
 @click.pass_context
