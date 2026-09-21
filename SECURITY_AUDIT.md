@@ -50,6 +50,7 @@ New this week (2026-09-21):
 | M-E | Medium | Fail closed when `s3_version_id` is empty unless `--latest` is passed |
 | H-A | High | CDK context `additional_kms_key_arns` grants extra rotation-target CMKs (no `Resource: *`) |
 | H-7b | High | `migrate` requires `import_root`; absolute paths are checked for lexical containment before any `lstat` |
+| M-7 | Medium | `exec` wipes secret buffers if `--secret` rejects non-UTF-8 / NUL |
 
 ---
 
@@ -179,3 +180,5 @@ Storage grows monotonically. Honouring a deletion request requires a new command
 **This scan (on `main` before remediations):** 0 Critical, 8 High, 7 Medium, 6 Low
 
 **After this PR:** 0 Critical, 2 High, 4 Medium, 5 Low
+
+Verification: `pytest tests/unit/` — **186 passed**; ruff + mypy clean. Crypto-safety inspector: PASS. Migration-safety inspector: PASS.
