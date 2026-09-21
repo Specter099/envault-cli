@@ -56,7 +56,9 @@ class S3Store:
         # the S3 read cost before failing with the same answer.
         retry=retry_if_not_exception_type(EnvaultError),
     )
-    def download_to_memory(self, s3_key: str, version_id: str = "") -> io.BytesIO:
+    def download_to_memory(
+        self, s3_key: str, version_id: str = "", *, allow_latest: bool = False
+    ) -> io.BytesIO:
         """Fetch an encrypted object into memory instead of onto disk.
 
         Used by :command:`envault exec`, where the whole point is that nothing
@@ -67,24 +69,22 @@ class S3Store:
 
         Args:
             s3_key: S3 object key.
-            version_id: Optional S3 version ID for point-in-time recovery.
+            version_id: S3 version ID for point-in-time recovery. Required
+                unless ``allow_latest`` is true (migrated records).
+            allow_latest: If true, an empty ``version_id`` fetches the current
+                object. Default is to refuse — latest is not the recorded version.
 
         Returns:
             A BytesIO positioned at the start of the ciphertext.
 
         Raises:
-            EnvaultError: If the object is larger than MAX_IN_MEMORY_BYTES.
+            EnvaultError: If the object is larger than MAX_IN_MEMORY_BYTES, or if
+                ``version_id`` is empty and ``allow_latest`` is false.
         """
+        self._require_version_id(s3_key, version_id, allow_latest)
         kwargs: dict[str, Any] = {"Bucket": self._bucket, "Key": s3_key}
         if version_id:
             kwargs["VersionId"] = version_id
-        else:
-            logger.warning(
-                "Fetching S3 object without VersionId — reading latest version. "
-                "If the object was overwritten since encryption, "
-                "the wrong ciphertext may be retrieved.",
-                extra={"bucket": self._bucket, "key": s3_key},
-            )
 
         response = self._s3.get_object(**kwargs)
         length = int(response.get("ContentLength", 0))
@@ -144,28 +144,50 @@ class S3Store:
         )
         return version_id
 
+    def _require_version_id(self, s3_key: str, version_id: str, allow_latest: bool) -> None:
+        """Refuse an unversioned fetch unless the caller opted into latest."""
+        if version_id:
+            return
+        if not allow_latest:
+            raise EnvaultError(
+                f"Refusing to fetch s3://{self._bucket}/{s3_key} without a VersionId. "
+                "That would download the current object, which may not be the ciphertext "
+                "recorded at encryption time. Pass --latest for migrated records."
+            )
+        logger.warning(
+            "Fetching S3 object without VersionId — reading latest version. "
+            "If the object was overwritten since encryption, "
+            "the wrong ciphertext may be retrieved.",
+            extra={"bucket": self._bucket, "key": s3_key},
+        )
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
+        retry=retry_if_not_exception_type(EnvaultError),
     )
-    def download_file(self, s3_key: str, local_path: Path, version_id: str = "") -> None:
+    def download_file(
+        self,
+        s3_key: str,
+        local_path: Path,
+        version_id: str = "",
+        *,
+        allow_latest: bool = False,
+    ) -> None:
         """Download a file from S3.
 
         Args:
             s3_key: S3 object key.
             local_path: Destination path on disk.
-            version_id: Optional S3 version ID for point-in-time recovery.
+            version_id: S3 version ID for point-in-time recovery. Required
+                unless ``allow_latest`` is true.
+            allow_latest: If true, an empty ``version_id`` fetches the current
+                object. Default is to refuse.
         """
+        self._require_version_id(s3_key, version_id, allow_latest)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         extra_args: dict[str, str] = {}
-        if not version_id:
-            logger.warning(
-                "Downloading S3 object without VersionId — fetching latest version. "
-                "If the object was overwritten since encryption, "
-                "the wrong ciphertext may be retrieved.",
-                extra={"bucket": self._bucket, "key": s3_key},
-            )
         if version_id:
             extra_args["VersionId"] = version_id
 

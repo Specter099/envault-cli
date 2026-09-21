@@ -150,7 +150,7 @@ def test_parse_entry_uses_content_hash(tmp_path: Path) -> None:
     expected_hash = hashlib.sha256(content).hexdigest()
 
     entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry)
+    record = _parse_output_json_entry(entry, import_root=tmp_path)
 
     assert record is not None
     assert record.sha256_hash == expected_hash
@@ -159,7 +159,7 @@ def test_parse_entry_uses_content_hash(tmp_path: Path) -> None:
 def test_parse_entry_skips_missing_file(tmp_path: Path) -> None:
     """_parse_output_json_entry returns None when the plaintext file doesn't exist."""
     entry = _make_entry("nonexistent/file.txt")
-    record = _parse_output_json_entry(entry)
+    record = _parse_output_json_entry(entry, import_root=tmp_path)
     assert record is None
 
 
@@ -168,11 +168,18 @@ def test_parse_entry_skips_non_encrypt_mode() -> None:
     assert _parse_output_json_entry(entry) is None
 
 
-def test_parse_entry_rejects_path_traversal() -> None:
+def test_parse_entry_requires_import_root() -> None:
+    """Unconstrained hashing of arbitrary paths is not allowed."""
+    entry = _make_entry("secret.txt")
+    with pytest.raises(MigrationError, match="import_root is required"):
+        _parse_output_json_entry(entry)
+
+
+def test_parse_entry_rejects_path_traversal(tmp_path: Path) -> None:
     """Paths with '..' components must raise MigrationError."""
     entry = _make_entry("../../etc/passwd")
     with pytest.raises(MigrationError, match="Path traversal not allowed"):
-        _parse_output_json_entry(entry)
+        _parse_output_json_entry(entry, import_root=tmp_path)
 
 
 def test_parse_entry_rejects_path_outside_import_root(tmp_path: Path) -> None:
@@ -218,7 +225,7 @@ def test_parse_entry_records_file_size(tmp_path: Path) -> None:
     plaintext.write_bytes(content)
 
     entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry)
+    record = _parse_output_json_entry(entry, import_root=tmp_path)
 
     assert record is not None
     assert record.file_size_bytes == len(content)
@@ -519,6 +526,7 @@ def test_decrypt_command_end_to_end(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -556,6 +564,7 @@ def test_decrypt_checksum_mismatch(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -593,6 +602,7 @@ def test_decrypt_encryption_context_mismatch(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -636,6 +646,7 @@ def test_decrypt_succeeds_with_sdk_extra_keys(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -673,6 +684,7 @@ def test_decrypt_checksum_mismatch_shows_friendly_message(tmp_path: Path) -> Non
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -713,6 +725,7 @@ def test_decrypt_aws_error_shows_friendly_message(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -757,6 +770,7 @@ def test_rotate_key_end_to_end(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -813,6 +827,40 @@ def test_encrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
 
 
 @mock_aws
+def test_decrypt_refuses_empty_version_id(tmp_path: Path) -> None:
+    """Migrated records with no VersionId must not silently fetch latest."""
+    _create_table()
+    _create_bucket()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store)
+    _upload_fake_ciphertext(record.s3_key)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "decrypt",
+            FAKE_SHA,
+            "--output",
+            str(tmp_path),
+            "--table",
+            TABLE_NAME,
+            "--bucket",
+            BUCKET_NAME,
+            "--region",
+            REGION,
+            "--allowed-account-ids",
+            ACCOUNT_IDS,
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code != 0
+    output = result.output.lower()
+    assert "version id" in output or "versionid" in output.replace(" ", "")
+    assert "--latest" in result.output
+
+
+@mock_aws
 def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
     """Temp downloaded file must be cleaned up even if decrypt_file raises."""
     _create_table()
@@ -838,6 +886,7 @@ def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -936,6 +985,7 @@ def test_decrypt_reports_audit_write_failure(
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -983,6 +1033,7 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1035,6 +1086,7 @@ def test_rotate_key_recovery_log_records_old_key(
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1076,6 +1128,7 @@ def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1251,6 +1304,7 @@ def test_decrypt_is_repeatable(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1269,6 +1323,7 @@ def test_decrypt_is_repeatable(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1306,6 +1361,7 @@ def test_decrypt_records_access_event_with_principal(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1351,6 +1407,7 @@ def test_rotate_key_covers_records_left_decrypted_by_old_versions(tmp_path: Path
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1580,6 +1637,7 @@ def test_decrypt_refuses_to_overwrite_existing_file(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1619,6 +1677,7 @@ def test_decrypt_force_overwrites_existing_file(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1692,6 +1751,7 @@ def test_decrypt_honours_audit_ttl_days(tmp_path: Path) -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env={**_CLI_ENV, "ENVAULT_AUDIT_TTL_DAYS": "7"},
         )
@@ -1726,6 +1786,7 @@ def test_rotate_key_preflight_fails_before_download() -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1762,6 +1823,7 @@ def test_rotate_key_preflight_rejects_disabled_key() -> None:
                 REGION,
                 "--allowed-account-ids",
                 ACCOUNT_IDS,
+                "--latest",
             ],
             env=_CLI_ENV,
         )
@@ -1775,7 +1837,7 @@ def test_parse_entry_null_header_does_not_crash(tmp_path: Path) -> None:
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"x")
     entry = {"mode": "encrypt", "input": str(plaintext), "header": None}
-    record = _parse_output_json_entry(entry)
+    record = _parse_output_json_entry(entry, import_root=tmp_path)
     assert record is not None
     assert record.algorithm == ""
     assert record.kms_key_id == "alias/s3_key"

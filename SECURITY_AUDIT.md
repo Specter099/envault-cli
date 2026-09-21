@@ -1,8 +1,8 @@
 # Weekly Security Audit — envault-cli
 
 **Reviewer:** Automated weekly static security review
-**Date:** 2026-09-14
-**Codebase:** `main` @ `4b98446`; remediations on `cursor/repository-security-audit-9cfa`
+**Date:** 2026-09-21
+**Codebase:** `main` @ `4b98446`; remediations on `cursor/repository-security-audit-8de4`
 **Scope:** `src/envault/`, `infra/cdk/`, `.github/workflows/`, `code/`, tests, dependency manifests, git history (secret patterns). Static analysis only — no exploit code, no execution of untrusted payloads, no fetches of URLs found in the repo.
 
 ---
@@ -11,15 +11,17 @@
 
 Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryption SDK, `REQUIRE_ENCRYPT_REQUIRE_DECRYPT`, mandatory `DiscoveryFilter` with 12-digit account IDs, checksum-before-rename decrypt, and SHA-pinned GitHub Actions with OIDC PyPI publish.
 
-`main` has not moved since the 2026-09-07 audit (`4b98446`). Prior weekly PRs (#110–#113) that remediate these items are still unmerged drafts. This week's scan reproduced the same open findings on `main` and re-lands those remediations here.
+`main` has not moved since 2026-08-09 (`4b98446`). Prior weekly PRs (#110–#114) that remediate these items are still unmerged drafts. This week's scan reproduced the same open findings on `main`, re-lands those remediations, and adds three follow-ups from the 2026-09-14 remaining list.
 
 **This scan (on `main` before remediations):** 0 Critical, 8 High, 7 Medium, 6 Low
 
-**After this PR:** 0 Critical, 3 High (accepted / requires operator action), 5 Medium, 5 Low
+**After this PR:** 0 Critical, 2 High (accepted / requires operator action), 4 Medium, 5 Low
 
 ---
 
 ## Remediations in this PR
+
+Re-landed from #110–#114:
 
 | ID | Severity | Fix |
 |----|----------|-----|
@@ -41,21 +43,19 @@ Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryp
 | M-5 | Medium | `migrate` catches non-object NDJSON / null headers per line instead of aborting |
 | M-6 | Medium | `rotate-key` preflight requires `KeyState == Enabled` |
 
+New this week (2026-09-21):
+
+| ID | Severity | Fix |
+|----|----------|-----|
+| M-E | Medium | Fail closed when `s3_version_id` is empty unless `--latest` is passed |
+| H-A | High | CDK context `additional_kms_key_arns` grants extra rotation-target CMKs (no `Resource: *`) |
+| H-7b | High | `migrate` requires `import_root`; absolute paths are checked for lexical containment before any `lstat` |
+
 ---
 
 ## Remaining findings (post-remediation)
 
 ### High
-
-#### H-A — `rotate-key` IAM still covers only the stack CMK
-
-**Location:** `infra/cdk/stacks/envault_stack.py` (KmsEnvelopeEncryption statement)
-
-**Issue:** The managed policy grants `kms:GenerateDataKey` / `kms:Decrypt` / `kms:DescribeKey` only on the CMK this stack creates. `rotate-key --new-key-id alias/other` fails at the new DescribeKey preflight (no plaintext written).
-
-**Impact:** Operators cannot complete rotation to a second key with the stock policy.
-
-**Fix:** Add a stack parameter for extra rotation-target key ARNs, or document the required policy amendment. Do not widen the default grant to `kms:*` / `Resource: *`.
 
 #### H-B — Rotation is not a revocation primitive
 
@@ -119,16 +119,6 @@ Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryp
 
 **Fix:** `name-index` GSI (`file_name`, `encrypted_at`) in a future migration.
 
-#### M-E — Empty `s3_version_id` fetches latest
-
-**Location:** `src/envault/s3.py` `download_file` / `download_to_memory`
-
-**Issue:** Migrated records and any blank version ID download the latest object. A warning is logged.
-
-**Impact:** A silent overwrite of the S3 object could be decrypted instead of the recorded version.
-
-**Fix:** Fail closed when `version_id` is empty except for an explicit `--latest` flag.
-
 ---
 
 ### Low
@@ -169,6 +159,10 @@ Storage grows monotonically. Honouring a deletion request requires a new command
 - Filename sanitization for decrypt output (`Path.name`); Rich markup escaped
 - No `eval` / `pickle` / `subprocess` with `shell=True` in application code
 - `.env` gitignored; `.secrets.baseline` committed; CODEOWNERS present
+- Empty S3 VersionId is fail-closed (`--latest` opt-in)
+- Content-addressed S3 keys validated before fetch
+- Directory-symlink trees skipped on encrypt
+- `migrate` confined to the import directory
 
 ---
 
@@ -184,4 +178,4 @@ Storage grows monotonically. Honouring a deletion request requires a new command
 
 **This scan (on `main` before remediations):** 0 Critical, 8 High, 7 Medium, 6 Low
 
-**After this PR:** 0 Critical, 3 High, 5 Medium, 5 Low
+**After this PR:** 0 Critical, 2 High, 4 Medium, 5 Low

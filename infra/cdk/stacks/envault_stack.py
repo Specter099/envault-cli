@@ -19,6 +19,32 @@ from cdk_nag import NagSuppressions
 from constructs import Construct
 
 
+def _additional_kms_key_arns(scope: Construct) -> list[str]:
+    """Optional extra KMS key ARNs for ``rotate-key --new-key-id``.
+
+    Pass at deploy time::
+
+        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123:key/abc
+
+    Multiple ARNs may be comma-separated. Values that are not KMS ARNs are
+    rejected at synth so a typo cannot widen the policy to an unrelated resource.
+    """
+    raw = scope.node.try_get_context("additional_kms_key_arns") or ""
+    arns = [a.strip() for a in str(raw).split(",") if a.strip()]
+    for arn in arns:
+        is_kms_arn = (
+            arn.startswith("arn:")
+            and ":kms:" in arn
+            and (":key/" in arn or ":alias/" in arn)
+        )
+        if not is_kms_arn:
+            raise ValueError(
+                "additional_kms_key_arns must be comma-separated KMS key or alias ARNs, "
+                f"got {arn!r}"
+            )
+    return arns
+
+
 class EnvaultStack(Stack):
     """Provisions all AWS resources required by envault.
 
@@ -190,7 +216,7 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsEnvelopeEncryption",
                     actions=["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
-                    resources=[encryption_key.key_arn],
+                    resources=[encryption_key.key_arn, *_additional_kms_key_arns(self)],
                 ),
                 iam.PolicyStatement(
                     sid="S3EncryptedObjects",

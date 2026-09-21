@@ -77,8 +77,24 @@ def test_download_specific_version(tmp_path: Path):
 
 
 @mock_aws
+def test_download_empty_version_id_is_refused(tmp_path: Path):
+    """download_file with empty version_id must fail closed."""
+    from envault.exceptions import EnvaultError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    s3_client.put_object(Bucket=BUCKET, Key="encrypted/aa/aaa.../file.enc", Body=b"data")
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    out = tmp_path / "file.enc"
+
+    with pytest.raises(EnvaultError, match="without a VersionId"):
+        store.download_file("encrypted/aa/aaa.../file.enc", out, version_id="")
+
+
+@mock_aws
 def test_download_empty_version_id_logs_warning(tmp_path: Path, caplog):
-    """download_file with empty version_id must emit a WARNING."""
+    """download_file with empty version_id and allow_latest must emit a WARNING."""
     s3_client = boto3.client("s3", region_name=REGION)
     _create_versioned_bucket(s3_client)
     s3_client.put_object(Bucket=BUCKET, Key="encrypted/aa/aaa.../file.enc", Body=b"data")
@@ -87,7 +103,9 @@ def test_download_empty_version_id_logs_warning(tmp_path: Path, caplog):
     out = tmp_path / "file.enc"
 
     with caplog.at_level(logging.WARNING, logger="envault.s3"):
-        store.download_file("encrypted/aa/aaa.../file.enc", out, version_id="")
+        store.download_file(
+            "encrypted/aa/aaa.../file.enc", out, version_id="", allow_latest=True
+        )
 
     assert any("version" in r.message.lower() for r in caplog.records), (
         f"Expected a version warning, got: {[r.message for r in caplog.records]}"
@@ -223,7 +241,7 @@ def test_download_to_memory_returns_ciphertext():
     s3_client.put_object(Bucket=BUCKET, Key="enc/a", Body=b"ciphertext-bytes")
 
     store = S3Store(bucket=BUCKET, region=REGION)
-    assert store.download_to_memory("enc/a").read() == b"ciphertext-bytes"
+    assert store.download_to_memory("enc/a", allow_latest=True).read() == b"ciphertext-bytes"
 
 
 @mock_aws
@@ -249,7 +267,7 @@ def test_download_to_memory_rejects_oversized_object():
     store = S3Store(bucket=BUCKET, region=REGION)
     with patch("envault.s3.MAX_IN_MEMORY_BYTES", 16):
         with pytest.raises(EnvaultError, match="limit for in-memory decryption"):
-            store.download_to_memory("enc/big")
+            store.download_to_memory("enc/big", allow_latest=True)
 
 
 @mock_aws
@@ -259,7 +277,7 @@ def test_download_to_memory_does_not_touch_disk(tmp_path):
     s3_client.put_object(Bucket=BUCKET, Key="enc/a", Body=b"ciphertext")
 
     store = S3Store(bucket=BUCKET, region=REGION)
-    store.download_to_memory("enc/a")
+    store.download_to_memory("enc/a", allow_latest=True)
     assert not list(tmp_path.iterdir())
 
 

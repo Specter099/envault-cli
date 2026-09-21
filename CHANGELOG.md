@@ -27,6 +27,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Decrypt closes the temp fd and always unlinks `.part` files if opening ciphertext fails after `fdopen`.
 - `migrate` treats non-object NDJSON lines as per-record errors instead of aborting the import.
 - `rotate-key` `DescribeKey` preflight rejects keys whose state is not `Enabled`.
+- Empty `s3_version_id` no longer fetches the latest S3 object. `decrypt` / `exec` / `rotate-key` require `--latest` for migrated records.
+- `migrate` requires an import directory and checks absolute paths for containment before any `lstat`, so a poisoned `output.json` cannot touch files outside that tree.
+- CDK context `additional_kms_key_arns` adds extra CMK ARNs to the user policy so `rotate-key --new-key-id` can target a second key without a wildcard grant.
 
 ## [0.2.0] - 2026-07-26
 
