@@ -30,6 +30,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Empty `s3_version_id` no longer fetches the latest S3 object. `decrypt` / `exec` / `rotate-key` require `--latest` for migrated records.
 - `migrate` requires an import directory and checks absolute paths for containment before any `lstat`, so a poisoned `output.json` cannot touch files outside that tree.
 - CDK context `additional_kms_key_arns` adds extra CMK ARNs to the user policy so `rotate-key --new-key-id` can target a second key without a wildcard grant.
+- `exec` wipes in-memory secret buffers if `--secret` rejects a non-UTF-8 or NUL value.
 
 ## [0.2.0] - 2026-07-26
 

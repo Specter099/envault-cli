@@ -1100,6 +1100,10 @@ def exec_(
             "No command was started and no secrets were delivered."
         )
         sys.exit(1)
+    except click.UsageError:
+        # Non-UTF-8 / NUL secrets raise here after plaintext is already in sinks.
+        _close_all(creds, sinks)
+        raise
 
     argv = _substitute_paths(list(command), child_env, [var for _, var in file_pairs])
 
