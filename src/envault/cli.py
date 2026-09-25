@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 import uuid
@@ -772,11 +773,14 @@ def rotate_key(
             console.print(f"  Would rotate: {escape(r.file_name)} ({r.sha256_hash[:16]}...)")
         return
 
-    console.print(
-        "[dim yellow]Note: Temporary plaintext is overwritten with zeros before deletion, "
-        "but secure erasure is not guaranteed on copy-on-write filesystems (APFS, Btrfs, "
-        "ZFS) or SSDs with wear-levelling.[/dim yellow]"
-    )
+    shm_dir = _private_ram_dir()
+    if shm_dir is None:
+        console.print(
+            "[dim yellow]Note: no RAM-backed filesystem available; temporary plaintext is "
+            "written to disk and overwritten with zeros before deletion, but secure erasure "
+            "is not guaranteed on copy-on-write filesystems (APFS, Btrfs, ZFS) or SSDs with "
+            "wear-levelling.[/dim yellow]"
+        )
 
     # Reuses the same context builder as encrypt so the two can never drift —
     # a divergent context here would make future decrypts fail verification.
@@ -791,7 +795,9 @@ def rotate_key(
             _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
             os.close(_fd_dl)
             tmp_dl = Path(_tmp_dl)
-            _fd_pt, _tmp_pt = tempfile.mkstemp(prefix="envault_pt_")
+            _fd_pt, _tmp_pt = tempfile.mkstemp(
+                prefix="envault_pt_", dir=_plaintext_dir(shm_dir, record.file_size_bytes)
+            )
             os.fchmod(_fd_pt, 0o600)
             os.close(_fd_pt)
             tmp_pt = Path(_tmp_pt)
@@ -864,6 +870,8 @@ def rotate_key(
             if tmp_enc is not None:
                 tmp_enc.unlink(missing_ok=True)
 
+    if shm_dir is not None:
+        shutil.rmtree(shm_dir, ignore_errors=True)
     console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
     if errors:
         # A partially-rotated corpus means some files are still readable with the
@@ -873,6 +881,28 @@ def rotate_key(
             "encrypted under the previous key."
         )
         sys.exit(1)
+
+
+def _private_ram_dir() -> Path | None:
+    """Create a 0700 scratch directory on a RAM-backed filesystem, if there is one.
+
+    Plaintext written here never reaches persistent storage (it can still be
+    swapped, like any process memory). Returns None where /dev/shm is absent.
+    """
+    shm = Path("/dev/shm")  # noqa: S108 — the point is RAM backing, not a shared name
+    if not shm.is_dir():
+        return None
+    try:
+        return Path(tempfile.mkdtemp(prefix="envault_rot_", dir=shm))
+    except OSError:
+        return None
+
+
+def _plaintext_dir(shm_dir: Path | None, size: int) -> Path | None:
+    """Use the RAM directory unless the file would take more than half its free space."""
+    if shm_dir is not None and size * 2 < shutil.disk_usage(shm_dir).free:
+        return shm_dir
+    return None
 
 
 # ---------------------------------------------------------------------------

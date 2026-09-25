@@ -721,6 +721,57 @@ def test_rotate_key_end_to_end(tmp_path: Path) -> None:
     assert updated.kms_key_id == new_key_id
 
 
+_SHM = Path("/dev/shm")  # noqa: S108
+
+
+@pytest.mark.skipif(not _SHM.is_dir(), reason="needs a RAM-backed /dev/shm")
+@mock_aws
+def test_rotate_key_keeps_plaintext_off_disk(tmp_path: Path) -> None:
+    """Rotation plaintext goes to a private RAM-backed dir, which is removed afterwards."""
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    record = _seed_encrypted_record(store, s3_version_id=version_id)
+
+    seen: list[Path] = []
+    inner = _make_mock_decrypt(record.encryption_context, content=b"plaintext")
+
+    def _spy(input_path: Path, output_path: Path, **kwargs: object) -> DecryptResult:
+        seen.append(output_path)
+        return inner(input_path, output_path, **kwargs)
+
+    runner = CliRunner()
+    with (
+        patch("envault.cli.decrypt_file", side_effect=_spy),
+        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/new-key",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env=_CLI_ENV,
+        )
+
+    assert result.exit_code == 0, result.output
+    assert len(seen) == 1
+    scratch = seen[0].parent
+    assert scratch.parent == _SHM
+    assert not scratch.exists()
+
+
 # ---------------------------------------------------------------------------
 # H-8: Temp file cleanup on failure
 # ---------------------------------------------------------------------------
