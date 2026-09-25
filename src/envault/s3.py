@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from envault.config import boto_config
 from envault.exceptions import EnvaultError
+from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +27,12 @@ class S3Store:
 
     def __init__(self, bucket: str, region: str = "us-east-1", kms_key_id: str = "") -> None:
         self._bucket = bucket
-        self._region = region
         self._kms_key_id = kms_key_id
         self._s3 = boto3.client("s3", region_name=region, config=boto_config)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-        # An oversized object is a deterministic rejection: retrying only triples
-        # the S3 read cost before failing with the same answer.
-        retry=retry_if_not_exception_type(EnvaultError),
-    )
+    # An oversized object is a deterministic rejection: retrying only triples
+    # the S3 read cost before failing with the same answer.
+    @aws_retry(never=(EnvaultError,))
     def download_to_memory(self, s3_key: str, version_id: str = "") -> io.BytesIO:
         """Fetch an encrypted object into memory instead of onto disk.
 
@@ -90,11 +84,7 @@ class S3Store:
         )
         return io.BytesIO(body)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def upload_file(self, local_path: Path, s3_key: str) -> str:
         """Upload a file to S3 and return the version ID atomically.
 
@@ -127,11 +117,7 @@ class S3Store:
         )
         return version_id
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def download_file(self, s3_key: str, local_path: Path, version_id: str = "") -> None:
         """Download a file from S3.
 
@@ -142,15 +128,15 @@ class S3Store:
         """
         local_path.parent.mkdir(parents=True, exist_ok=True)
         extra_args: dict[str, str] = {}
-        if not version_id:
+        if version_id:
+            extra_args["VersionId"] = version_id
+        else:
             logger.warning(
                 "Downloading S3 object without VersionId — fetching latest version. "
                 "If the object was overwritten since encryption, "
                 "the wrong ciphertext may be retrieved.",
                 extra={"bucket": self._bucket, "key": s3_key},
             )
-        if version_id:
-            extra_args["VersionId"] = version_id
 
         logger.info(
             "Downloading from S3",

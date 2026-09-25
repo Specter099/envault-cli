@@ -66,7 +66,7 @@ All config via environment variables — no config files with secrets.
 | `ENVAULT_TABLE` | Yes | — | DynamoDB table name |
 | `ENVAULT_ALLOWED_ACCOUNT_IDS` | For reads | — | Comma-separated AWS account IDs trusted to have encrypted the data. Required by `decrypt`, `exec`, and `rotate-key`: it constrains KMS discovery so a ciphertext header cannot name a key outside your control. |
 | `ENVAULT_REGION` | No | `us-east-1` | AWS region |
-| `ENVAULT_AUDIT_TTL_DAYS` | No | `365` | Days to retain audit events |
+| `ENVAULT_AUDIT_TTL_DAYS` | No | `365` | Days to retain audit events (same as `--audit-ttl-days`) |
 
 ---
 
@@ -80,7 +80,8 @@ envault encrypt INPUT_PATH [--tag KEY=VALUE]... [--force]
 envault exec -s IDENTIFIER=VAR [-f IDENTIFIER=VAR]... [--clean-env] -- COMMAND [ARGS]...
 
 # Decrypt by filename or SHA256 hash
-envault decrypt IDENTIFIER [-o OUTPUT_DIR] [--version N]
+# -o takes an existing directory or a file path; existing files need --force
+envault decrypt IDENTIFIER [-o OUTPUT_DIR|OUTPUT_FILE] [--version N] [--force]
 
 # List all encrypted/decrypted files
 envault status [--state encrypted|decrypted|all]
@@ -146,13 +147,16 @@ The `infra/cdk/` directory contains a CDK Python stack that provisions:
 - **KMS CMK** with automatic annual key rotation
 - **S3 bucket** — versioned, SSE-KMS, block-public-access enforced
 - **DynamoDB table** — on-demand billing, KMS encryption, PITR, all GSIs
-- **IAM managed policy** — least-privilege, ready to attach to users/roles
+- **IAM managed policy** — least-privilege, ready to attach to users/roles. Direct KMS use is
+  limited to envault ciphertexts (encryption context `purpose`); bucket/table encryption is
+  allowed only via S3 and DynamoDB.
+- **SNS topic + DynamoDB alarms** — pass `AlertEmailParam` to get notified
 
 ```bash
 cd infra/cdk
 pip install -r requirements.txt
 cdk synth
-cdk deploy
+cdk deploy --parameters AlertEmailParam=ops@example.com
 ```
 
 ---

@@ -9,6 +9,40 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- `decrypt` fails closed on audit: the DECRYPT event is written before verified plaintext
+  is moved into place, and the plaintext is discarded if that write fails (previously the
+  file was left on disk with a warning).
+- `decrypt` refuses to overwrite an existing file unless `--force` is given.
+- `rotate-key` keeps temporary plaintext in a private directory on RAM-backed `/dev/shm`
+  where available, instead of the default (often disk-backed) temp directory.
+- CDK: the IAM policy's direct `kms:Decrypt`/`kms:GenerateDataKey` now require an envault
+  encryption context (`purpose` = `envault-backup` or legacy `backup`); bucket/table
+  encryption is granted only via S3 and DynamoDB (`kms:ViaService`). Unused
+  `dynamodb:UpdateItem` removed.
+
+### Fixed
+
+- `ENVAULT_AUDIT_TTL_DAYS` is honoured (it was documented but ignored); also available as
+  `--audit-ttl-days` on every command that writes audit events.
+- Audit events no longer appear in `state-index`, so `status`, `rotate-key`,
+  decrypt-by-name and `dashboard` stop reading the whole audit history. Events written by
+  earlier versions stay in the index until their TTL expires; queries still filter them.
+- `dashboard` "Last activity" no longer shows "—" once any audit event exists.
+- `decrypt -o FILE` writes to `FILE` instead of `FILE`'s parent directory.
+- CDK: non-current S3 versions are no longer moved to Glacier. Records pin a `VersionId`,
+  and an archived version cannot be read.
+
+### Added
+
+- CDK `AlertEmailParam` subscribes an email address to the operational alarm topic.
+
+### Removed
+
+- `Config.from_env`, `Config.table_name`, `Config.allowed_account_ids`,
+  `FileRecord.ttl`, `FileRecord.decrypted_at` (unused).
+
 ## [0.2.0] - 2026-07-26
 
 ### Added

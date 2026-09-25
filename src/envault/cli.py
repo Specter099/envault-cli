@@ -6,9 +6,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,7 +24,7 @@ from rich.progress import track
 from rich.table import Table
 
 from envault.config import Config
-from envault.crypto import decrypt_file, decrypt_to_stream, encrypt_file
+from envault.crypto import decrypt_file, decrypt_to_stream, encrypt_file, sha256_file
 from envault.exceptions import (
     AlreadyEncryptedError,
     ChecksumMismatchError,
@@ -51,21 +54,11 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, handlers=[handler])
 
 
-def _load_config() -> Config:
-    try:
-        return Config.from_env()
-    except ConfigurationError as e:
-        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(e))}")
-        sys.exit(1)
-
-
 @click.group(invoke_without_command=True)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose JSON logging to stderr.")
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
     """envault — client-side envelope encryption with AWS KMS + DynamoDB state tracking."""
-    ctx.ensure_object(dict)
-    ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
@@ -107,6 +100,32 @@ def cli() -> None:
         sys.exit(1)
 
 
+# Every command that writes an audit event takes this, so ENVAULT_AUDIT_TTL_DAYS
+# applies to ENCRYPT, DECRYPT, ACCESS, and ROTATE_KEY events alike.
+_audit_ttl_option = click.option(
+    "--audit-ttl-days",
+    envvar="ENVAULT_AUDIT_TTL_DAYS",
+    type=click.IntRange(min=1),
+    default=365,
+    show_default=True,
+    help="Days to retain audit events before DynamoDB TTL expires them.",
+)
+
+
+@contextmanager
+def _exit_on_error() -> Iterator[None]:
+    """Turn AWS and envault errors into a one-line message and exit status 1."""
+    try:
+        yield
+    except (ClientError, BotoCoreError) as exc:
+        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
+        sys.exit(1)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # encrypt
 # ---------------------------------------------------------------------------
@@ -120,9 +139,8 @@ def cli() -> None:
 @click.option("--tag", "-t", multiple=True, metavar="KEY=VALUE", help="File tags (repeatable).")
 @click.option("--force", is_flag=True, help="Re-encrypt even if already ENCRYPTED.")
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1", show_default=True)
-@click.pass_context
+@_audit_ttl_option
 def encrypt(
-    ctx: click.Context,
     input_path: Path,
     key_id: str,
     bucket: str,
@@ -130,12 +148,13 @@ def encrypt(
     tag: tuple[str, ...],
     force: bool,
     region: str,
+    audit_ttl_days: int,
 ) -> None:
     """Encrypt a file or directory and store state in DynamoDB.
 
     INPUT_PATH can be a single file or a directory (processed recursively).
     """
-    config = Config(key_id=key_id, bucket=bucket, table_name=table, region=region)
+    config = Config(key_id=key_id, bucket=bucket, region=region, audit_ttl_days=audit_ttl_days)
     tags = _parse_tags(tag)
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region, kms_key_id=key_id)
@@ -175,8 +194,6 @@ def _encrypt_one(
     correlation_id: str,
     force: bool,
 ) -> None:
-    from envault.crypto import sha256_file
-
     sha256 = sha256_file(file_path)
 
     existing = store.get_current_state(sha256)
@@ -263,8 +280,14 @@ def _encrypt_one(
 @main.command()
 @click.argument("identifier")
 @click.option(
-    "--output", "-o", type=click.Path(path_type=Path), default=Path("."), show_default=True
+    "--output",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=Path("."),
+    show_default=True,
+    help="Existing directory (file keeps its original name) or the output file path.",
 )
+@click.option("--force", is_flag=True, help="Overwrite the output file if it already exists.")
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
@@ -282,16 +305,17 @@ def _encrypt_one(
     default="",
     help="Comma-separated AWS account IDs to trust for decryption.",
 )
-@click.pass_context
+@_audit_ttl_option
 def decrypt(
-    ctx: click.Context,
     identifier: str,
     output: Path,
+    force: bool,
     table: str,
     bucket: str,
     region: str,
     version: int,
     allowed_account_ids: str,
+    audit_ttl_days: int,
 ) -> None:
     """Decrypt a file by SHA256 hash or filename.
 
@@ -306,27 +330,63 @@ def decrypt(
     record = _resolve_identifier(identifier, version, store)
     sha256_hash = record.sha256_hash
 
+    if output.is_dir():
+        safe_name = Path(record.file_name).name
+        if not safe_name or safe_name.startswith("."):
+            safe_name = f"decrypted_{sha256_hash[:16]}"
+        output_path = output / safe_name
+    else:
+        output_path = output
+    if output_path.exists() and not force:
+        console.print(
+            f"[bold red]Refusing to overwrite[/bold red] {escape(str(output_path))} "
+            "(use --force to replace it)."
+        )
+        sys.exit(1)
+
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
     os.close(_fd)
     tmp_encrypted = Path(_tmp)
-    safe_name = Path(record.file_name).name
-    if not safe_name or safe_name.startswith("."):
-        safe_name = f"decrypted_{sha256_hash[:16]}"
-    output_path = (output if output.is_dir() else output.parent) / safe_name
+    # Verified plaintext waits here, hidden, until the read is on the audit trail.
+    staging = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex[:8]}.verified")
 
     try:
         s3.download_file(
             s3_key=record.s3_key, local_path=tmp_encrypted, version_id=record.s3_version_id
         )
-
         decrypt_file(
             input_path=tmp_encrypted,
-            output_path=output_path,
+            output_path=staging,
             expected_sha256=sha256_hash,
             region=region,
-            allowed_account_ids=account_ids or None,
+            allowed_account_ids=account_ids,
             expected_context=record.encryption_context,
         )
+
+        # Fail closed, like exec: reading a file does not change what is stored
+        # in S3, so current_state is left alone and the read is recorded as an
+        # event — before the plaintext becomes visible at its final path. If the
+        # event cannot be written the plaintext is destroyed, never delivered.
+        try:
+            store.put_event(
+                record,
+                operation="DECRYPT",
+                correlation_id=correlation_id,
+                audit_ttl_days=audit_ttl_days,
+                principal_arn=caller_arn(region),
+            )
+        except (ClientError, BotoCoreError, EnvaultError) as exc:
+            logger.error(
+                "Audit event write failed; decrypted plaintext discarded.",
+                extra={"sha256": sha256_hash, "s3_key": record.s3_key},
+            )
+            console.print(
+                "[bold red]Refusing to write plaintext:[/bold red] the access could not be "
+                f"recorded in the audit trail: {escape(str(exc))}"
+            )
+            sys.exit(1)
+
+        _publish(staging, output_path, overwrite=force)
     except EncryptionContextMismatchError:
         console.print(
             "[bold red]Decryption failed:[/bold red] encryption context mismatch.\n"
@@ -356,42 +416,38 @@ def decrypt(
             f"  File: {escape(record.file_name)}  S3: {escape(record.s3_key)}"
         )
         sys.exit(1)
-    except EnvaultError as exc:
+    except (EnvaultError, OSError) as exc:
         console.print(f"[bold red]Decryption error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
-
-    # Reading a file does not change what is stored in S3, so current_state is
-    # left alone — the ciphertext is still there and still encrypted. The read is
-    # recorded as an event instead. This is what makes a file decryptable more
-    # than once, keeps it visible to rotate-key, and avoids two concurrent reads
-    # colliding on the CURRENT record's optimistic lock.
-    try:
-        store.put_event(
-            record,
-            operation="DECRYPT",
-            correlation_id=correlation_id,
-            principal_arn=caller_arn(region),
-        )
-    except (ClientError, BotoCoreError, EnvaultError) as exc:
-        logger.error(
-            "Audit event write failed after successful decryption.",
-            extra={
-                "sha256": sha256_hash,
-                "output_path": str(output_path),
-                "s3_key": record.s3_key,
-            },
-        )
-        console.print(
-            f"[green]✓[/green] Decrypted → {escape(str(output_path))}\n"
-            f"[bold yellow]Warning:[/bold yellow] the access could not be recorded in the "
-            f"audit trail: {escape(str(exc))}\n"
-            "The plaintext was written but this read is missing from the audit log."
-        )
-        sys.exit(1)
+        # No-op once published; otherwise zero-overwrites verified plaintext.
+        _best_effort_delete(staging)
 
     console.print(f"[green]✓[/green] Decrypted → {escape(str(output_path))}")
+
+
+def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
+    """Move ``src`` to ``dst``; without ``overwrite``, never replace an existing file.
+
+    ``os.link`` fails atomically if ``dst`` exists, closing the race between the
+    up-front existence check and this point.
+    """
+    if overwrite:
+        os.replace(src, dst)
+        return
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise EnvaultError(f"{dst} appeared while decrypting; not overwriting it.") from None
+    except OSError:
+        # Filesystem without hard links (FAT, some network mounts): fall back
+        # to check-then-rename, which is racy but still refuses a known file.
+        if dst.exists():
+            raise EnvaultError(f"{dst} appeared while decrypting; not overwriting it.") from None
+        os.replace(src, dst)
+        return
+    src.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +462,7 @@ def decrypt(
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def status(state: str, sha256_hash: str | None, table: str, region: str) -> None:
     """Show current encryption state of files."""
-    try:
+    with _exit_on_error():
         store = StateStore(table_name=table, region=region)
 
         if sha256_hash:
@@ -428,13 +484,6 @@ def status(state: str, sha256_hash: str | None, table: str, region: str) -> None
             console.print("[yellow]No records found.[/yellow]")
             return
         _print_records(records)
-    except (ClientError, BotoCoreError) as exc:
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
-        sys.exit(1)
-    except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        sys.exit(1)
 
 
 def _print_records(records: list[FileRecord]) -> None:
@@ -472,7 +521,7 @@ def _print_records(records: list[FileRecord]) -> None:
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -> None:
     """Show the full event history."""
-    try:
+    with _exit_on_error():
         store = StateStore(table_name=table, region=region)
 
         if sha256_hash:
@@ -510,13 +559,6 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
                 escape(str(e.get("correlation_id", ""))[:8]),
             )
         console.print(t)
-    except (ClientError, BotoCoreError) as exc:
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
-        sys.exit(1)
-    except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +571,7 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def dashboard(table: str, region: str) -> None:
     """Show a summary dashboard of all tracked files."""
-    try:
+    with _exit_on_error():
         store = StateStore(table_name=table, region=region)
         summary = store.summary()
 
@@ -546,13 +588,6 @@ def dashboard(table: str, region: str) -> None:
         t.add_row("Last activity:", summary["last_activity"])
         console.print(t)
         console.print()
-    except (ClientError, BotoCoreError) as exc:
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
-        sys.exit(1)
-    except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +600,8 @@ def dashboard(table: str, region: str) -> None:
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 @click.option("--dry-run", is_flag=True, help="Parse without writing to DynamoDB.")
-def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
+@_audit_ttl_option
+def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_days: int) -> None:
     """Import existing output.json metadata into DynamoDB.
 
     FROM_PATH is the path to code/output.json (NDJSON format).
@@ -587,7 +623,10 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
             if not dry_run:
                 store.put_current_state(record)
                 store.put_event(
-                    record, operation="ENCRYPT", correlation_id="migrated-from-output-json"
+                    record,
+                    operation="ENCRYPT",
+                    correlation_id="migrated-from-output-json",
+                    audit_ttl_days=audit_ttl_days,
                 )
             imported += 1
         except StateConflictError:
@@ -624,8 +663,6 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
     message_id = _extract_message_id(header)
     kms_key_id = _extract_kms_key_id(header)
     enc_context = header.get("encryption_context", {})
-
-    from envault.crypto import sha256_file
 
     if not plaintext_path.exists():
         logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
@@ -686,6 +723,7 @@ def _extract_kms_key_id(header: dict[str, Any]) -> str:
     default="",
     help="Comma-separated AWS account IDs to trust for decryption.",
 )
+@_audit_ttl_option
 def rotate_key(
     new_key_id: str,
     table: str,
@@ -693,6 +731,7 @@ def rotate_key(
     region: str,
     dry_run: bool,
     allowed_account_ids: str,
+    audit_ttl_days: int,
 ) -> None:
     """Re-encrypt all ENCRYPTED files under a new KMS key.
 
@@ -729,15 +768,18 @@ def rotate_key(
             console.print(f"  Would rotate: {escape(r.file_name)} ({r.sha256_hash[:16]}...)")
         return
 
-    console.print(
-        "[dim yellow]Note: Temporary plaintext is overwritten with zeros before deletion, "
-        "but secure erasure is not guaranteed on copy-on-write filesystems (APFS, Btrfs, "
-        "ZFS) or SSDs with wear-levelling.[/dim yellow]"
-    )
+    shm_dir = _private_ram_dir()
+    if shm_dir is None:
+        console.print(
+            "[dim yellow]Note: no RAM-backed filesystem available; temporary plaintext is "
+            "written to disk and overwritten with zeros before deletion, but secure erasure "
+            "is not guaranteed on copy-on-write filesystems (APFS, Btrfs, ZFS) or SSDs with "
+            "wear-levelling.[/dim yellow]"
+        )
 
     # Reuses the same context builder as encrypt so the two can never drift —
     # a divergent context here would make future decrypts fail verification.
-    new_key_config = Config(key_id=new_key_id, bucket=bucket, table_name=table, region=region)
+    new_key_config = Config(key_id=new_key_id, bucket=bucket, region=region)
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
@@ -748,7 +790,9 @@ def rotate_key(
             _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
             os.close(_fd_dl)
             tmp_dl = Path(_tmp_dl)
-            _fd_pt, _tmp_pt = tempfile.mkstemp(prefix="envault_pt_")
+            _fd_pt, _tmp_pt = tempfile.mkstemp(
+                prefix="envault_pt_", dir=_plaintext_dir(shm_dir, record.file_size_bytes)
+            )
             os.fchmod(_fd_pt, 0o600)
             os.close(_fd_pt)
             tmp_pt = Path(_tmp_pt)
@@ -762,7 +806,7 @@ def rotate_key(
                 tmp_pt,
                 expected_sha256=record.sha256_hash,
                 region=region,
-                allowed_account_ids=account_ids or None,
+                allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
             )
             tmp_dl.unlink(missing_ok=True)
@@ -791,6 +835,7 @@ def rotate_key(
                     record,
                     operation="ROTATE_KEY",
                     correlation_id=correlation_id,
+                    audit_ttl_days=audit_ttl_days,
                     principal_arn=caller_arn(region),
                 )
             except Exception:
@@ -820,6 +865,8 @@ def rotate_key(
             if tmp_enc is not None:
                 tmp_enc.unlink(missing_ok=True)
 
+    if shm_dir is not None:
+        shutil.rmtree(shm_dir, ignore_errors=True)
     console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
     if errors:
         # A partially-rotated corpus means some files are still readable with the
@@ -829,6 +876,28 @@ def rotate_key(
             "encrypted under the previous key."
         )
         sys.exit(1)
+
+
+def _private_ram_dir() -> Path | None:
+    """Create a 0700 scratch directory on a RAM-backed filesystem, if there is one.
+
+    Plaintext written here never reaches persistent storage (it can still be
+    swapped, like any process memory). Returns None where /dev/shm is absent.
+    """
+    shm = Path("/dev/shm")  # noqa: S108 — the point is RAM backing, not a shared name
+    if not shm.is_dir():
+        return None
+    try:
+        return Path(tempfile.mkdtemp(prefix="envault_rot_", dir=shm))
+    except OSError:
+        return None
+
+
+def _plaintext_dir(shm_dir: Path | None, size: int) -> Path | None:
+    """Use the RAM directory unless the file would take more than half its free space."""
+    if shm_dir is not None and size * 2 < shutil.disk_usage(shm_dir).free:
+        return shm_dir
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +959,7 @@ class _BufferSink:
     is_flag=True,
     help="Start the command from a minimal environment instead of inheriting this one.",
 )
+@_audit_ttl_option
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
 def exec_(
     env_specs: tuple[str, ...],
@@ -899,6 +969,7 @@ def exec_(
     region: str,
     allowed_account_ids: str,
     clean_env: bool,
+    audit_ttl_days: int,
     command: tuple[str, ...],
 ) -> None:
     """Run a command with secrets supplied in memory, never on disk.
@@ -979,6 +1050,7 @@ def exec_(
                 record,
                 operation="ACCESS",
                 correlation_id=correlation_id,
+                audit_ttl_days=audit_ttl_days,
                 principal_arn=principal,
             )
     except EncryptionContextMismatchError:
@@ -1129,7 +1201,7 @@ _TAG_VALUE_MAX_LEN = 256
 
 def _validate_sha256(value: str) -> str:
     """Validate a SHA256 hash string. Exit with error if invalid."""
-    if not _SHA256_RE.fullmatch(value):
+    if not _is_sha256(value):
         console.print(
             f"[red]Invalid SHA256 hash: {escape(repr(value))}. "
             "Expected 64 lowercase hexadecimal characters.[/red]"
