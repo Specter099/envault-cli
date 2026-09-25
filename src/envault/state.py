@@ -10,12 +10,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from envault.config import boto_config
 from envault.exceptions import StateConflictError
+from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +45,7 @@ class FileRecord:
     tags: dict[str, str] = field(default_factory=dict)
     s3_version_id: str = ""
     encrypted_at: str = ""
-    decrypted_at: str = ""
     last_updated: str = ""
-    ttl: int = 0
 
     def to_dynamo_item(self, sk: str) -> dict[str, Any]:
         """Serialize to a DynamoDB item dict."""
@@ -85,15 +83,13 @@ class StateStore:
           EVENT#{iso_timestamp}#{operation}  (immutable audit trail)
 
     GSIs:
-      state-index: PK=current_state, SK=encrypted_at
-      date-index:  PK=date, SK=last_updated
+      state-index: PK=current_state, SK=encrypted_at  (CURRENT rows only)
+      date-index:  PK=date, SK=last_updated          (EVENT rows only)
     """
 
     def __init__(self, table_name: str, region: str = "us-east-1") -> None:
-        self._table_name = table_name
-        self._region = region
-        self._dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
-        self._table = self._dynamodb.Table(table_name)
+        dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
+        self._table = dynamodb.Table(table_name)
 
     def _paginate_query(self, max_items: int = 0, **query_kwargs: Any) -> list[dict[str, Any]]:
         """Execute a DynamoDB Query, following LastEvaluatedKey until exhausted.
@@ -113,12 +109,7 @@ class StateStore:
             query_kwargs["ExclusiveStartKey"] = last_key
         return items
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-        retry=retry_if_not_exception_type(StateConflictError),
-    )
+    @aws_retry(never=(StateConflictError,))
     def put_current_state(
         self, record: FileRecord, expected_last_updated: str | None = None
     ) -> None:
@@ -133,9 +124,6 @@ class StateStore:
         """
         record.last_updated = _now_iso()
         item = record.to_dynamo_item(sk=CURRENT)
-        # Add GSI keys
-        item["current_state"] = record.current_state
-        item["date"] = _today_str()
 
         put_kwargs: dict[str, Any] = {"Item": item}
 
@@ -185,11 +173,7 @@ class StateStore:
             record, operation, correlation_id, audit_ttl_days, now, unique_suffix, principal_arn
         )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def _put_event_inner(
         self,
         record: FileRecord,
@@ -206,7 +190,10 @@ class StateStore:
         item["operation"] = operation
         item["correlation_id"] = correlation_id
         item["principal_arn"] = principal_arn
-        item["current_state"] = record.current_state
+        # Stored under a different name so events stay out of the sparse
+        # state-index: otherwise every state/filename lookup, rotate-key and
+        # dashboard query reads (and pays for) the entire audit history.
+        item["record_state"] = item.pop("current_state")
         item["date"] = _today_str()
         item["ttl"] = _ttl_epoch(audit_ttl_days)
         try:
@@ -227,11 +214,7 @@ class StateStore:
             extra={"sha256": record.sha256_hash[:16], "operation": operation},
         )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def get_current_state(self, sha256_hash: str) -> FileRecord | None:
         """Return the current state record for a file, or None if not found."""
         response = self._table.get_item(Key={"PK": f"{FILE_PREFIX}{sha256_hash}", "SK": CURRENT})
@@ -240,11 +223,7 @@ class StateStore:
             return None
         return _item_to_record(item)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def list_by_state(self, state: str, max_items: int = 0) -> list[FileRecord]:
         """Return all files in a given state (uses state-index GSI).
 
@@ -252,8 +231,6 @@ class StateStore:
             state: The state to filter by (e.g. ENCRYPTED, DECRYPTED).
             max_items: Maximum items to return. 0 means no limit.
         """
-        from boto3.dynamodb.conditions import Attr
-
         items = self._paginate_query(
             max_items=max_items,
             IndexName="state-index",
@@ -262,19 +239,13 @@ class StateStore:
         )
         return [_item_to_record(item) for item in items]
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def list_by_file_name(self, file_name: str, state: str) -> list[FileRecord]:
         """Return CURRENT records matching a file_name in a given state.
 
         Results are sorted by encrypted_at descending (newest first).
         Uses state-index GSI with FilterExpression on file_name and SK.
         """
-        from boto3.dynamodb.conditions import Attr
-
         items = self._paginate_query(
             IndexName="state-index",
             KeyConditionExpression=Key("current_state").eq(state),
@@ -284,11 +255,7 @@ class StateStore:
         records.sort(key=lambda r: r.encrypted_at, reverse=True)
         return records
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def list_events_for_file(self, sha256_hash: str) -> list[dict[str, Any]]:
         """Return all event records for a file, sorted by timestamp."""
         return self._paginate_query(
@@ -297,88 +264,51 @@ class StateStore:
             )
         )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
+    @aws_retry()
     def list_events_by_date(self, date_str: str) -> list[dict[str, Any]]:
         """Return EVENT records for a given date YYYY-MM-DD (uses date-index GSI).
 
         CURRENT-state records also carry a 'date' attribute but are excluded by
         filtering on SK beginning with EVENT_PREFIX.
         """
-        from boto3.dynamodb.conditions import Attr
-
         return self._paginate_query(
             IndexName="date-index",
             KeyConditionExpression=Key("date").eq(date_str),
             FilterExpression=Attr("SK").begins_with(EVENT_PREFIX),
         )
 
-    def _count_by_state(self, state: str) -> int:
-        """Return count of CURRENT records in a given state via Select=COUNT."""
-        from boto3.dynamodb.conditions import Attr
+    def _state_stats(self, state: str) -> tuple[int, str]:
+        """Return (count, latest last_updated) of CURRENT records in a state.
 
+        One paginated pass that projects only the timestamp. Filtering happens
+        after DynamoDB's Limit is applied, so a ``Limit=1`` query here would
+        return nothing whenever the first index entry is a legacy EVENT row.
+        """
         count = 0
+        latest = ""
         query_kwargs: dict[str, Any] = {
             "IndexName": "state-index",
             "KeyConditionExpression": Key("current_state").eq(state),
             "FilterExpression": Attr("SK").eq(CURRENT),
-            "Select": "COUNT",
+            "ProjectionExpression": "last_updated",
         }
         while True:
             response = self._table.query(**query_kwargs)
-            count += int(response.get("Count", 0))
+            for item in response.get("Items", []):
+                count += 1
+                latest = max(latest, str(item.get("last_updated", "")))
             last_key = response.get("LastEvaluatedKey")
             if not last_key:
                 break
             query_kwargs["ExclusiveStartKey"] = last_key
-        return count
+        return count, latest
 
-    def _latest_record_timestamp(self, state: str) -> str | None:
-        """Return the last_updated timestamp of the most recent CURRENT record in a state.
-
-        DynamoDB applies ``Limit`` *before* ``FilterExpression``. Event items
-        inherit ``current_state`` and land in this GSI, so a Limit=1 query
-        almost always fetches an EVENT, filters it out, and returns empty.
-        Page until a CURRENT item survives the filter.
-        """
-        from boto3.dynamodb.conditions import Attr
-
-        query_kwargs: dict[str, Any] = {
-            "IndexName": "state-index",
-            "KeyConditionExpression": Key("current_state").eq(state),
-            "FilterExpression": Attr("SK").eq(CURRENT),
-            "ScanIndexForward": False,
-            "Limit": 25,
-        }
-        while True:
-            response = self._table.query(**query_kwargs)
-            items = response.get("Items", [])
-            if items:
-                value = items[0].get("last_updated")
-                return str(value) if value is not None else None
-            last_key = response.get("LastEvaluatedKey")
-            if not last_key:
-                return None
-            query_kwargs["ExclusiveStartKey"] = last_key
 
     def summary(self) -> dict[str, Any]:
         """Return aggregate counts and last activity timestamp for the dashboard."""
-        encrypted_count = self._count_by_state(ENCRYPTED)
-        decrypted_count = self._count_by_state(DECRYPTED)
-
-        # Find the most recent activity across both states
-        timestamps = [
-            ts
-            for ts in (
-                self._latest_record_timestamp(ENCRYPTED),
-                self._latest_record_timestamp(DECRYPTED),
-            )
-            if ts
-        ]
-        last_activity = max(timestamps) if timestamps else "\u2014"
+        encrypted_count, encrypted_latest = self._state_stats(ENCRYPTED)
+        decrypted_count, decrypted_latest = self._state_stats(DECRYPTED)
+        last_activity = max(encrypted_latest, decrypted_latest) or "\u2014"
 
         return {
             "total": encrypted_count + decrypted_count,
@@ -403,7 +333,5 @@ def _item_to_record(item: dict[str, Any]) -> FileRecord:
         tags=dict(item.get("tags", {})),
         s3_version_id=item.get("s3_version_id", ""),
         encrypted_at=item.get("encrypted_at", ""),
-        decrypted_at=item.get("decrypted_at", ""),
         last_updated=item.get("last_updated", ""),
-        ttl=int(item.get("ttl", 0)),
     )

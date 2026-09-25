@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import boto3
 import pytest
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
@@ -368,7 +369,7 @@ def test_summary_uses_count_query():
 
 @mock_aws
 def test_count_by_state_returns_correct_count():
-    """_count_by_state must count records without loading item data."""
+    """_state_stats must count records without loading item data."""
     store = _create_table()
     for i in range(4):
         sha = f"{chr(ord('a') + i)}" * 64
@@ -383,8 +384,8 @@ def test_count_by_state_returns_correct_count():
     )
     store.put_current_state(r_dec)
 
-    assert store._count_by_state(ENCRYPTED) == 4
-    assert store._count_by_state(DECRYPTED) == 1
+    assert store._state_stats(ENCRYPTED)[0] == 4
+    assert store._state_stats(DECRYPTED)[0] == 1
 
 
 @mock_aws
@@ -428,7 +429,7 @@ def test_list_by_state_excludes_event_records():
 
 @mock_aws
 def test_count_by_state_excludes_event_records():
-    """_count_by_state must only count CURRENT records, not EVENT records.
+    """_state_stats must only count CURRENT records, not EVENT records.
 
     Same root cause as list_by_state — both record types have current_state,
     so both appear in state-index GSI.
@@ -444,7 +445,7 @@ def test_count_by_state_excludes_event_records():
     store.put_event(record, operation="ENCRYPT", correlation_id="corr-2")
 
     # Should count 1 (the CURRENT record), not 3
-    assert store._count_by_state(ENCRYPTED) == 1
+    assert store._state_stats(ENCRYPTED)[0] == 1
 
 
 @mock_aws
@@ -675,3 +676,40 @@ def test_retry_exhaustion_reraises_original_exception():
     with patch.object(store._table, "get_item", side_effect=throttled):
         with pytest.raises(ClientError):
             store.get_current_state(record.sha256_hash)
+
+
+@mock_aws
+def test_events_are_kept_out_of_state_index():
+    """Audit events must not land in state-index, or every lookup reads all history."""
+    store = _create_table()
+    record = _make_record(sha256_hash="a" * 64, current_state=ENCRYPTED)
+    store.put_current_state(record)
+    for _ in range(3):
+        store.put_event(record, operation="DECRYPT", correlation_id="c")
+
+    raw = store._table.query(
+        IndexName="state-index",
+        KeyConditionExpression=Key("current_state").eq(ENCRYPTED),
+    )
+    assert raw["Count"] == 1
+    event = store.list_events_for_file(record.sha256_hash)[0]
+    assert event["record_state"] == ENCRYPTED
+    assert "current_state" not in event
+
+
+@mock_aws
+def test_summary_last_activity_survives_legacy_event_rows():
+    """Legacy events in state-index sort ahead of CURRENT rows; last_activity must still resolve."""
+    store = _create_table()
+    record = _make_record(
+        sha256_hash="a" * 64, current_state=ENCRYPTED, encrypted_at="2026-01-01T00:00:00+00:00"
+    )
+    store.put_current_state(record)
+    # An event as written by earlier versions: carries current_state and a later encrypted_at.
+    legacy = record.to_dynamo_item(sk="EVENT#2026-02-01T00:00:00+00:00#DECRYPT#abcd1234")
+    legacy["encrypted_at"] = "2026-02-01T00:00:00+00:00"
+    store._table.put_item(Item=legacy)
+
+    summary = store.summary()
+    assert summary["encrypted"] == 1
+    assert summary["last_activity"] == record.last_updated

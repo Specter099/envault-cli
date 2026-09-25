@@ -9,28 +9,59 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- `decrypt` fails closed on audit: the DECRYPT event is written before verified plaintext
+  is moved into place, and the plaintext is discarded if that write fails (previously the
+  file was left on disk with a warning).
+- `decrypt` refuses to overwrite an existing file unless `--force` is given.
+- `rotate-key` keeps temporary plaintext in a private directory on RAM-backed `/dev/shm`
+  where available, instead of the default (often disk-backed) temp directory.
+- CDK: the IAM policy's direct `kms:Decrypt`/`kms:GenerateDataKey` now require an envault
+  encryption context (`purpose` = `envault-backup` or legacy `backup`); bucket/table
+  encryption is granted only via S3 and DynamoDB (`kms:ViaService`). Unused
+  `dynamodb:UpdateItem` removed.
+
 ### Fixed
 
-- KMS key policy no longer denies `DisableKey`, so a compromised CMK can be frozen during incident response without a CloudFormation change.
-- IAM policy no longer grants unused `dynamodb:UpdateItem` / `s3:ListBucket`; S3 object actions are scoped to `encrypted/*`; `sts:GetCallerIdentity` is granted for audit attribution.
+- `ENVAULT_AUDIT_TTL_DAYS` is honoured (it was documented but ignored); also available as
+  `--audit-ttl-days` on every command that writes audit events.
+- Audit events no longer appear in `state-index`, so `status`, `rotate-key`,
+  decrypt-by-name and `dashboard` stop reading the whole audit history. Events written by
+  earlier versions stay in the index until their TTL expires; queries still filter them.
+- `dashboard` "Last activity" no longer shows "—" once any audit event exists.
+- `decrypt -o FILE` writes to `FILE` instead of `FILE`'s parent directory.
+- CDK: non-current S3 versions are no longer moved to Glacier. Records pin a `VersionId`,
+  and an archived version cannot be read.
+- KMS key policy no longer denies `DisableKey`, so a compromised CMK can be frozen during
+  incident response without a CloudFormation change.
+- IAM: unused `s3:ListBucket` removed; S3 object actions scoped to `encrypted/*`;
+  `sts:GetCallerIdentity` granted for audit attribution.
 - Ops SNS topic is encrypted with the envault CMK.
-- `decrypt` refuses to overwrite an existing destination unless `--force` is passed, and checks before creating temp files.
-- S3 downloads require a content-addressed key (`encrypted/{aa}/{sha256}/{name}.encrypted`) so a poisoned DynamoDB `s3_key` cannot fetch an arbitrary object.
+- S3 downloads require a content-addressed key (`encrypted/{aa}/{sha256}/{name}.encrypted`)
+  so a poisoned DynamoDB `s3_key` cannot fetch an arbitrary object.
 - Directory-symlink trees are skipped by `os.walk(followlinks=False)` during encrypt.
-- `migrate` confines input paths to the import directory and rejects per-component symlinks.
-- `ENVAULT_AUDIT_TTL_DAYS` is applied on encrypt, decrypt, exec, rotate-key, and migrate event writes.
-- `rotate-key` calls `DescribeKey` on the target CMK before downloading or decrypting anything.
+- `migrate` confines input paths to the import directory and rejects per-component
+  symlinks; non-object NDJSON lines are per-record errors.
+- `rotate-key` calls `DescribeKey` on the target CMK (must be `Enabled`) before any
+  download or decrypt.
 - `last_updated` CAS tokens use microsecond timestamps.
-- Dashboard `last_activity` pages the state-index until a CURRENT item survives the filter.
-- `exec` warns when the child will inherit `AWS_*` credentials; `--clean-env` remains opt-in.
-- Encrypt closes the output fd if the SDK stream fails before `fdopen`.
-- Decrypt closes the temp fd and always unlinks `.part` files if opening ciphertext fails after `fdopen`.
-- `migrate` treats non-object NDJSON lines as per-record errors instead of aborting the import.
-- `rotate-key` `DescribeKey` preflight rejects keys whose state is not `Enabled`.
-- Empty `s3_version_id` no longer fetches the latest S3 object. `decrypt` / `exec` / `rotate-key` require `--latest` for migrated records.
-- `migrate` requires an import directory and checks absolute paths for containment before any `lstat`, so a poisoned `output.json` cannot touch files outside that tree.
-- CDK context `additional_kms_key_arns` adds extra CMK ARNs to the user policy so `rotate-key --new-key-id` can target a second key without a wildcard grant.
-- `exec` wipes in-memory secret buffers if `--secret` rejects a non-UTF-8 or NUL value.
+- `exec` warns when the child will inherit `AWS_*` credentials; `--clean-env` remains
+  opt-in. In-memory secret buffers are wiped if `--secret` rejects a non-UTF-8 or NUL value.
+- Encrypt/decrypt close leftover fds if the SDK stream fails before `fdopen`.
+- Empty `s3_version_id` no longer fetches the latest S3 object. `decrypt` / `exec` /
+  `rotate-key` require `--latest` for migrated records.
+
+### Added
+
+- CDK `AlertEmailParam` subscribes an email address to the operational alarm topic.
+- CDK context `additional_kms_key_arns` grants extra rotation-target CMKs without a
+  wildcard IAM grant.
+
+### Removed
+
+- `Config.from_env`, `Config.table_name`, `Config.allowed_account_ids`,
+  `FileRecord.ttl`, `FileRecord.decrypted_at` (unused).
 
 ## [0.2.0] - 2026-07-26
 
