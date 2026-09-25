@@ -790,6 +790,7 @@ def test_rotate_key_keeps_plaintext_off_disk(tmp_path: Path) -> None:
     """Rotation plaintext goes to a private RAM-backed dir, which is removed afterwards."""
     _create_table()
     _create_bucket()
+    _ensure_kms_alias()
     s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
     version_id = _upload_fake_ciphertext(s3_key)
     store = StateStore(table_name=TABLE_NAME, region=REGION)

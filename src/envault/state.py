@@ -303,7 +303,6 @@ class StateStore:
             query_kwargs["ExclusiveStartKey"] = last_key
         return count, latest
 
-
     def summary(self) -> dict[str, Any]:
         """Return aggregate counts and last activity timestamp for the dashboard."""
         encrypted_count, encrypted_latest = self._state_stats(ENCRYPTED)
