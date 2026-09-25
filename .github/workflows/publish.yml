@@ -47,7 +47,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pip-audit
-          pip-audit --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-3219
+          pip-audit
 
   build:
     name: Build distribution

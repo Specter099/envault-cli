@@ -55,6 +55,13 @@ class EnvaultStack(Stack):
             min_length=1,
             max_length=128,
         )
+        alert_email_param = cdk.CfnParameter(
+            self,
+            "AlertEmailParam",
+            type="String",
+            default="",
+            description="Email address subscribed to envault operational alarms (optional).",
+        )
 
         # ------------------------------------------------------------------ #
         # KMS Customer Managed Key                                             #
@@ -118,16 +125,12 @@ class EnvaultStack(Stack):
             server_access_logs_prefix="envault-access-logs/",
             removal_policy=RemovalPolicy.RETAIN,
             lifecycle_rules=[
-                # Move old non-current versions to GLACIER after 90 days,
-                # then expire after 365 days to prevent unbounded growth
-                # from key rotation creating new versions per file.
+                # Expire non-current versions after 365 days to bound growth from
+                # key rotation. No Glacier transition: DynamoDB pins each file to
+                # a specific VersionId, and GetObject on an archived version fails,
+                # so a record left pointing at a non-current version (e.g. after
+                # a failed state write) would become undecryptable at 90 days.
                 s3.LifecycleRule(
-                    noncurrent_version_transitions=[
-                        s3.NoncurrentVersionTransition(
-                            storage_class=s3.StorageClass.GLACIER,
-                            transition_after=Duration.days(90),
-                        )
-                    ],
                     noncurrent_version_expiration=Duration.days(365),
                 )
             ],
@@ -185,9 +188,38 @@ class EnvaultStack(Stack):
             managed_policy_name=policy_name_param.value_as_string,
             description="Least-privilege access for envault CLI users",
             statements=[
+                # Direct KMS use is limited to envault envelope ciphertexts
+                # ("backup" is the legacy shell scripts' context). Without this,
+                # the policy is a general-purpose decrypt grant on a key that
+                # also protects the bucket and table.
                 iam.PolicyStatement(
                     sid="KmsEnvelopeEncryption",
-                    actions=["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
+                    actions=["kms:GenerateDataKey", "kms:Decrypt"],
+                    resources=[encryption_key.key_arn],
+                    conditions={
+                        "StringEquals": {
+                            "kms:EncryptionContext:purpose": ["envault-backup", "backup"]
+                        }
+                    },
+                ),
+                # SSE-KMS on the bucket and table: only when S3/DynamoDB call
+                # KMS on the user's behalf.
+                iam.PolicyStatement(
+                    sid="KmsViaStorageServices",
+                    actions=["kms:GenerateDataKey", "kms:Decrypt"],
+                    resources=[encryption_key.key_arn],
+                    conditions={
+                        "StringEquals": {
+                            "kms:ViaService": [
+                                f"s3.{self.region}.amazonaws.com",
+                                f"dynamodb.{self.region}.amazonaws.com",
+                            ]
+                        }
+                    },
+                ),
+                iam.PolicyStatement(
+                    sid="KmsDescribeKey",
+                    actions=["kms:DescribeKey"],
                     resources=[encryption_key.key_arn],
                 ),
                 iam.PolicyStatement(
@@ -294,6 +326,22 @@ class EnvaultStack(Stack):
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
             treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
         ).add_alarm_action(cw_actions.SnsAction(ops_topic))
+
+        has_alert_email = cdk.CfnCondition(
+            self,
+            "HasAlertEmail",
+            expression=cdk.Fn.condition_not(
+                cdk.Fn.condition_equals(alert_email_param.value_as_string, "")
+            ),
+        )
+        alert_subscription = sns.CfnSubscription(
+            self,
+            "OpsTopicEmailSubscription",
+            topic_arn=ops_topic.topic_arn,
+            protocol="email",
+            endpoint=alert_email_param.value_as_string,
+        )
+        alert_subscription.cfn_options.condition = has_alert_email
 
         cdk.CfnOutput(self, "OpsTopicArn", value=ops_topic.topic_arn)
 
