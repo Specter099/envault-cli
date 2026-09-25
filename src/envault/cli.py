@@ -10,6 +10,8 @@ import shutil
 import sys
 import tempfile
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -108,6 +110,20 @@ _audit_ttl_option = click.option(
     show_default=True,
     help="Days to retain audit events before DynamoDB TTL expires them.",
 )
+
+
+@contextmanager
+def _exit_on_error() -> Iterator[None]:
+    """Turn AWS and envault errors into a one-line message and exit status 1."""
+    try:
+        yield
+    except (ClientError, BotoCoreError) as exc:
+        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
+        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
+        sys.exit(1)
+    except EnvaultError as exc:
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +462,7 @@ def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def status(state: str, sha256_hash: str | None, table: str, region: str) -> None:
     """Show current encryption state of files."""
-    try:
+    with _exit_on_error():
         store = StateStore(table_name=table, region=region)
 
         if sha256_hash:
@@ -468,13 +484,6 @@ def status(state: str, sha256_hash: str | None, table: str, region: str) -> None
             console.print("[yellow]No records found.[/yellow]")
             return
         _print_records(records)
-    except (ClientError, BotoCoreError) as exc:
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
-        sys.exit(1)
-    except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        sys.exit(1)
 
 
 def _print_records(records: list[FileRecord]) -> None:
@@ -512,7 +521,7 @@ def _print_records(records: list[FileRecord]) -> None:
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -> None:
     """Show the full event history."""
-    try:
+    with _exit_on_error():
         store = StateStore(table_name=table, region=region)
 
         if sha256_hash:
@@ -550,13 +559,6 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
                 escape(str(e.get("correlation_id", ""))[:8]),
             )
         console.print(t)
-    except (ClientError, BotoCoreError) as exc:
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
-        sys.exit(1)
-    except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +571,7 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 def dashboard(table: str, region: str) -> None:
     """Show a summary dashboard of all tracked files."""
-    try:
+    with _exit_on_error():
         store = StateStore(table_name=table, region=region)
         summary = store.summary()
 
@@ -586,13 +588,6 @@ def dashboard(table: str, region: str) -> None:
         t.add_row("Last activity:", summary["last_activity"])
         console.print(t)
         console.print()
-    except (ClientError, BotoCoreError) as exc:
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
-        sys.exit(1)
-    except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
