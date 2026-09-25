@@ -206,7 +206,6 @@ class EnvaultStack(Stack):
                         "dynamodb:PutItem",
                         "dynamodb:GetItem",
                         "dynamodb:Query",
-                        "dynamodb:UpdateItem",
                     ],
                     resources=[table.table_arn, f"{table.table_arn}/index/*"],
                 ),
@@ -265,11 +264,11 @@ class EnvaultStack(Stack):
             treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
         ).add_alarm_action(cw_actions.SnsAction(ops_topic))
 
-        # DynamoDB system errors — use a math expression over the four
+        # DynamoDB system errors — use a math expression over the three
         # operations envault actually calls to stay within the 10-metric
         # alarm limit imposed by CloudWatch.
         sys_err_metrics: dict[str, cloudwatch.IMetric] = {}
-        for op in ("PutItem", "GetItem", "Query", "UpdateItem"):
+        for op in ("PutItem", "GetItem", "Query"):
             sys_err_metrics[op.lower()] = cloudwatch.Metric(
                 namespace="AWS/DynamoDB",
                 metric_name="SystemErrors",

@@ -27,7 +27,6 @@ class S3Store:
 
     def __init__(self, bucket: str, region: str = "us-east-1", kms_key_id: str = "") -> None:
         self._bucket = bucket
-        self._region = region
         self._kms_key_id = kms_key_id
         self._s3 = boto3.client("s3", region_name=region, config=boto_config)
 
@@ -142,15 +141,15 @@ class S3Store:
         """
         local_path.parent.mkdir(parents=True, exist_ok=True)
         extra_args: dict[str, str] = {}
-        if not version_id:
+        if version_id:
+            extra_args["VersionId"] = version_id
+        else:
             logger.warning(
                 "Downloading S3 object without VersionId — fetching latest version. "
                 "If the object was overwritten since encryption, "
                 "the wrong ciphertext may be retrieved.",
                 extra={"bucket": self._bucket, "key": s3_key},
             )
-        if version_id:
-            extra_args["VersionId"] = version_id
 
         logger.info(
             "Downloading from S3",

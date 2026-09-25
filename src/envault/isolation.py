@@ -83,10 +83,6 @@ class HardeningReport:
     memory_locked: bool = False
     degraded: list[str] = field(default_factory=list)
 
-    @property
-    def fully_applied(self) -> bool:
-        return not self.degraded
-
     def summary(self) -> str:
         applied = []
         if self.dumpable_disabled:

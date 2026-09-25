@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
@@ -45,9 +45,7 @@ class FileRecord:
     tags: dict[str, str] = field(default_factory=dict)
     s3_version_id: str = ""
     encrypted_at: str = ""
-    decrypted_at: str = ""
     last_updated: str = ""
-    ttl: int = 0
 
     def to_dynamo_item(self, sk: str) -> dict[str, Any]:
         """Serialize to a DynamoDB item dict."""
@@ -88,10 +86,8 @@ class StateStore:
     """
 
     def __init__(self, table_name: str, region: str = "us-east-1") -> None:
-        self._table_name = table_name
-        self._region = region
-        self._dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
-        self._table = self._dynamodb.Table(table_name)
+        dynamodb = boto3.resource("dynamodb", region_name=region, config=boto_config)
+        self._table = dynamodb.Table(table_name)
 
     def _paginate_query(self, max_items: int = 0, **query_kwargs: Any) -> list[dict[str, Any]]:
         """Execute a DynamoDB Query, following LastEvaluatedKey until exhausted.
@@ -250,8 +246,6 @@ class StateStore:
             state: The state to filter by (e.g. ENCRYPTED, DECRYPTED).
             max_items: Maximum items to return. 0 means no limit.
         """
-        from boto3.dynamodb.conditions import Attr
-
         items = self._paginate_query(
             max_items=max_items,
             IndexName="state-index",
@@ -271,8 +265,6 @@ class StateStore:
         Results are sorted by encrypted_at descending (newest first).
         Uses state-index GSI with FilterExpression on file_name and SK.
         """
-        from boto3.dynamodb.conditions import Attr
-
         items = self._paginate_query(
             IndexName="state-index",
             KeyConditionExpression=Key("current_state").eq(state),
@@ -306,8 +298,6 @@ class StateStore:
         CURRENT-state records also carry a 'date' attribute but are excluded by
         filtering on SK beginning with EVENT_PREFIX.
         """
-        from boto3.dynamodb.conditions import Attr
-
         return self._paginate_query(
             IndexName="date-index",
             KeyConditionExpression=Key("date").eq(date_str),
@@ -316,8 +306,6 @@ class StateStore:
 
     def _count_by_state(self, state: str) -> int:
         """Return count of CURRENT records in a given state via Select=COUNT."""
-        from boto3.dynamodb.conditions import Attr
-
         count = 0
         query_kwargs: dict[str, Any] = {
             "IndexName": "state-index",
@@ -336,8 +324,6 @@ class StateStore:
 
     def _latest_record_timestamp(self, state: str) -> str | None:
         """Return the last_updated timestamp of the most recent CURRENT record in a state."""
-        from boto3.dynamodb.conditions import Attr
-
         response = self._table.query(
             IndexName="state-index",
             KeyConditionExpression=Key("current_state").eq(state),
@@ -390,7 +376,5 @@ def _item_to_record(item: dict[str, Any]) -> FileRecord:
         tags=dict(item.get("tags", {})),
         s3_version_id=item.get("s3_version_id", ""),
         encrypted_at=item.get("encrypted_at", ""),
-        decrypted_at=item.get("decrypted_at", ""),
         last_updated=item.get("last_updated", ""),
-        ttl=int(item.get("ttl", 0)),
     )

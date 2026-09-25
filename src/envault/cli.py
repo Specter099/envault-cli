@@ -21,7 +21,7 @@ from rich.progress import track
 from rich.table import Table
 
 from envault.config import Config
-from envault.crypto import decrypt_file, decrypt_to_stream, encrypt_file
+from envault.crypto import decrypt_file, decrypt_to_stream, encrypt_file, sha256_file
 from envault.exceptions import (
     AlreadyEncryptedError,
     ChecksumMismatchError,
@@ -51,21 +51,11 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, handlers=[handler])
 
 
-def _load_config() -> Config:
-    try:
-        return Config.from_env()
-    except ConfigurationError as e:
-        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(e))}")
-        sys.exit(1)
-
-
 @click.group(invoke_without_command=True)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose JSON logging to stderr.")
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
     """envault — client-side envelope encryption with AWS KMS + DynamoDB state tracking."""
-    ctx.ensure_object(dict)
-    ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
@@ -107,6 +97,18 @@ def cli() -> None:
         sys.exit(1)
 
 
+# Every command that writes an audit event takes this, so ENVAULT_AUDIT_TTL_DAYS
+# applies to ENCRYPT, DECRYPT, ACCESS, and ROTATE_KEY events alike.
+_audit_ttl_option = click.option(
+    "--audit-ttl-days",
+    envvar="ENVAULT_AUDIT_TTL_DAYS",
+    type=click.IntRange(min=1),
+    default=365,
+    show_default=True,
+    help="Days to retain audit events before DynamoDB TTL expires them.",
+)
+
+
 # ---------------------------------------------------------------------------
 # encrypt
 # ---------------------------------------------------------------------------
@@ -120,9 +122,8 @@ def cli() -> None:
 @click.option("--tag", "-t", multiple=True, metavar="KEY=VALUE", help="File tags (repeatable).")
 @click.option("--force", is_flag=True, help="Re-encrypt even if already ENCRYPTED.")
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1", show_default=True)
-@click.pass_context
+@_audit_ttl_option
 def encrypt(
-    ctx: click.Context,
     input_path: Path,
     key_id: str,
     bucket: str,
@@ -130,12 +131,13 @@ def encrypt(
     tag: tuple[str, ...],
     force: bool,
     region: str,
+    audit_ttl_days: int,
 ) -> None:
     """Encrypt a file or directory and store state in DynamoDB.
 
     INPUT_PATH can be a single file or a directory (processed recursively).
     """
-    config = Config(key_id=key_id, bucket=bucket, table_name=table, region=region)
+    config = Config(key_id=key_id, bucket=bucket, region=region, audit_ttl_days=audit_ttl_days)
     tags = _parse_tags(tag)
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region, kms_key_id=key_id)
@@ -175,8 +177,6 @@ def _encrypt_one(
     correlation_id: str,
     force: bool,
 ) -> None:
-    from envault.crypto import sha256_file
-
     sha256 = sha256_file(file_path)
 
     existing = store.get_current_state(sha256)
@@ -282,9 +282,8 @@ def _encrypt_one(
     default="",
     help="Comma-separated AWS account IDs to trust for decryption.",
 )
-@click.pass_context
+@_audit_ttl_option
 def decrypt(
-    ctx: click.Context,
     identifier: str,
     output: Path,
     table: str,
@@ -292,6 +291,7 @@ def decrypt(
     region: str,
     version: int,
     allowed_account_ids: str,
+    audit_ttl_days: int,
 ) -> None:
     """Decrypt a file by SHA256 hash or filename.
 
@@ -372,6 +372,7 @@ def decrypt(
             record,
             operation="DECRYPT",
             correlation_id=correlation_id,
+            audit_ttl_days=audit_ttl_days,
             principal_arn=caller_arn(region),
         )
     except (ClientError, BotoCoreError, EnvaultError) as exc:
@@ -565,7 +566,8 @@ def dashboard(table: str, region: str) -> None:
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
 @click.option("--dry-run", is_flag=True, help="Parse without writing to DynamoDB.")
-def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
+@_audit_ttl_option
+def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_days: int) -> None:
     """Import existing output.json metadata into DynamoDB.
 
     FROM_PATH is the path to code/output.json (NDJSON format).
@@ -587,7 +589,10 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool) -> None:
             if not dry_run:
                 store.put_current_state(record)
                 store.put_event(
-                    record, operation="ENCRYPT", correlation_id="migrated-from-output-json"
+                    record,
+                    operation="ENCRYPT",
+                    correlation_id="migrated-from-output-json",
+                    audit_ttl_days=audit_ttl_days,
                 )
             imported += 1
         except StateConflictError:
@@ -624,8 +629,6 @@ def _parse_output_json_entry(entry: dict[str, Any]) -> FileRecord | None:
     message_id = _extract_message_id(header)
     kms_key_id = _extract_kms_key_id(header)
     enc_context = header.get("encryption_context", {})
-
-    from envault.crypto import sha256_file
 
     if not plaintext_path.exists():
         logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
@@ -686,6 +689,7 @@ def _extract_kms_key_id(header: dict[str, Any]) -> str:
     default="",
     help="Comma-separated AWS account IDs to trust for decryption.",
 )
+@_audit_ttl_option
 def rotate_key(
     new_key_id: str,
     table: str,
@@ -693,6 +697,7 @@ def rotate_key(
     region: str,
     dry_run: bool,
     allowed_account_ids: str,
+    audit_ttl_days: int,
 ) -> None:
     """Re-encrypt all ENCRYPTED files under a new KMS key.
 
@@ -737,7 +742,7 @@ def rotate_key(
 
     # Reuses the same context builder as encrypt so the two can never drift —
     # a divergent context here would make future decrypts fail verification.
-    new_key_config = Config(key_id=new_key_id, bucket=bucket, table_name=table, region=region)
+    new_key_config = Config(key_id=new_key_id, bucket=bucket, region=region)
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
@@ -791,6 +796,7 @@ def rotate_key(
                     record,
                     operation="ROTATE_KEY",
                     correlation_id=correlation_id,
+                    audit_ttl_days=audit_ttl_days,
                     principal_arn=caller_arn(region),
                 )
             except Exception:
@@ -890,6 +896,7 @@ class _BufferSink:
     is_flag=True,
     help="Start the command from a minimal environment instead of inheriting this one.",
 )
+@_audit_ttl_option
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
 def exec_(
     env_specs: tuple[str, ...],
@@ -899,6 +906,7 @@ def exec_(
     region: str,
     allowed_account_ids: str,
     clean_env: bool,
+    audit_ttl_days: int,
     command: tuple[str, ...],
 ) -> None:
     """Run a command with secrets supplied in memory, never on disk.
@@ -979,6 +987,7 @@ def exec_(
                 record,
                 operation="ACCESS",
                 correlation_id=correlation_id,
+                audit_ttl_days=audit_ttl_days,
                 principal_arn=principal,
             )
     except EncryptionContextMismatchError:
@@ -1129,7 +1138,7 @@ _TAG_VALUE_MAX_LEN = 256
 
 def _validate_sha256(value: str) -> str:
     """Validate a SHA256 hash string. Exit with error if invalid."""
-    if not _SHA256_RE.fullmatch(value):
+    if not _is_sha256(value):
         console.print(
             f"[red]Invalid SHA256 hash: {escape(repr(value))}. "
             "Expected 64 lowercase hexadecimal characters.[/red]"

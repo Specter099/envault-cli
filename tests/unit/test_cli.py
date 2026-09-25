@@ -379,7 +379,7 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
     runner = CliRunner()
     with (
         patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
-        patch("envault.crypto.sha256_file", return_value=sha),
+        patch("envault.cli.sha256_file", return_value=sha),
     ):
         result = runner.invoke(
             main,
@@ -739,7 +739,7 @@ def test_encrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
     runner = CliRunner()
     with (
         patch("envault.cli.encrypt_file", side_effect=EnvaultError("boom")),
-        patch("envault.crypto.sha256_file", return_value=sha),
+        patch("envault.cli.sha256_file", return_value=sha),
     ):
         result = runner.invoke(
             main,
@@ -825,7 +825,7 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(
     runner = CliRunner()
     with (
         patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
-        patch("envault.crypto.sha256_file", return_value=sha),
+        patch("envault.cli.sha256_file", return_value=sha),
         patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
         caplog.at_level(logging.ERROR, logger="envault.cli"),
     ):
@@ -1241,6 +1241,56 @@ def test_decrypt_records_access_event_with_principal(tmp_path: Path) -> None:
     events = [e for e in store.list_events_for_file(FAKE_SHA) if e["operation"] == "DECRYPT"]
     assert len(events) == 1
     assert events[0]["principal_arn"].startswith("arn:aws:")
+
+
+@mock_aws
+def test_decrypt_honours_audit_ttl_env(tmp_path: Path) -> None:
+    """ENVAULT_AUDIT_TTL_DAYS sets the retention of the DECRYPT audit event."""
+    import time
+
+    _create_table()
+    _create_bucket()
+    s3_key = f"encrypted/{FAKE_SHA[:2]}/{FAKE_SHA}/test.txt.encrypted"
+    version_id = _upload_fake_ciphertext(s3_key)
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, s3_version_id=version_id)
+
+    runner = CliRunner()
+    with patch("envault.cli.decrypt_file", side_effect=_mock_decrypt_file_ok):
+        result = runner.invoke(
+            main,
+            [
+                "decrypt",
+                FAKE_SHA,
+                "--output",
+                str(tmp_path),
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+            ],
+            env={**_CLI_ENV, "ENVAULT_AUDIT_TTL_DAYS": "7"},
+        )
+
+    assert result.exit_code == 0, result.output
+    events = [e for e in store.list_events_for_file(FAKE_SHA) if e["operation"] == "DECRYPT"]
+    assert len(events) == 1
+    assert int(events[0]["ttl"]) < int(time.time()) + 8 * 86400
+
+
+def test_audit_ttl_must_be_positive() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["decrypt", FAKE_SHA, "--table", TABLE_NAME, "--bucket", BUCKET_NAME],
+        env={**_CLI_ENV, "ENVAULT_AUDIT_TTL_DAYS": "0"},
+    )
+    assert result.exit_code == 2
+    assert "audit-ttl-days" in result.output
 
 
 @mock_aws
