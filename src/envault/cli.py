@@ -263,8 +263,14 @@ def _encrypt_one(
 @main.command()
 @click.argument("identifier")
 @click.option(
-    "--output", "-o", type=click.Path(path_type=Path), default=Path("."), show_default=True
+    "--output",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=Path("."),
+    show_default=True,
+    help="Existing directory (file keeps its original name) or the output file path.",
 )
+@click.option("--force", is_flag=True, help="Overwrite the output file if it already exists.")
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
@@ -286,6 +292,7 @@ def _encrypt_one(
 def decrypt(
     identifier: str,
     output: Path,
+    force: bool,
     table: str,
     bucket: str,
     region: str,
@@ -306,27 +313,63 @@ def decrypt(
     record = _resolve_identifier(identifier, version, store)
     sha256_hash = record.sha256_hash
 
+    if output.is_dir():
+        safe_name = Path(record.file_name).name
+        if not safe_name or safe_name.startswith("."):
+            safe_name = f"decrypted_{sha256_hash[:16]}"
+        output_path = output / safe_name
+    else:
+        output_path = output
+    if output_path.exists() and not force:
+        console.print(
+            f"[bold red]Refusing to overwrite[/bold red] {escape(str(output_path))} "
+            "(use --force to replace it)."
+        )
+        sys.exit(1)
+
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
     os.close(_fd)
     tmp_encrypted = Path(_tmp)
-    safe_name = Path(record.file_name).name
-    if not safe_name or safe_name.startswith("."):
-        safe_name = f"decrypted_{sha256_hash[:16]}"
-    output_path = (output if output.is_dir() else output.parent) / safe_name
+    # Verified plaintext waits here, hidden, until the read is on the audit trail.
+    staging = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex[:8]}.verified")
 
     try:
         s3.download_file(
             s3_key=record.s3_key, local_path=tmp_encrypted, version_id=record.s3_version_id
         )
-
         decrypt_file(
             input_path=tmp_encrypted,
-            output_path=output_path,
+            output_path=staging,
             expected_sha256=sha256_hash,
             region=region,
-            allowed_account_ids=account_ids or None,
+            allowed_account_ids=account_ids,
             expected_context=record.encryption_context,
         )
+
+        # Fail closed, like exec: reading a file does not change what is stored
+        # in S3, so current_state is left alone and the read is recorded as an
+        # event — before the plaintext becomes visible at its final path. If the
+        # event cannot be written the plaintext is destroyed, never delivered.
+        try:
+            store.put_event(
+                record,
+                operation="DECRYPT",
+                correlation_id=correlation_id,
+                audit_ttl_days=audit_ttl_days,
+                principal_arn=caller_arn(region),
+            )
+        except (ClientError, BotoCoreError, EnvaultError) as exc:
+            logger.error(
+                "Audit event write failed; decrypted plaintext discarded.",
+                extra={"sha256": sha256_hash, "s3_key": record.s3_key},
+            )
+            console.print(
+                "[bold red]Refusing to write plaintext:[/bold red] the access could not be "
+                f"recorded in the audit trail: {escape(str(exc))}"
+            )
+            sys.exit(1)
+
+        _publish(staging, output_path, overwrite=force)
     except EncryptionContextMismatchError:
         console.print(
             "[bold red]Decryption failed:[/bold red] encryption context mismatch.\n"
@@ -356,43 +399,38 @@ def decrypt(
             f"  File: {escape(record.file_name)}  S3: {escape(record.s3_key)}"
         )
         sys.exit(1)
-    except EnvaultError as exc:
+    except (EnvaultError, OSError) as exc:
         console.print(f"[bold red]Decryption error:[/bold red] {escape(str(exc))}")
         sys.exit(1)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
-
-    # Reading a file does not change what is stored in S3, so current_state is
-    # left alone — the ciphertext is still there and still encrypted. The read is
-    # recorded as an event instead. This is what makes a file decryptable more
-    # than once, keeps it visible to rotate-key, and avoids two concurrent reads
-    # colliding on the CURRENT record's optimistic lock.
-    try:
-        store.put_event(
-            record,
-            operation="DECRYPT",
-            correlation_id=correlation_id,
-            audit_ttl_days=audit_ttl_days,
-            principal_arn=caller_arn(region),
-        )
-    except (ClientError, BotoCoreError, EnvaultError) as exc:
-        logger.error(
-            "Audit event write failed after successful decryption.",
-            extra={
-                "sha256": sha256_hash,
-                "output_path": str(output_path),
-                "s3_key": record.s3_key,
-            },
-        )
-        console.print(
-            f"[green]✓[/green] Decrypted → {escape(str(output_path))}\n"
-            f"[bold yellow]Warning:[/bold yellow] the access could not be recorded in the "
-            f"audit trail: {escape(str(exc))}\n"
-            "The plaintext was written but this read is missing from the audit log."
-        )
-        sys.exit(1)
+        # No-op once published; otherwise zero-overwrites verified plaintext.
+        _best_effort_delete(staging)
 
     console.print(f"[green]✓[/green] Decrypted → {escape(str(output_path))}")
+
+
+def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
+    """Move ``src`` to ``dst``; without ``overwrite``, never replace an existing file.
+
+    ``os.link`` fails atomically if ``dst`` exists, closing the race between the
+    up-front existence check and this point.
+    """
+    if overwrite:
+        os.replace(src, dst)
+        return
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise EnvaultError(f"{dst} appeared while decrypting; not overwriting it.") from None
+    except OSError:
+        # Filesystem without hard links (FAT, some network mounts): fall back
+        # to check-then-rename, which is racy but still refuses a known file.
+        if dst.exists():
+            raise EnvaultError(f"{dst} appeared while decrypting; not overwriting it.") from None
+        os.replace(src, dst)
+        return
+    src.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +805,7 @@ def rotate_key(
                 tmp_pt,
                 expected_sha256=record.sha256_hash,
                 region=region,
-                allowed_account_ids=account_ids or None,
+                allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
             )
             tmp_dl.unlink(missing_ok=True)

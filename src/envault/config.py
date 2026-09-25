@@ -9,13 +9,8 @@ from botocore.config import Config as BotoConfig
 # Shared boto3 client config:
 # - Explicit timeouts prevent indefinite hangs under partial network failure
 # - Retries disabled at boto3 level — tenacity handles retries at the application layer
-#   to avoid compounding (boto3 5x * tenacity 3x = 15x amplification)
-#
-# Every tenacity @retry in this package sets reraise=True. Without it, exhausting
-# the attempts raises tenacity.RetryError instead of the underlying error, which
-# slips past every `except ClientError` / `except BotoCoreError` handler in the
-# CLI and surfaces as a traceback — skipping the error message and the cleanup
-# those handlers exist to perform.
+#   to avoid compounding (boto3 5x * tenacity 3x = 15x amplification);
+#   see envault.retry.aws_retry
 boto_config = BotoConfig(
     connect_timeout=5,
     read_timeout=30,

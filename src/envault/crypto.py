@@ -19,7 +19,6 @@ from aws_encryption_sdk import (
 )
 from aws_encryption_sdk.exceptions import AWSEncryptionSDKClientError
 from cryptography.exceptions import InvalidTag
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from envault.config import boto_config
 from envault.exceptions import (
@@ -29,6 +28,7 @@ from envault.exceptions import (
     EncryptionContextMismatchError,
 )
 from envault.fileutils import best_effort_delete
+from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
 
@@ -117,12 +117,7 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    reraise=True,
-    retry=retry_if_not_exception_type(ConfigurationError),
-)
+@aws_retry(never=(ConfigurationError, OSError))
 def encrypt_file(
     input_path: Path,
     key_id: str,
@@ -326,18 +321,14 @@ def decrypt_to_stream(
     )
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    reraise=True,
-    retry=retry_if_not_exception_type(
-        (
-            ConfigurationError,
-            ChecksumMismatchError,
-            DecryptionError,
-            EncryptionContextMismatchError,
-        )
-    ),
+@aws_retry(
+    never=(
+        ConfigurationError,
+        ChecksumMismatchError,
+        DecryptionError,
+        EncryptionContextMismatchError,
+        OSError,
+    )
 )
 def decrypt_file(
     input_path: Path,
