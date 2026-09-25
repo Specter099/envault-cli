@@ -77,11 +77,11 @@ All config via environment variables — no config files with secrets.
 envault encrypt INPUT_PATH [--tag KEY=VALUE]... [--force]
 
 # Run a command with secrets supplied in memory, never on disk
-envault exec -s IDENTIFIER=VAR [-f IDENTIFIER=VAR]... [--clean-env] -- COMMAND [ARGS]...
+envault exec -s IDENTIFIER=VAR [-f IDENTIFIER=VAR]... [--clean-env] [--latest] -- COMMAND [ARGS]...
 
 # Decrypt by filename or SHA256 hash
 # -o takes an existing directory or a file path; existing files need --force
-envault decrypt IDENTIFIER [-o OUTPUT_DIR|OUTPUT_FILE] [--version N] [--force]
+envault decrypt IDENTIFIER [-o OUTPUT_DIR|OUTPUT_FILE] [--version N] [--force] [--latest]
 
 # List all encrypted/decrypted files
 envault status [--state encrypted|decrypted|all]
@@ -96,7 +96,7 @@ envault audit [--since YYYY-MM-DD] [--file SHA256]
 envault dashboard
 
 # Re-encrypt all files with a new KMS key
-envault rotate-key --new-key-id alias/new-key [--dry-run]
+envault rotate-key --new-key-id alias/new-key [--dry-run] [--latest]
 
 # Migrate from legacy output.json (NDJSON format)
 envault migrate FROM_PATH [--dry-run]
@@ -157,6 +157,8 @@ cd infra/cdk
 pip install -r requirements.txt
 cdk synth
 cdk deploy --parameters AlertEmailParam=ops@example.com
+# Optional: grant rotate-key access to additional CMKs (full key or alias ARNs)
+# cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123456789012:key/abcd
 ```
 
 ---

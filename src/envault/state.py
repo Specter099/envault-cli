@@ -61,7 +61,9 @@ class FileRecord:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Microseconds (not seconds) so last_updated can serve as a CAS token:
+    # two writers in the same wall-clock second must not share a token.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _today_str() -> str:

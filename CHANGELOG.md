@@ -33,10 +33,30 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `decrypt -o FILE` writes to `FILE` instead of `FILE`'s parent directory.
 - CDK: non-current S3 versions are no longer moved to Glacier. Records pin a `VersionId`,
   and an archived version cannot be read.
+- KMS key policy no longer denies `DisableKey`, so a compromised CMK can be frozen during
+  incident response without a CloudFormation change.
+- IAM: unused `s3:ListBucket` removed; S3 object actions scoped to `encrypted/*`;
+  `sts:GetCallerIdentity` granted for audit attribution.
+- Ops SNS topic is encrypted with the envault CMK.
+- S3 downloads require a content-addressed key (`encrypted/{aa}/{sha256}/{name}.encrypted`)
+  so a poisoned DynamoDB `s3_key` cannot fetch an arbitrary object.
+- Directory-symlink trees are skipped by `os.walk(followlinks=False)` during encrypt.
+- `migrate` confines input paths to the import directory and rejects per-component
+  symlinks; non-object NDJSON lines are per-record errors.
+- `rotate-key` calls `DescribeKey` on the target CMK (must be `Enabled`) before any
+  download or decrypt.
+- `last_updated` CAS tokens use microsecond timestamps.
+- `exec` warns when the child will inherit `AWS_*` credentials; `--clean-env` remains
+  opt-in. In-memory secret buffers are wiped if `--secret` rejects a non-UTF-8 or NUL value.
+- Encrypt/decrypt close leftover fds if the SDK stream fails before `fdopen`.
+- Empty `s3_version_id` no longer fetches the latest S3 object. `decrypt` / `exec` /
+  `rotate-key` require `--latest` for migrated records.
 
 ### Added
 
 - CDK `AlertEmailParam` subscribes an email address to the operational alarm topic.
+- CDK context `additional_kms_key_arns` grants extra rotation-target CMKs without a
+  wildcard IAM grant.
 
 ### Removed
 

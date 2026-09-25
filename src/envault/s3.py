@@ -21,6 +21,23 @@ logger = logging.getLogger(__name__)
 # belongs in the streaming `decrypt` path, not `exec`.
 MAX_IN_MEMORY_BYTES = 16 * 1024 * 1024
 
+# Content-addressed object keys: encrypted/{sha256[:2]}/{sha256}/{name}.encrypted
+_S3_KEY_RE = re.compile(r"^encrypted/([0-9a-f]{2})/([0-9a-f]{64})/[^/]+\.encrypted$")
+
+
+def assert_s3_key_matches_hash(s3_key: str, sha256_hash: str) -> None:
+    """Reject DynamoDB-sourced keys that are not this file's content-addressed path.
+
+    A poisoned ``s3_key`` must not be able to make the CLI fetch an arbitrary
+    object from the bucket (or a different file's ciphertext).
+    """
+    match = _S3_KEY_RE.fullmatch(s3_key)
+    if not match or match.group(1) != sha256_hash[:2] or match.group(2) != sha256_hash:
+        raise EnvaultError(
+            "Refusing to fetch S3 object: key is not the content-addressed "
+            f"path for hash {sha256_hash[:16]}...."
+        )
+
 
 class S3Store:
     """Handles upload and download of encrypted files to/from S3."""
@@ -33,7 +50,9 @@ class S3Store:
     # An oversized object is a deterministic rejection: retrying only triples
     # the S3 read cost before failing with the same answer.
     @aws_retry(never=(EnvaultError,))
-    def download_to_memory(self, s3_key: str, version_id: str = "") -> io.BytesIO:
+    def download_to_memory(
+        self, s3_key: str, version_id: str = "", *, allow_latest: bool = False
+    ) -> io.BytesIO:
         """Fetch an encrypted object into memory instead of onto disk.
 
         Used by :command:`envault exec`, where the whole point is that nothing
@@ -44,24 +63,22 @@ class S3Store:
 
         Args:
             s3_key: S3 object key.
-            version_id: Optional S3 version ID for point-in-time recovery.
+            version_id: S3 version ID for point-in-time recovery. Required
+                unless ``allow_latest`` is true (migrated records).
+            allow_latest: If true, an empty ``version_id`` fetches the current
+                object. Default is to refuse — latest is not the recorded version.
 
         Returns:
             A BytesIO positioned at the start of the ciphertext.
 
         Raises:
-            EnvaultError: If the object is larger than MAX_IN_MEMORY_BYTES.
+            EnvaultError: If the object is larger than MAX_IN_MEMORY_BYTES, or if
+                ``version_id`` is empty and ``allow_latest`` is false.
         """
+        self._require_version_id(s3_key, version_id, allow_latest)
         kwargs: dict[str, Any] = {"Bucket": self._bucket, "Key": s3_key}
         if version_id:
             kwargs["VersionId"] = version_id
-        else:
-            logger.warning(
-                "Fetching S3 object without VersionId — reading latest version. "
-                "If the object was overwritten since encryption, "
-                "the wrong ciphertext may be retrieved.",
-                extra={"bucket": self._bucket, "key": s3_key},
-            )
 
         response = self._s3.get_object(**kwargs)
         length = int(response.get("ContentLength", 0))
@@ -117,26 +134,47 @@ class S3Store:
         )
         return version_id
 
-    @aws_retry()
-    def download_file(self, s3_key: str, local_path: Path, version_id: str = "") -> None:
+    def _require_version_id(self, s3_key: str, version_id: str, allow_latest: bool) -> None:
+        """Refuse an unversioned fetch unless the caller opted into latest."""
+        if version_id:
+            return
+        if not allow_latest:
+            raise EnvaultError(
+                f"Refusing to fetch s3://{self._bucket}/{s3_key} without a VersionId. "
+                "That would download the current object, which may not be the ciphertext "
+                "recorded at encryption time. Pass --latest for migrated records."
+            )
+        logger.warning(
+            "Fetching S3 object without VersionId — reading latest version. "
+            "If the object was overwritten since encryption, "
+            "the wrong ciphertext may be retrieved.",
+            extra={"bucket": self._bucket, "key": s3_key},
+        )
+
+    @aws_retry(never=(EnvaultError,))
+    def download_file(
+        self,
+        s3_key: str,
+        local_path: Path,
+        version_id: str = "",
+        *,
+        allow_latest: bool = False,
+    ) -> None:
         """Download a file from S3.
 
         Args:
             s3_key: S3 object key.
             local_path: Destination path on disk.
-            version_id: Optional S3 version ID for point-in-time recovery.
+            version_id: S3 version ID for point-in-time recovery. Required
+                unless ``allow_latest`` is true.
+            allow_latest: If true, an empty ``version_id`` fetches the current
+                object. Default is to refuse.
         """
+        self._require_version_id(s3_key, version_id, allow_latest)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         extra_args: dict[str, str] = {}
         if version_id:
             extra_args["VersionId"] = version_id
-        else:
-            logger.warning(
-                "Downloading S3 object without VersionId — fetching latest version. "
-                "If the object was overwritten since encryption, "
-                "the wrong ciphertext may be retrieved.",
-                extra={"bucket": self._bucket, "key": s3_key},
-            )
 
         logger.info(
             "Downloading from S3",

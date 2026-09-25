@@ -19,6 +19,32 @@ from cdk_nag import NagSuppressions
 from constructs import Construct
 
 
+def _additional_kms_key_arns(scope: Construct) -> list[str]:
+    """Optional extra KMS key ARNs for ``rotate-key --new-key-id``.
+
+    Pass at deploy time::
+
+        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123:key/abc
+
+    Multiple ARNs may be comma-separated. Values that are not KMS ARNs are
+    rejected at synth so a typo cannot widen the policy to an unrelated resource.
+    """
+    raw = scope.node.try_get_context("additional_kms_key_arns") or ""
+    arns = [a.strip() for a in str(raw).split(",") if a.strip()]
+    for arn in arns:
+        is_kms_arn = (
+            arn.startswith("arn:")
+            and ":kms:" in arn
+            and (":key/" in arn or ":alias/" in arn)
+        )
+        if not is_kms_arn:
+            raise ValueError(
+                "additional_kms_key_arns must be comma-separated KMS key or alias ARNs, "
+                f"got {arn!r}"
+            )
+    return arns
+
+
 class EnvaultStack(Stack):
     """Provisions all AWS resources required by envault.
 
@@ -81,13 +107,15 @@ class EnvaultStack(Stack):
         )
 
         # Deny key deletion for all principals — requires removing this
-        # policy statement first (break-glass procedure).
+        # policy statement first (break-glass procedure). DisableKey is
+        # intentionally allowed so operators can freeze a compromised CMK
+        # during incident response without a CloudFormation change.
         encryption_key.add_to_resource_policy(
             iam.PolicyStatement(
                 sid="DenyScheduleKeyDeletion",
                 effect=iam.Effect.DENY,
                 principals=[iam.AnyPrincipal()],
-                actions=["kms:ScheduleKeyDeletion", "kms:DisableKey"],
+                actions=["kms:ScheduleKeyDeletion"],
                 resources=["*"],
             )
         )
@@ -195,7 +223,7 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsEnvelopeEncryption",
                     actions=["kms:GenerateDataKey", "kms:Decrypt"],
-                    resources=[encryption_key.key_arn],
+                    resources=[encryption_key.key_arn, *_additional_kms_key_arns(self)],
                     conditions={
                         "StringEquals": {
                             "kms:EncryptionContext:purpose": ["envault-backup", "backup"]
@@ -220,7 +248,7 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsDescribeKey",
                     actions=["kms:DescribeKey"],
-                    resources=[encryption_key.key_arn],
+                    resources=[encryption_key.key_arn, *_additional_kms_key_arns(self)],
                 ),
                 iam.PolicyStatement(
                     sid="S3EncryptedObjects",
@@ -228,9 +256,8 @@ class EnvaultStack(Stack):
                         "s3:PutObject",
                         "s3:GetObject",
                         "s3:GetObjectVersion",
-                        "s3:ListBucket",
                     ],
-                    resources=[bucket.bucket_arn, f"{bucket.bucket_arn}/*"],
+                    resources=[f"{bucket.bucket_arn}/encrypted/*"],
                 ),
                 iam.PolicyStatement(
                     sid="DynamoDBStateAccess",
@@ -240,6 +267,11 @@ class EnvaultStack(Stack):
                         "dynamodb:Query",
                     ],
                     resources=[table.table_arn, f"{table.table_arn}/index/*"],
+                ),
+                iam.PolicyStatement(
+                    sid="StsCallerIdentity",
+                    actions=["sts:GetCallerIdentity"],
+                    resources=["*"],
                 ),
             ],
         )
@@ -253,12 +285,12 @@ class EnvaultStack(Stack):
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "S3 object-level actions (PutObject, GetObject) require"
-                        " bucket/* wildcard. Access is scoped to the single"
-                        " envault bucket."
+                        "S3 object-level actions require a key prefix wildcard."
+                        " Access is scoped to encrypted/* on the single envault"
+                        " bucket — the CLI never lists or reads other prefixes."
                     ),
                     "applies_to": [
-                        f"Resource::<{bucket.node.id}.Arn>/*",
+                        f"Resource::<{bucket.node.id}.Arn>/encrypted/*",
                     ],
                 },
                 {
@@ -266,11 +298,20 @@ class EnvaultStack(Stack):
                     "reason": (
                         "DynamoDB GSI queries require table/index/* wildcard."
                         " Access is scoped to the single envault table and"
-                        " only allows read/write operations."
+                        " only allows PutItem/GetItem/Query."
                     ),
                     "applies_to": [
                         f"Resource::<{table.node.id}.Arn>/index/*",
                     ],
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "sts:GetCallerIdentity does not support resource-level"
+                        " authorization; Resource * is required by the API."
+                        " Used only to attribute audit events to the caller."
+                    ),
+                    "applies_to": ["Resource::*"],
                 },
             ],
         )
@@ -283,6 +324,7 @@ class EnvaultStack(Stack):
             "EnvaultOpsTopic",
             display_name="envault operational alerts",
             enforce_ssl=True,
+            master_key=encryption_key,
         )
 
         # DynamoDB throttle alarm

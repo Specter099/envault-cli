@@ -468,6 +468,24 @@ def test_summary_returns_last_activity_timestamp():
 
 
 @mock_aws
+def test_summary_last_activity_pages_past_event_items():
+    """Event items share the GSI; last_activity must still find the CURRENT record."""
+    store = _create_table()
+    record = _make_record(
+        sha256_hash="a" * 64,
+        current_state=ENCRYPTED,
+        encrypted_at="2026-03-03T10:00:00+00:00",
+    )
+    store.put_current_state(record)
+    for i in range(5):
+        store.put_event(record, operation="ENCRYPT", correlation_id=f"corr-{i}")
+
+    summary = store.summary()
+    assert summary["last_activity"] != "\u2014"
+    assert "T" in summary["last_activity"]
+
+
+@mock_aws
 def test_summary_counts_exclude_events():
     """summary() total/encrypted/decrypted counts must not double-count EVENT records."""
     store = _create_table()
