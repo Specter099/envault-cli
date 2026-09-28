@@ -737,7 +737,7 @@ def test_decrypt_aws_error_shows_friendly_message(tmp_path: Path) -> None:
 
 
 @mock_aws
-def test_rotate_key_end_to_end(tmp_path: Path) -> None:
+def test_rotate_key_end_to_end() -> None:
     """rotate-key: mocked decrypt + re-encrypt, real DynamoDB + S3."""
     _create_table()
     _create_bucket()
@@ -786,7 +786,7 @@ _SHM = Path("/dev/shm")  # noqa: S108
 
 @pytest.mark.skipif(not _SHM.is_dir(), reason="needs a RAM-backed /dev/shm")
 @mock_aws
-def test_rotate_key_keeps_plaintext_off_disk(tmp_path: Path) -> None:
+def test_rotate_key_keeps_plaintext_off_disk() -> None:
     """Rotation plaintext goes to a private RAM-backed dir, which is removed afterwards."""
     _create_table()
     _create_bucket()
@@ -1046,7 +1046,7 @@ def test_decrypt_reports_audit_write_failure(
 
 @mock_aws
 def test_rotate_key_logs_recovery_info_on_state_write_failure(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """If DynamoDB write fails after S3 re-upload during rotation, log recovery info."""
     import logging
@@ -1095,7 +1095,7 @@ def test_rotate_key_logs_recovery_info_on_state_write_failure(
 
 @mock_aws
 def test_rotate_key_recovery_log_records_old_key(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The recovery log must record the PREVIOUS key as old_kms_key.
 
@@ -1150,7 +1150,7 @@ def test_rotate_key_recovery_log_records_old_key(
 
 
 @mock_aws
-def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
+def test_rotate_key_mkstemp_failure_is_handled() -> None:
     """A temp-file creation failure must surface as a per-file error message,
     not an UnboundLocalError from the cleanup block referencing unset paths."""
     _create_table()
@@ -1546,7 +1546,7 @@ def test_audit_ttl_must_be_positive() -> None:
 
 
 @mock_aws
-def test_rotate_key_covers_records_left_decrypted_by_old_versions(tmp_path: Path) -> None:
+def test_rotate_key_covers_records_left_decrypted_by_old_versions() -> None:
     """C-2: a record stuck in DECRYPTED still has ciphertext in S3 and must rotate."""
     _create_table()
     _create_bucket()
