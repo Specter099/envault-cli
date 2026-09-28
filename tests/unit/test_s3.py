@@ -77,6 +77,43 @@ def test_download_specific_version(tmp_path: Path):
 
 
 @mock_aws
+def test_upload_empty_version_id_is_refused(tmp_path: Path):
+    """An unversioned PutObject response must not be stored as a successful encrypt."""
+    from envault.exceptions import EnvaultError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+
+    p = tmp_path / "file.enc"
+    p.write_bytes(b"ciphertext")
+    store = S3Store(bucket=BUCKET, region=REGION)
+
+    with patch.object(store._s3, "put_object", return_value={}):
+        with pytest.raises(EnvaultError, match="no VersionId"):
+            store.upload_file(local_path=p, s3_key="encrypted/aa/aaa.../file.enc")
+
+
+@mock_aws
+def test_download_refuses_symlink_destination(tmp_path: Path):
+    """download_file must not write ciphertext through a symlink."""
+    from envault.exceptions import EnvaultError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    s3_client.put_object(Bucket=BUCKET, Key="encrypted/aa/aaa.../file.enc", Body=b"data")
+
+    target = tmp_path / "real-file"
+    target.write_bytes(b"keep-me")
+    link = tmp_path / "link.enc"
+    link.symlink_to(target)
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with pytest.raises(EnvaultError, match="symlink"):
+        store.download_file("encrypted/aa/aaa.../file.enc", link, allow_latest=True)
+    assert target.read_bytes() == b"keep-me"
+
+
+@mock_aws
 def test_download_empty_version_id_is_refused(tmp_path: Path):
     """download_file with empty version_id must fail closed."""
     from envault.exceptions import EnvaultError
