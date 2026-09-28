@@ -282,12 +282,25 @@ def test_best_effort_delete_logs_warning_on_oserror(
     p.write_bytes(b"data")
 
     with (
-        patch.object(Path, "open", side_effect=OSError("Permission denied")),
+        patch("envault.fileutils.os.open", side_effect=OSError("Permission denied")),
         caplog.at_level(logging.WARNING, logger="envault.fileutils"),
     ):
         _best_effort_delete(p)
 
     assert any("best-effort" in r.message.lower() for r in caplog.records)
+
+
+def test_best_effort_delete_does_not_follow_symlink(tmp_path: Path) -> None:
+    """A swapped-in symlink must not redirect the zero-overwrite at another file."""
+    target = tmp_path / "victim.bin"
+    target.write_bytes(b"KEEP ME")
+    link = tmp_path / "staging.part"
+    link.symlink_to(target)
+
+    _best_effort_delete(link)
+
+    assert not link.exists()
+    assert target.read_bytes() == b"KEEP ME"
 
 
 def test_parse_tags_valid() -> None:
@@ -2003,6 +2016,18 @@ def test_rotate_key_preflight_rejects_disabled_key() -> None:
     assert result.exit_code != 0
     assert decrypt_mock.call_count == 0
     assert "not enabled" in result.output.lower() or "key state" in result.output.lower()
+
+
+def test_parse_entry_rejects_non_string_encryption_context(tmp_path: Path) -> None:
+    """Non-string context values must not be stored (they skip AAD matching)."""
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"x")
+    entry = _make_entry(str(plaintext))
+    header = entry["header"]
+    assert isinstance(header, dict)
+    header["encryption_context"] = {"purpose": 1}
+    with pytest.raises(MigrationError, match="must be strings"):
+        _parse_output_json_entry(entry, import_root=tmp_path)
 
 
 def test_parse_entry_null_header_does_not_crash(tmp_path: Path) -> None:

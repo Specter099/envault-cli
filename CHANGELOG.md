@@ -11,6 +11,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- S3 upload fails closed when PutObject returns no VersionId (unversioned bucket), so
+  encrypt cannot record a pin that decrypt would later have to fetch with `--latest`.
+- `best_effort_delete` opens with `O_NOFOLLOW` so a swapped-in symlink cannot redirect
+  the plaintext zero-overwrite at another file.
+- CDK `additional_kms_key_arns` rejects wildcards and requires a 12-digit account id.
+- `migrate` rejects encryption-context keys/values that are not strings.
+- Discovery partition mapping covers AWS ISO regions (`aws-iso`, `aws-iso-b/e/f`).
+- Dependabot now tracks `infra/cdk/requirements.txt`; CI pins `pip-audit` to `>=2.7,<3`.
 - `decrypt` fails closed on audit: the DECRYPT event is written before verified plaintext
   is moved into place, and the plaintext is discarded if that write fails (previously the
   file was left on disk with a warning).
