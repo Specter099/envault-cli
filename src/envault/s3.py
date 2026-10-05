@@ -101,7 +101,7 @@ class S3Store:
         )
         return io.BytesIO(body)
 
-    @aws_retry()
+    @aws_retry(never=(EnvaultError,))
     def upload_file(self, local_path: Path, s3_key: str) -> str:
         """Upload a file to S3 and return the version ID atomically.
 
@@ -113,7 +113,12 @@ class S3Store:
             s3_key: S3 object key.
 
         Returns:
-            The S3 VersionId of the uploaded object (empty string if bucket not versioned).
+            The S3 VersionId of the uploaded object.
+
+        Raises:
+            EnvaultError: If PutObject returns no VersionId (bucket is not versioned).
+                Decrypt pins a specific version; an unversioned bucket would force
+                ``--latest`` and silently follow later overwrites.
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
@@ -127,7 +132,13 @@ class S3Store:
                 put_kwargs["ServerSideEncryption"] = "aws:kms"
                 put_kwargs["SSEKMSKeyId"] = self._kms_key_id
             response = self._s3.put_object(**put_kwargs)
-        version_id: str = response.get("VersionId", "")
+        version_id = str(response.get("VersionId") or "")
+        if not version_id:
+            raise EnvaultError(
+                f"S3 PutObject returned no VersionId for s3://{self._bucket}/{s3_key}. "
+                "Enable versioning on the bucket (the envault CDK stack does this) so "
+                "decrypt can pin the exact object that was uploaded."
+            )
         logger.info(
             "Upload complete",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
@@ -172,6 +183,11 @@ class S3Store:
         """
         self._require_version_id(s3_key, version_id, allow_latest)
         local_path.parent.mkdir(parents=True, exist_ok=True)
+        if local_path.is_symlink():
+            raise EnvaultError(
+                f"Refusing to download to {local_path}: path is a symlink. "
+                "Ciphertext must be written to a regular file."
+            )
         extra_args: dict[str, str] = {}
         if version_id:
             extra_args["VersionId"] = version_id

@@ -17,21 +17,32 @@ def best_effort_delete(path: Path) -> None:
     filesystems (APFS, Btrfs, ZFS), SSD wear-levelling, and journaling
     filesystems may retain copies of the original data.
 
+    Opens with ``O_NOFOLLOW`` so a swapped-in symlink cannot redirect the
+    overwrite at another file. If the path is a symlink, the target is left
+    untouched and only the symlink is unlinked.
+
     Does nothing if the file does not exist.
     """
+    fd = -1
     try:
-        size = path.stat().st_size
-        chunk = b"\x00" * min(65536, size)
-        with path.open("r+b") as f:
-            remaining = size
-            while remaining > 0:
-                to_write = min(len(chunk), remaining)
-                f.write(chunk[:to_write])
-                remaining -= to_write
-            f.flush()
-            os.fsync(f.fileno())
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags)
+        size = os.fstat(fd).st_size
+        chunk = b"\x00" * min(65536, max(size, 0))
+        remaining = size
+        while remaining > 0:
+            to_write = min(len(chunk), remaining)
+            written = os.write(fd, chunk[:to_write])
+            remaining -= written
+        os.fsync(fd)
     except FileNotFoundError:
         return
     except OSError as exc:
         logger.warning("Best-effort overwrite failed for %s: %s", path, exc)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     path.unlink(missing_ok=True)
