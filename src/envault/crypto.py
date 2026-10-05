@@ -229,11 +229,21 @@ def _discovery_key_provider(
 
 
 def _partition_for_region(region: str) -> str:
-    """Map an AWS region to its partition so GovCloud and China aren't excluded."""
+    """Map an AWS region to its partition so GovCloud, China, and ISO aren't excluded."""
     if region.startswith("us-gov-"):
         return "aws-us-gov"
     if region.startswith("cn-"):
         return "aws-cn"
+    # us-iso-east-1 → iso; us-isob-east-1 → isob; eu-isoe-west-1 → isoe
+    token = region.split("-")[1] if "-" in region else ""
+    iso_partitions = {
+        "iso": "aws-iso",
+        "isob": "aws-iso-b",
+        "isoe": "aws-iso-e",
+        "isof": "aws-iso-f",
+    }
+    if token in iso_partitions:
+        return iso_partitions[token]
     return "aws"
 
 
