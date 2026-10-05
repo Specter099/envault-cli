@@ -608,7 +608,7 @@ def dashboard(table: str, region: str) -> None:
         t.add_row("Total tracked files:", str(summary["total"]))
         t.add_row("Currently encrypted:", f"[green]{summary['encrypted']}[/green]")
         t.add_row("Currently decrypted:", f"[yellow]{summary['decrypted']}[/yellow]")
-        t.add_row("Last activity:", summary["last_activity"])
+        t.add_row("Last activity:", escape(str(summary["last_activity"])))
         console.print(t)
         console.print()
 
@@ -701,6 +701,15 @@ def _parse_output_json_entry(
     enc_context = header.get("encryption_context", {}) or {}
     if not isinstance(enc_context, dict):
         raise MigrationError("encryption_context must be a JSON object")
+    for ctx_key, ctx_value in enc_context.items():
+        if not isinstance(ctx_key, str) or not isinstance(ctx_value, str):
+            raise MigrationError("encryption_context keys and values must be strings")
+    if not enc_context:
+        logger.warning(
+            "Migrating record with empty encryption_context; decrypt will not bind "
+            "purpose/sha256/file_name/kms_key_alias (checksum still verified): %s",
+            input_path,
+        )
 
     if not plaintext_path.exists():
         logger.warning("Plaintext file not found for migration, skipping: %s", input_path)

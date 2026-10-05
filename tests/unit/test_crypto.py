@@ -400,6 +400,10 @@ def test_partition_for_region():
     assert _partition_for_region("eu-west-2") == "aws"
     assert _partition_for_region("us-gov-west-1") == "aws-us-gov"
     assert _partition_for_region("cn-north-1") == "aws-cn"
+    assert _partition_for_region("us-iso-east-1") == "aws-iso"
+    assert _partition_for_region("us-isob-east-1") == "aws-iso-b"
+    assert _partition_for_region("eu-isoe-west-1") == "aws-iso-e"
+    assert _partition_for_region("us-isof-east-1") == "aws-iso-f"
 
 
 def test_decrypt_missing_ciphertext_cleans_temp(tmp_path: Path) -> None:

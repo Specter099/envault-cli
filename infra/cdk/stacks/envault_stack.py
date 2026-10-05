@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import aws_cdk as cdk
 from aws_cdk import (
     Duration,
@@ -18,28 +20,32 @@ from aws_cdk import aws_sns as sns
 from cdk_nag import NagSuppressions
 from constructs import Construct
 
+# Full key/alias ARN with a 12-digit account. Wildcards, missing accounts, and
+# non-KMS services are rejected so a typo cannot widen GenerateDataKey/Decrypt.
+_KMS_KEY_OR_ALIAS_ARN = re.compile(
+    r"^arn:aws(?:-us-gov|-cn|-iso(?:-[bef])?)?:kms:[a-z0-9-]+:[0-9]{12}:"
+    r"(?:key/[A-Za-z0-9-]+|alias/[A-Za-z0-9/_-]+)$"
+)
+
 
 def _additional_kms_key_arns(scope: Construct) -> list[str]:
     """Optional extra KMS key ARNs for ``rotate-key --new-key-id``.
 
     Pass at deploy time::
 
-        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123:key/abc
+        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123456789012:alias/next
 
-    Multiple ARNs may be comma-separated. Values that are not KMS ARNs are
-    rejected at synth so a typo cannot widen the policy to an unrelated resource.
+    Multiple ARNs may be comma-separated. Values that are not KMS key/alias ARNs
+    with a 12-digit account (or that contain wildcards) are rejected at synth so
+    a typo cannot widen the policy to an unrelated resource.
     """
     raw = scope.node.try_get_context("additional_kms_key_arns") or ""
     arns = [a.strip() for a in str(raw).split(",") if a.strip()]
     for arn in arns:
-        is_kms_arn = (
-            arn.startswith("arn:")
-            and ":kms:" in arn
-            and (":key/" in arn or ":alias/" in arn)
-        )
-        if not is_kms_arn:
+        if "*" in arn or "?" in arn or _KMS_KEY_OR_ALIAS_ARN.fullmatch(arn) is None:
             raise ValueError(
-                "additional_kms_key_arns must be comma-separated KMS key or alias ARNs, "
+                "additional_kms_key_arns must be comma-separated KMS key or alias ARNs "
+                "with a 12-digit account id and no wildcards, "
                 f"got {arn!r}"
             )
     return arns
