@@ -13,6 +13,7 @@ import boto3
 
 from envault.config import boto_config
 from envault.exceptions import EnvaultError
+from envault.fileutils import open_nofollow
 from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
@@ -101,7 +102,7 @@ class S3Store:
         )
         return io.BytesIO(body)
 
-    @aws_retry()
+    @aws_retry(never=(EnvaultError,))
     def upload_file(self, local_path: Path, s3_key: str) -> str:
         """Upload a file to S3 and return the version ID atomically.
 
@@ -113,7 +114,12 @@ class S3Store:
             s3_key: S3 object key.
 
         Returns:
-            The S3 VersionId of the uploaded object (empty string if bucket not versioned).
+            The S3 VersionId of the uploaded object.
+
+        Raises:
+            EnvaultError: If PutObject returns no VersionId (bucket is not versioned).
+                Decrypt pins a specific version; an unversioned bucket would force
+                ``--latest`` and silently follow later overwrites.
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
         with local_path.open("rb") as f:
@@ -127,7 +133,13 @@ class S3Store:
                 put_kwargs["ServerSideEncryption"] = "aws:kms"
                 put_kwargs["SSEKMSKeyId"] = self._kms_key_id
             response = self._s3.put_object(**put_kwargs)
-        version_id: str = response.get("VersionId", "")
+        version_id = str(response.get("VersionId") or "")
+        if not version_id:
+            raise EnvaultError(
+                f"S3 PutObject returned no VersionId for s3://{self._bucket}/{s3_key}. "
+                "Enable versioning on the bucket (the envault CDK stack does this) so "
+                "decrypt can pin the exact object that was uploaded."
+            )
         logger.info(
             "Upload complete",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
@@ -162,6 +174,9 @@ class S3Store:
     ) -> None:
         """Download a file from S3.
 
+        Writes through an ``O_NOFOLLOW`` descriptor so a swapped-in symlink
+        cannot redirect ciphertext (or a later chmod) at another file.
+
         Args:
             s3_key: S3 object key.
             local_path: Destination path on disk.
@@ -180,13 +195,25 @@ class S3Store:
             "Downloading from S3",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
         )
-        self._s3.download_file(
-            self._bucket,
-            s3_key,
-            str(local_path),
-            ExtraArgs=extra_args if extra_args else None,
-        )
-        os.chmod(str(local_path), 0o600)
+        # O_NOFOLLOW closes the TOCTOU window of is_symlink() then write;
+        # fchmod on the fd cannot be redirected at a swapped-in target.
+        fd = open_nofollow(local_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as out:
+                fd = -1
+                self._s3.download_fileobj(
+                    self._bucket,
+                    s3_key,
+                    out,
+                    ExtraArgs=extra_args if extra_args else None,
+                )
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         logger.info("Download complete", extra={"local_path": str(local_path)})
 
     @staticmethod

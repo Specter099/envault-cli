@@ -26,8 +26,9 @@ from envault.exceptions import (
     ConfigurationError,
     DecryptionError,
     EncryptionContextMismatchError,
+    EnvaultError,
 )
-from envault.fileutils import best_effort_delete
+from envault.fileutils import best_effort_delete, open_nofollow
 from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
@@ -109,15 +110,25 @@ class _HashingReader:
 
 
 def sha256_file(path: Path) -> str:
-    """Compute SHA256 hash of a file's contents."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """Compute SHA256 hash of a file's contents.
+
+    Opens with ``O_NOFOLLOW`` so a swapped-in symlink cannot redirect the
+    hash (and later encrypt) at a file the operator did not select.
+    """
+    fd = open_nofollow(path, os.O_RDONLY)
+    try:
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
+                h.update(chunk)
+            return h.hexdigest()
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
-@aws_retry(never=(ConfigurationError, OSError))
+@aws_retry(never=(ConfigurationError, EnvaultError, OSError))
 def encrypt_file(
     input_path: Path,
     key_id: str,
@@ -145,8 +156,6 @@ def encrypt_file(
     Returns:
         EncryptResult with hash, size, algorithm, and message_id.
     """
-    file_size = input_path.stat().st_size
-
     logger.info("Encrypting file", extra={"input": str(input_path), "key_id": key_id})
 
     client = aws_encryption_sdk.EncryptionSDKClient(
@@ -159,10 +168,13 @@ def encrypt_file(
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-
+    in_fd = open_nofollow(input_path, os.O_RDONLY)
+    fd = -1
     try:
-        with input_path.open("rb") as raw_input:
+        file_size = os.fstat(in_fd).st_size
+        fd = open_nofollow(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(in_fd, "rb") as raw_input:
+            in_fd = -1  # ownership transferred; fdopen closes on exit
             hashing_reader = _HashingReader(raw_input)
             with client.stream(
                 source=hashing_reader,
@@ -206,8 +218,10 @@ def encrypt_file(
             output_path=output_path,
         )
     finally:
-        # If stream() (or anything before fdopen) fails, close the raw fd so
+        # If stream() (or anything before fdopen) fails, close the raw fds so
         # we neither leak descriptors nor leave an unlinked 0600 file open.
+        if in_fd >= 0:
+            os.close(in_fd)
         if fd >= 0:
             os.close(fd)
 
@@ -229,11 +243,21 @@ def _discovery_key_provider(
 
 
 def _partition_for_region(region: str) -> str:
-    """Map an AWS region to its partition so GovCloud and China aren't excluded."""
+    """Map an AWS region to its partition so GovCloud, China, and ISO aren't excluded."""
     if region.startswith("us-gov-"):
         return "aws-us-gov"
     if region.startswith("cn-"):
         return "aws-cn"
+    # us-iso-east-1 → iso; us-isob-east-1 → isob; eu-isoe-west-1 → isoe
+    token = region.split("-")[1] if "-" in region else ""
+    iso_partitions = {
+        "iso": "aws-iso",
+        "isob": "aws-iso-b",
+        "isoe": "aws-iso-e",
+        "isof": "aws-iso-f",
+    }
+    if token in iso_partitions:
+        return iso_partitions[token]
     return "aws"
 
 

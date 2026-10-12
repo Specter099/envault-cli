@@ -97,6 +97,8 @@ envault dashboard
 
 # Re-encrypt all files with a new KMS key
 envault rotate-key --new-key-id alias/new-key [--dry-run] [--latest]
+# Rotation is not revocation: prior S3 versions stay readable under the old CMK
+# for 365 days. Disable the old key after a successful rotate-key.
 
 # Migrate from legacy output.json (NDJSON format)
 envault migrate FROM_PATH [--dry-run]
@@ -116,7 +118,7 @@ envault exec -s db.env=DATABASE_URL -- ./server
 # As a file, for programs that insist on a path (certs, keystores, kubeconfigs)
 envault exec -f server.pem=TLS_CERT -- curl --cert {TLS_CERT} https://api.internal
 
-# Both, from a minimal environment that drops your ambient AWS credentials
+# Prefer --clean-env so the child does not inherit ambient AWS credentials
 envault exec --clean-env -s db.env=DATABASE_URL -f server.pem=TLS_CERT -- ./server
 ```
 

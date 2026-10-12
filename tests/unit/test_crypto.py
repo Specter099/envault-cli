@@ -45,6 +45,34 @@ def test_sha256_file_correct_hash(tmp_path: Path) -> None:
     assert sha256_file(p) == expected
 
 
+def test_sha256_file_refuses_symlink(tmp_path: Path) -> None:
+    """A swapped-in symlink must not redirect the hash at another file."""
+    from envault.exceptions import EnvaultError
+
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"do-not-hash-me")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+
+    with pytest.raises(EnvaultError, match="symlink"):
+        sha256_file(link)
+
+
+def test_encrypt_file_refuses_symlink_input(tmp_path: Path) -> None:
+    """encrypt_file must not follow a symlink to plaintext the operator did not select."""
+    from envault.exceptions import EnvaultError
+
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"do-not-encrypt-me")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+    out = tmp_path / "out.enc"
+
+    with pytest.raises(EnvaultError, match="symlink"):
+        encrypt_file(link, "alias/x", {"purpose": "envault-backup"}, out)
+    assert not out.exists() or out.stat().st_size == 0
+
+
 def test_sha256_file_empty(tmp_path: Path) -> None:
     p = tmp_path / "empty.txt"
     p.write_bytes(b"")
@@ -400,6 +428,10 @@ def test_partition_for_region():
     assert _partition_for_region("eu-west-2") == "aws"
     assert _partition_for_region("us-gov-west-1") == "aws-us-gov"
     assert _partition_for_region("cn-north-1") == "aws-cn"
+    assert _partition_for_region("us-iso-east-1") == "aws-iso"
+    assert _partition_for_region("us-isob-east-1") == "aws-iso-b"
+    assert _partition_for_region("eu-isoe-west-1") == "aws-iso-e"
+    assert _partition_for_region("us-isof-east-1") == "aws-iso-f"
 
 
 def test_decrypt_missing_ciphertext_cleans_temp(tmp_path: Path) -> None:
