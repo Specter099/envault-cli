@@ -1639,6 +1639,54 @@ def test_rotate_key_dry_run_lists_legacy_decrypted_records() -> None:
 
 
 @mock_aws
+def test_dashboard_escapes_markup_in_last_activity() -> None:
+    """A poisoned last_activity timestamp must render literally, not as Rich style."""
+    _create_table()
+    runner = CliRunner()
+    with patch.object(
+        StateStore,
+        "summary",
+        return_value={
+            "total": 1,
+            "encrypted": 1,
+            "decrypted": 0,
+            "last_activity": "[bold red]pwned[/bold red]",
+        },
+    ):
+        result = runner.invoke(
+            main,
+            ["dashboard", "--table", TABLE_NAME, "--region", REGION],
+            env={**_CLI_ENV, "COLUMNS": "200"},
+        )
+    assert result.exit_code == 0, result.output
+    assert "[bold" in result.output
+    assert "pwned" in result.output
+
+
+@mock_aws
+def test_dashboard_survives_unmatched_markup_in_last_activity() -> None:
+    """Unbalanced Rich tags in last_activity must not abort the dashboard."""
+    _create_table()
+    runner = CliRunner()
+    with patch.object(
+        StateStore,
+        "summary",
+        return_value={
+            "total": 0,
+            "encrypted": 0,
+            "decrypted": 0,
+            "last_activity": "[/nope]",
+        },
+    ):
+        result = runner.invoke(
+            main,
+            ["dashboard", "--table", TABLE_NAME, "--region", REGION],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code == 0, result.output
+
+
+@mock_aws
 def test_status_escapes_markup_in_file_names() -> None:
     """A filename containing Rich markup must render literally, not as style."""
     _create_table()
@@ -2078,3 +2126,41 @@ def test_migrate_skips_non_object_json_and_continues(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Migrated 1" in result.output
     assert "errors 2" in result.output
+
+
+@mock_aws
+def test_migrate_continues_when_hash_refuses_symlink(tmp_path: Path) -> None:
+    """O_NOFOLLOW on one record must not abort the rest of the import."""
+    _create_table()
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    (import_root / "a.txt").write_bytes(b"a")
+    (import_root / "b.txt").write_bytes(b"b")
+    ndjson = import_root / "output.json"
+    ndjson.write_text(
+        json.dumps(_make_entry("a.txt")) + "\n" + json.dumps(_make_entry("b.txt")) + "\n"
+    )
+
+    def fake_sha(path: Path) -> str:
+        if path.name == "a.txt":
+            raise EnvaultError(f"Refusing to follow symlink: {path}")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    runner = CliRunner()
+    with patch("envault.cli.sha256_file", side_effect=fake_sha):
+        result = runner.invoke(
+            main,
+            [
+                "migrate",
+                str(ndjson),
+                "--table",
+                TABLE_NAME,
+                "--region",
+                REGION,
+                "--dry-run",
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code == 0, result.output
+    assert "Migrated 1" in result.output
+    assert "errors 1" in result.output

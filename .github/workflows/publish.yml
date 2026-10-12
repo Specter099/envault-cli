@@ -50,6 +50,7 @@ jobs:
           # CVE-2026-3219: pip itself (CI installer), not shipped in the wheel.
           # pygments>=2.20.0 is a direct pin in pyproject.toml (CVE-2026-4539).
           pip-audit --ignore-vuln CVE-2026-3219
+          pip-audit -r infra/cdk/requirements.txt --ignore-vuln CVE-2026-3219
 
   build:
     name: Build distribution

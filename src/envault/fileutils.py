@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 from pathlib import Path
 
+from envault.exceptions import EnvaultError
+
 logger = logging.getLogger(__name__)
+
+
+def open_nofollow(path: Path, flags: int, mode: int = 0o600) -> int:
+    """Open ``path`` without following a final-component symlink.
+
+    Raises:
+        EnvaultError: If ``path`` is a symlink (``ELOOP``).
+        OSError: Other open failures.
+    """
+    try:
+        return os.open(str(path), flags | getattr(os, "O_NOFOLLOW", 0), mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise EnvaultError(
+                f"Refusing to follow symlink: {path}. "
+                "Ciphertext and plaintext must be regular files."
+            ) from exc
+        raise
 
 
 def best_effort_delete(path: Path) -> None:

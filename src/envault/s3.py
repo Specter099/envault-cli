@@ -13,6 +13,7 @@ import boto3
 
 from envault.config import boto_config
 from envault.exceptions import EnvaultError
+from envault.fileutils import open_nofollow
 from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
@@ -173,6 +174,9 @@ class S3Store:
     ) -> None:
         """Download a file from S3.
 
+        Writes through an ``O_NOFOLLOW`` descriptor so a swapped-in symlink
+        cannot redirect ciphertext (or a later chmod) at another file.
+
         Args:
             s3_key: S3 object key.
             local_path: Destination path on disk.
@@ -183,11 +187,6 @@ class S3Store:
         """
         self._require_version_id(s3_key, version_id, allow_latest)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        if local_path.is_symlink():
-            raise EnvaultError(
-                f"Refusing to download to {local_path}: path is a symlink. "
-                "Ciphertext must be written to a regular file."
-            )
         extra_args: dict[str, str] = {}
         if version_id:
             extra_args["VersionId"] = version_id
@@ -196,13 +195,25 @@ class S3Store:
             "Downloading from S3",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
         )
-        self._s3.download_file(
-            self._bucket,
-            s3_key,
-            str(local_path),
-            ExtraArgs=extra_args if extra_args else None,
-        )
-        os.chmod(str(local_path), 0o600)
+        # O_NOFOLLOW closes the TOCTOU window of is_symlink() then write;
+        # fchmod on the fd cannot be redirected at a swapped-in target.
+        fd = open_nofollow(local_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as out:
+                fd = -1
+                self._s3.download_fileobj(
+                    self._bucket,
+                    s3_key,
+                    out,
+                    ExtraArgs=extra_args if extra_args else None,
+                )
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         logger.info("Download complete", extra={"local_path": str(local_path)})
 
     @staticmethod

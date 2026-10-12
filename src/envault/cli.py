@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import uuid
@@ -668,6 +669,8 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
             TypeError,
             AttributeError,
             MigrationError,
+            EnvaultError,
+            OSError,
         ) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
@@ -716,6 +719,14 @@ def _parse_output_json_entry(
         return None
 
     sha256_hash = sha256_file(plaintext_path)
+    # lstat after the O_NOFOLLOW hash: a swapped-in symlink must not supply
+    # the target's size as this record's file_size_bytes.
+    try:
+        st = plaintext_path.lstat()
+    except OSError as exc:
+        raise MigrationError(f"Could not stat migration input {input_path!r}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise MigrationError(f"Symlink not allowed in migration input: {input_path!r}")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     return FileRecord(
@@ -728,7 +739,7 @@ def _parse_output_json_entry(
         encryption_context=enc_context,
         algorithm=algorithm,
         message_id=message_id,
-        file_size_bytes=plaintext_path.stat().st_size,
+        file_size_bytes=st.st_size,
         tags={"source": "migrated"},
         encrypted_at=now,
         last_updated=now,

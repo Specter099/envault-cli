@@ -11,6 +11,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- `sha256_file` and `encrypt_file` open plaintext with `O_NOFOLLOW` so a swapped-in
+  symlink cannot redirect hashing or encryption at another file.
+- S3 `download_file` writes through an `O_NOFOLLOW` descriptor and `fchmod`s that fd
+  (closes the `is_symlink()`-then-write TOCTOU).
+- CI/publish `pip-audit` now also scans `infra/cdk/requirements.txt`.
+- `migrate` treats `EnvaultError`/`OSError` on one NDJSON line as a per-record error
+  (so an `O_NOFOLLOW` refusal cannot abort the rest of the import) and takes
+  `file_size_bytes` from `lstat` after the hash.
 - S3 upload fails closed when PutObject returns no VersionId (unversioned bucket), so
   encrypt cannot record a pin that decrypt would later have to fetch with `--latest`.
 - `best_effort_delete` opens with `O_NOFOLLOW` so a swapped-in symlink cannot redirect
