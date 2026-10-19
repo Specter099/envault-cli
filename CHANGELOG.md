@@ -11,6 +11,32 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- `open_nofollow` fails closed when `O_NOFOLLOW` is unavailable (non-Linux) instead of
+  silently following a final-component symlink.
+- `decrypt_file` and S3 `upload_file` open ciphertext with `O_NOFOLLOW`.
+- CDK `KmsViaStorageServices` includes `additional_kms_key_arns` so `rotate-key`
+  can SSE-KMS the re-upload with the new CMK after decrypting to a temp file.
+- `rotate-key` aborts a file (and does not replace S3) if the in-flight encrypt hash
+  does not match the record.
+- `sha256_file` and `encrypt_file` open plaintext with `O_NOFOLLOW` so a swapped-in
+  symlink cannot redirect hashing or encryption at another file.
+- S3 `download_file` writes through an `O_NOFOLLOW` descriptor and `fchmod`s that fd
+  (closes the `is_symlink()`-then-write TOCTOU).
+- CI/publish `pip-audit` now also scans `infra/cdk/requirements.txt`.
+- `migrate` treats `EnvaultError`/`OSError` on one NDJSON line as a per-record error
+  (so an `O_NOFOLLOW` refusal cannot abort the rest of the import) and takes
+  `file_size_bytes` from `lstat` after the hash.
+- S3 upload fails closed when PutObject returns no VersionId (unversioned bucket), so
+  encrypt cannot record a pin that decrypt would later have to fetch with `--latest`.
+- `best_effort_delete` opens with `O_NOFOLLOW` so a swapped-in symlink cannot redirect
+  the plaintext zero-overwrite at another file.
+- CDK `additional_kms_key_arns` rejects wildcards and requires a 12-digit account id.
+- `migrate` rejects encryption-context keys/values that are not strings.
+- Discovery partition mapping covers AWS ISO regions (`aws-iso`, `aws-iso-b/e/f`).
+- Dependabot now tracks `infra/cdk/requirements.txt`; CI pins `pip-audit` to `>=2.7,<3`.
+- Pin `pygments>=2.20.0` (transitive of Rich) and stop ignoring CVE-2026-4539.
+- `dashboard` escapes DynamoDB-sourced `last_activity` so a poisoned timestamp cannot
+  be interpreted as Rich markup.
 - `decrypt` fails closed on audit: the DECRYPT event is written before verified plaintext
   is moved into place, and the plaintext is discarded if that write fails (previously the
   file was left on disk with a warning).
