@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import uuid
@@ -608,7 +609,7 @@ def dashboard(table: str, region: str) -> None:
         t.add_row("Total tracked files:", str(summary["total"]))
         t.add_row("Currently encrypted:", f"[green]{summary['encrypted']}[/green]")
         t.add_row("Currently decrypted:", f"[yellow]{summary['decrypted']}[/yellow]")
-        t.add_row("Last activity:", summary["last_activity"])
+        t.add_row("Last activity:", escape(str(summary["last_activity"])))
         console.print(t)
         console.print()
 
@@ -668,6 +669,8 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
             TypeError,
             AttributeError,
             MigrationError,
+            EnvaultError,
+            OSError,
         ) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
@@ -701,12 +704,29 @@ def _parse_output_json_entry(
     enc_context = header.get("encryption_context", {}) or {}
     if not isinstance(enc_context, dict):
         raise MigrationError("encryption_context must be a JSON object")
+    for ctx_key, ctx_value in enc_context.items():
+        if not isinstance(ctx_key, str) or not isinstance(ctx_value, str):
+            raise MigrationError("encryption_context keys and values must be strings")
+    if not enc_context:
+        logger.warning(
+            "Migrating record with empty encryption_context; decrypt will not bind "
+            "purpose/sha256/file_name/kms_key_alias (checksum still verified): %s",
+            input_path,
+        )
 
     if not plaintext_path.exists():
         logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
         return None
 
     sha256_hash = sha256_file(plaintext_path)
+    # lstat after the O_NOFOLLOW hash: a swapped-in symlink must not supply
+    # the target's size as this record's file_size_bytes.
+    try:
+        st = plaintext_path.lstat()
+    except OSError as exc:
+        raise MigrationError(f"Could not stat migration input {input_path!r}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise MigrationError(f"Symlink not allowed in migration input: {input_path!r}")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     return FileRecord(
@@ -719,7 +739,7 @@ def _parse_output_json_entry(
         encryption_context=enc_context,
         algorithm=algorithm,
         message_id=message_id,
-        file_size_bytes=plaintext_path.stat().st_size,
+        file_size_bytes=st.st_size,
         tags={"source": "migrated"},
         encrypted_at=now,
         last_updated=now,
@@ -872,6 +892,13 @@ def rotate_key(
 
             new_ctx = new_key_config.build_encryption_context(record.sha256_hash, record.file_name)
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
+            if new_result.sha256_hash != record.sha256_hash:
+                raise EnvaultError(
+                    f"File {record.file_name!r} changed during rotation "
+                    f"(record hash {record.sha256_hash[:16]}… != "
+                    f"re-encrypted hash {new_result.sha256_hash[:16]}…). "
+                    "Aborting this file; ciphertext in S3 was not replaced."
+                )
             _best_effort_delete(tmp_pt)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
