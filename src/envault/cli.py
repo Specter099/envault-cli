@@ -37,6 +37,7 @@ from envault.exceptions import (
     StateConflictError,
 )
 from envault.fileutils import best_effort_delete as _best_effort_delete
+from envault.fileutils import open_nofollow
 from envault.identity import caller_arn
 from envault.isolation import CredentialFd, harden_process, wipe
 from envault.s3 import S3Store, assert_s3_key_matches_hash
@@ -634,7 +635,11 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
     imported = skipped = errors = 0
     import_root = from_path.parent.resolve()
 
-    lines = from_path.read_text().splitlines()
+    try:
+        lines = _read_text_nofollow(from_path).splitlines()
+    except EnvaultError as exc:
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+        sys.exit(1)
     for i, line in enumerate(track(lines, description="Migrating records..."), start=1):
         line = line.strip()
         if not line:
@@ -1367,6 +1372,21 @@ def _path_has_symlink_component(path: Path) -> bool:
         except OSError:
             return True
     return False
+
+
+def _read_text_nofollow(path: Path) -> str:
+    """Read UTF-8 text without following a final-component symlink."""
+    fd = open_nofollow(path, os.O_RDONLY)
+    try:
+        with os.fdopen(fd, encoding="utf-8") as f:
+            fd = -1
+            return f.read()
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _confine_migration_path(input_path: str, import_root: Path | None) -> Path:

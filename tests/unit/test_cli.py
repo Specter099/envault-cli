@@ -2230,3 +2230,32 @@ def test_migrate_continues_when_hash_refuses_symlink(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Migrated 1" in result.output
     assert "errors 1" in result.output
+
+
+@mock_aws
+def test_migrate_refuses_symlink_from_path(tmp_path: Path) -> None:
+    """FROM_PATH must not follow a swapped-in symlink to another file."""
+    _create_table()
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    real = import_root / "output.json"
+    real.write_text(json.dumps(_make_entry("secret.txt")) + "\n")
+    link = import_root / "alias.json"
+    link.symlink_to(real)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "migrate",
+            str(link),
+            "--table",
+            TABLE_NAME,
+            "--region",
+            REGION,
+            "--dry-run",
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code != 0
+    assert "symlink" in result.output.lower()

@@ -11,6 +11,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- `migrate` reads `FROM_PATH` with `O_NOFOLLOW` so a swapped-in symlink cannot redirect
+  the NDJSON import at another file.
+- CDK data bucket denies `s3:PutObject` without `aws:kms` SSE (missing header or AES256).
+- GitHub Actions checkouts set `persist-credentials: false` so later steps cannot reuse
+  `GITHUB_TOKEN` via the local git credential helper.
+- S3 buckets set `ObjectOwnership.BUCKET_OWNER_ENFORCED` (ACLs disabled).
 - `open_nofollow` fails closed when `O_NOFOLLOW` is unavailable (non-Linux) instead of
   silently following a final-component symlink.
 - `decrypt_file` and S3 `upload_file` open ciphertext with `O_NOFOLLOW`.

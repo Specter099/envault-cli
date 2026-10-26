@@ -1,8 +1,8 @@
 # Weekly Security Audit — envault-cli
 
 **Reviewer:** Automated weekly static security review
-**Date:** 2026-10-19
-**Codebase:** `main` @ `a58ea77`; remediations on `cursor/repository-security-audit-2b2d`
+**Date:** 2026-10-26
+**Codebase:** `main` @ `a58ea77`; remediations on `cursor/repository-security-audit-58ca`
 **Scope:** `src/envault/`, `infra/cdk/`, `.github/workflows/`, `code/`, tests, dependency manifests, git history (secret patterns). Static analysis only — no exploit code, no execution of untrusted payloads, no fetches of URLs found in the repo.
 
 ---
@@ -11,11 +11,11 @@
 
 Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryption SDK, `REQUIRE_ENCRYPT_REQUIRE_DECRYPT`, mandatory `DiscoveryFilter` with 12-digit account IDs, checksum-before-rename decrypt, and SHA-pinned GitHub Actions with OIDC PyPI publish.
 
-`main` has not moved since #115 (2026-09-21) and #116. Draft PRs #117–#119 that remediate symlink TOCTOU, VersionId fail-closed, and KMS ARN glob rejection are still unmerged. This week's scan reproduced those findings on `main`, re-lands them, and adds four follow-ups: fail-closed `O_NOFOLLOW` on platforms that lack the flag, ciphertext `O_NOFOLLOW` on decrypt/upload, `KmsViaStorageServices` coverage of rotation-target CMKs, and an in-flight hash check on `rotate-key`.
+`main` has not moved since #115 (2026-09-21) and #116. Draft PRs #117–#122 that remediate symlink TOCTOU, VersionId fail-closed, and KMS ARN glob rejection are still unmerged. This week's scan reproduced those findings on `main`, re-lands them (via #122), and adds four follow-ups: `migrate` `FROM_PATH` `O_NOFOLLOW`, S3 bucket denies for non-KMS `PutObject`, `persist-credentials: false` on Actions checkouts, and explicit `BUCKET_OWNER_ENFORCED`.
 
-No hardcoded secrets in the current tree or scanned git history (pattern search over recent commits; `.env` is gitignored).
+No hardcoded secrets in the current tree or scanned git history (pattern search over recent commits; `.env` is gitignored; `code/output.json` is not in history).
 
-**This scan (on `main` before remediations):** 0 Critical, 6 High, 12 Medium, 8 Low
+**This scan (on `main` before remediations):** 0 Critical, 6 High, 16 Medium, 10 Low
 
 **After this PR:** 0 Critical, 2 High (accepted / requires operator action), 6 Medium, 7 Low
 
@@ -23,29 +23,33 @@ No hardcoded secrets in the current tree or scanned git history (pattern search 
 
 ## Remediations in this PR
 
-Re-landed from #117–#119:
+Re-landed from #117–#122:
 
 | ID | Severity | Fix |
 |----|----------|-----|
 | H-D | High | `sha256_file` / `encrypt_file` / S3 `download_file` open with `O_NOFOLLOW` |
 | H-E | High | CDK `additional_kms_key_arns` requires a 12-digit account and rejects wildcards |
 | H-F | High | S3 upload fails closed when PutObject returns no VersionId |
+| H-G | High | `KmsViaStorageServices` includes `additional_kms_key_arns` so `rotate-key` SSE-KMS upload can use the new CMK |
+| H-H | High | `open_nofollow` fails closed when `O_NOFOLLOW` is missing instead of `getattr(..., 0)` |
 | M-8 | Medium | `best_effort_delete` uses `O_NOFOLLOW`; symlink targets are not overwritten |
 | M-9 | Medium | `migrate` rejects non-string encryption-context keys/values; empty context is warned |
 | M-10 | Medium | Pin `pygments>=2.20.0` (CVE-2026-4539); Dependabot watches `/infra/cdk` |
 | M-11 | Medium | ISO partition mapping; dashboard escapes `last_activity` |
 | M-12 | Medium | CI/publish `pip-audit -r infra/cdk/requirements.txt`; pin `pip-audit>=2.7,<3` |
 | M-13 | Medium | `migrate` treats `EnvaultError`/`OSError` per line; `file_size_bytes` from `lstat` |
+| M-14 | Medium | `decrypt_file` and `upload_file` open ciphertext with `O_NOFOLLOW` |
+| M-15 | Medium | `rotate-key` refuses to replace S3 if the in-flight encrypt hash ≠ `record.sha256_hash` |
+| L-6 | Low | `encrypt_file` / `sha256_file` `finally` wraps each `os.close` so a failing first close cannot skip the second |
 
-New this week (2026-10-19):
+New this week (2026-10-26):
 
 | ID | Severity | Fix |
 |----|----------|-----|
-| H-G | High | `KmsViaStorageServices` includes `additional_kms_key_arns` so `rotate-key` SSE-KMS upload can use the new CMK |
-| H-H | High | `open_nofollow` fails closed when `O_NOFOLLOW` is missing instead of `getattr(..., 0)` |
-| M-14 | Medium | `decrypt_file` and `upload_file` open ciphertext with `O_NOFOLLOW` |
-| M-15 | Medium | `rotate-key` refuses to replace S3 if the in-flight encrypt hash ≠ `record.sha256_hash` |
-| L-6 | Low | `encrypt_file` `finally` wraps each `os.close` so a failing first close cannot skip the second |
+| M-16 | Medium | `migrate` reads `FROM_PATH` with `O_NOFOLLOW` so a swapped-in symlink cannot redirect the NDJSON import |
+| M-17 | Medium | Data bucket denies `s3:PutObject` unless SSE is `aws:kms` (missing header or AES256) |
+| L-9 | Low | Actions checkouts set `persist-credentials: false` |
+| L-10 | Low | S3 buckets set `ObjectOwnership.BUCKET_OWNER_ENFORCED` (ACLs disabled) |
 
 ---
 
@@ -124,11 +128,11 @@ aws kms disable-key --key-id alias/previous-envault-key
 
 **Location:** `src/envault/crypto.py` `verify_encryption_context`; `src/envault/cli.py` `_parse_output_json_entry`
 
-**Issue:** `any(...)` over an empty expected dict never fires. `migrate` now warns and rejects non-string values, but an empty/partial context still skips the four application keys. Checksum still binds plaintext.
+**Issue:** `any(...)` over an empty expected dict never fires. `migrate` now warns and rejects non-string values, but an empty/partial context still skips the four application keys. Checksum still binds plaintext. Synthesizing keys in DynamoDB would break decrypt, because they were never bound into the ciphertext.
 
 **Impact:** A substituted ciphertext of the same plaintext (or a checksum collision) would not be rejected on `purpose` / `file_name` / `kms_key_alias`.
 
-**Fix:** After migrate, require the four application keys (or refuse decrypt when they are absent).
+**Fix:** After migrate, require the four application keys in the ciphertext header (or refuse decrypt when they are absent).
 
 #### M-F — IAM `PutItem` cannot enforce append-only audit events
 
@@ -180,12 +184,12 @@ If `put_current_state` succeeds and `put_event` fails, a retry hits `StateConfli
 
 ## Findings closed this week (do not re-open)
 
-See the remediations table. In addition, the following from 2026-10-12 remaining list are now closed in this PR:
+See the remediations table. In addition to the #122 set:
 
-- `getattr(os, "O_NOFOLLOW", 0)` silently following on non-Linux → fail closed (H-H)
-- `decrypt_file` / `upload_file` `Path.open` on ciphertext → `open_nofollow` (M-14)
-- `rotate-key` missing in-flight hash compare (M-15)
-- `KmsViaStorageServices` omitting additional CMKs, so rotate-key SSE-KMS failed after plaintext hit disk (H-G)
+- `migrate` `from_path.read_text()` following a final-component symlink → `open_nofollow` (M-16)
+- Data bucket accepting AES256 / header-less PutObject → deny statements (M-17)
+- Actions checkout persisting `GITHUB_TOKEN` in the local git helper → `persist-credentials: false` (L-9)
+- S3 ACL mutability → `BUCKET_OWNER_ENFORCED` (L-10)
 
 ---
 
@@ -202,9 +206,10 @@ See the remediations table. In addition, the following from 2026-10-12 remaining
 - Empty S3 VersionId is fail-closed (`--latest` opt-in); unversioned PutObject is also fail-closed
 - Content-addressed S3 keys validated before fetch
 - Directory-symlink trees skipped on encrypt
-- `migrate` confined to the import directory; per-component symlinks rejected
+- `migrate` confined to the import directory; per-component symlinks rejected; `FROM_PATH` itself is `O_NOFOLLOW`
 - cdk-nag suppressions for IAM5 include justification comments (S3 prefix, GSI, `sts:GetCallerIdentity`)
 - No Dockerfiles in this repo
+- Legacy `code/*.sh` isolate `.env` to `S3_BUCKET` / `KMS_ACCOUNT_ID`; no `aws s3 sync` of `code/`
 
 ---
 
@@ -212,14 +217,14 @@ See the remediations table. In addition, the following from 2026-10-12 remaining
 
 - `docs/reviews/2026-07-26-deep-review.md` — state-machine findings (mostly fixed in 0.2.0)
 - `docs/plans/2026-03-03-security-audit-fixes.md` — original 25-item remediation plan
-- Unmerged drafts #117, #118, #119 — re-landed here
+- Unmerged drafts #117–#122 — re-landed here
 
 ---
 
 ## Summary count
 
-**This scan (on `main` before remediations):** 0 Critical, 6 High, 12 Medium, 8 Low
+**This scan (on `main` before remediations):** 0 Critical, 6 High, 16 Medium, 10 Low
 
 **After this PR:** 0 Critical, 2 High, 6 Medium, 7 Low
 
-Verification: `pytest tests/unit/` — **196 passed**; ruff clean. mypy reports a pre-existing tenacity return-type error in `retry.py` (file unchanged). Crypto-safety inspector: PASS (8/8). Migration-safety inspector: PASS (6/6).
+Verification: `pytest tests/unit/` — **197 passed**; ruff clean. mypy reports a pre-existing tenacity return-type error in `retry.py` (file unchanged). Crypto-safety inspector: PASS (8/8). Migration-safety inspector: PASS (6/6).

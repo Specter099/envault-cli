@@ -135,6 +135,7 @@ class EnvaultStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
             removal_policy=RemovalPolicy.RETAIN,
             lifecycle_rules=[
                 s3.LifecycleRule(
@@ -155,6 +156,7 @@ class EnvaultStack(Stack):
             bucket_key_enabled=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
             server_access_logs_bucket=access_logs_bucket,
             server_access_logs_prefix="envault-access-logs/",
             removal_policy=RemovalPolicy.RETAIN,
@@ -168,6 +170,38 @@ class EnvaultStack(Stack):
                     noncurrent_version_expiration=Duration.days(365),
                 )
             ],
+        )
+
+        # Defense in depth for the ciphertext blob. Client-side envelope
+        # encryption still holds if SSE is wrong; these denies stop a PutObject
+        # with AES256 (or no SSE header) from bypassing the envault CMK.
+        bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyNonKmsObjectPuts",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:PutObject"],
+                resources=[bucket.arn_for_objects("*")],
+                conditions={
+                    "StringNotEquals": {
+                        "s3:x-amz-server-side-encryption": "aws:kms",
+                    }
+                },
+            )
+        )
+        bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyUnencryptedObjectPuts",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:PutObject"],
+                resources=[bucket.arn_for_objects("*")],
+                conditions={
+                    "Null": {
+                        "s3:x-amz-server-side-encryption": True,
+                    }
+                },
+            )
         )
 
         # ------------------------------------------------------------------ #

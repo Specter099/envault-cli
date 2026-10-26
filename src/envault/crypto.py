@@ -125,7 +125,10 @@ def sha256_file(path: Path) -> str:
             return h.hexdigest()
     finally:
         if fd >= 0:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 @aws_retry(never=(ConfigurationError, EnvaultError, OSError))
