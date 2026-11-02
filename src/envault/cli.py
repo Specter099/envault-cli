@@ -242,7 +242,6 @@ def _encrypt_one(
         file_size_bytes=result.file_size_bytes,
         tags=tags,
         encrypted_at=now,
-        last_updated=now,
     )
     try:
         store.put_current_state(
@@ -875,13 +874,11 @@ def rotate_key(
 
             original_last_updated = record.last_updated
             old_kms_key = record.kms_key_id
-            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
             record.kms_key_id = new_key_id
             record.encryption_context = new_ctx
             record.algorithm = new_result.algorithm
             record.message_id = new_result.message_id
             record.s3_version_id = new_version_id
-            record.last_updated = now
             # Legacy records land back in ENCRYPTED: the ciphertext is present,
             # which is what the field is supposed to describe.
             record.current_state = ENCRYPTED
