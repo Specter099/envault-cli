@@ -731,10 +731,7 @@ def _extract_algorithm(header: dict[str, Any]) -> str:
 
 
 def _extract_message_id(header: dict[str, Any]) -> str:
-    mid = header.get("message_id", "")
-    if isinstance(mid, bytes):
-        return mid.hex()
-    return str(mid)
+    return str(header.get("message_id", ""))
 
 
 def _extract_kms_key_id(header: dict[str, Any]) -> str:
