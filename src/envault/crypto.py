@@ -181,14 +181,9 @@ def encrypt_file(
                 header = encryptor.header
 
         sha256_hash = hashing_reader.hexdigest
-        algorithm = (
-            header.algorithm.name if hasattr(header.algorithm, "name") else str(header.algorithm)
-        )
-        message_id = (
-            header.message_id.hex()
-            if isinstance(header.message_id, bytes)
-            else str(header.message_id)
-        )
+        # MessageHeader validates these as an Algorithm enum and bytes.
+        algorithm = header.algorithm.name
+        message_id = header.message_id.hex()
         logger.info(
             "Encryption complete",
             extra={
