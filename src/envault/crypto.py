@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,13 +27,33 @@ from envault.exceptions import (
     ConfigurationError,
     DecryptionError,
     EncryptionContextMismatchError,
+    EnvaultError,
 )
-from envault.fileutils import best_effort_delete
+from envault.fileutils import best_effort_delete, open_nofollow
 from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
 
 _CHUNK_SIZE = 65536
+_ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
+
+
+def _require_allowed_account_ids(allowed_account_ids: list[str] | None) -> list[str]:
+    """Reject empty or malformed account IDs before any KMS discovery.
+
+    ``DiscoveryFilter`` is only as strict as the IDs it is given. A wildcard,
+    truncated, or non-numeric value must not reach the provider.
+    """
+    if not allowed_account_ids:
+        raise ConfigurationError(
+            "allowed_account_ids is required for decryption. "
+            "Set ENVAULT_ALLOWED_ACCOUNT_IDS to a comma-separated list of AWS account IDs "
+            "that are trusted to have encrypted the data."
+        )
+    for account_id in allowed_account_ids:
+        if not _ACCOUNT_ID_RE.fullmatch(account_id):
+            raise ConfigurationError(f"Invalid AWS account ID: {account_id!r}. Must be 12 digits.")
+    return allowed_account_ids
 
 
 def verify_encryption_context(expected: dict[str, str], actual: dict[str, str]) -> None:
@@ -109,15 +130,28 @@ class _HashingReader:
 
 
 def sha256_file(path: Path) -> str:
-    """Compute SHA256 hash of a file's contents."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """Compute SHA256 hash of a file's contents.
+
+    Opens with ``O_NOFOLLOW`` so a swapped-in symlink cannot redirect the
+    hash (and later encrypt) at a file the operator did not select.
+    """
+    fd = open_nofollow(path, os.O_RDONLY)
+    try:
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
+                h.update(chunk)
+            return h.hexdigest()
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
-@aws_retry(never=(ConfigurationError, OSError))
+@aws_retry(never=(ConfigurationError, EnvaultError, OSError))
 def encrypt_file(
     input_path: Path,
     key_id: str,
@@ -145,12 +179,11 @@ def encrypt_file(
     Returns:
         EncryptResult with hash, size, algorithm, and message_id.
     """
-    file_size = input_path.stat().st_size
-
     logger.info("Encrypting file", extra={"input": str(input_path), "key_id": key_id})
 
     client = aws_encryption_sdk.EncryptionSDKClient(
-        commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT
+        commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT,
+        max_encrypted_data_keys=1,
     )
     key_provider = StrictAwsKmsMasterKeyProvider(
         key_ids=[key_id],
@@ -159,10 +192,16 @@ def encrypt_file(
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-
+    in_fd = open_nofollow(input_path, os.O_RDONLY)
+    fd = -1
+    output_created = False
+    succeeded = False
     try:
-        with input_path.open("rb") as raw_input:
+        file_size = os.fstat(in_fd).st_size
+        fd = open_nofollow(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        output_created = True
+        with os.fdopen(in_fd, "rb") as raw_input:
+            in_fd = -1  # ownership transferred; fdopen closes on exit
             hashing_reader = _HashingReader(raw_input)
             with client.stream(
                 source=hashing_reader,
@@ -198,6 +237,7 @@ def encrypt_file(
                 "message_id": message_id,
             },
         )
+        succeeded = True
         return EncryptResult(
             sha256_hash=sha256_hash,
             file_size_bytes=file_size,
@@ -206,10 +246,27 @@ def encrypt_file(
             output_path=output_path,
         )
     finally:
-        # If stream() (or anything before fdopen) fails, close the raw fd so
+        # If stream() (or anything before fdopen) fails, close the raw fds so
         # we neither leak descriptors nor leave an unlinked 0600 file open.
+        # Wrap each close: a failing first close must not skip the second.
+        if in_fd >= 0:
+            try:
+                os.close(in_fd)
+            except OSError:
+                pass
         if fd >= 0:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        # Library callers (unlike the CLI tmp-file path) may pass a durable
+        # output_path. O_TRUNC already destroyed any previous ciphertext; do
+        # not leave a partial envelope beside it.
+        if output_created and not succeeded:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _discovery_key_provider(
@@ -229,11 +286,21 @@ def _discovery_key_provider(
 
 
 def _partition_for_region(region: str) -> str:
-    """Map an AWS region to its partition so GovCloud and China aren't excluded."""
+    """Map an AWS region to its partition so GovCloud, China, and ISO aren't excluded."""
     if region.startswith("us-gov-"):
         return "aws-us-gov"
     if region.startswith("cn-"):
         return "aws-cn"
+    # us-iso-east-1 → iso; us-isob-east-1 → isob; eu-isoe-west-1 → isoe
+    token = region.split("-")[1] if "-" in region else ""
+    iso_partitions = {
+        "iso": "aws-iso",
+        "isob": "aws-iso-b",
+        "isoe": "aws-iso-e",
+        "isof": "aws-iso-f",
+    }
+    if token in iso_partitions:
+        return iso_partitions[token]
     return "aws"
 
 
@@ -274,17 +341,12 @@ def decrypt_to_stream(
         DecryptResult with the plaintext hash, size, and encryption context.
 
     Raises:
-        ConfigurationError: If allowed_account_ids is empty.
+        ConfigurationError: If allowed_account_ids is empty or not 12-digit IDs.
         EncryptionContextMismatchError: If the header context doesn't match.
         ChecksumMismatchError: If the plaintext checksum doesn't match.
         DecryptionError: If the ciphertext is corrupted, truncated, or tampered.
     """
-    if not allowed_account_ids:
-        raise ConfigurationError(
-            "allowed_account_ids is required for decryption. "
-            "Set ENVAULT_ALLOWED_ACCOUNT_IDS to a comma-separated list of AWS account IDs "
-            "that are trusted to have encrypted the data."
-        )
+    allowed_account_ids = _require_allowed_account_ids(allowed_account_ids)
 
     client = aws_encryption_sdk.EncryptionSDKClient(
         commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT,
@@ -333,6 +395,7 @@ def decrypt_to_stream(
         ChecksumMismatchError,
         DecryptionError,
         EncryptionContextMismatchError,
+        EnvaultError,
         OSError,
     )
 )
@@ -367,10 +430,14 @@ def decrypt_file(
     Raises:
         ChecksumMismatchError: If expected_sha256 is provided and doesn't match.
         EncryptionContextMismatchError: If expected_context doesn't match.
+        ConfigurationError: If allowed_account_ids is empty or not 12-digit IDs.
         DecryptionError: If the SDK fails to decrypt (corrupted/tampered
             ciphertext, failed frame authentication, untrusted key). Never
             retried — these failures are deterministic.
     """
+    # Validate before creating temps so a bad DiscoveryFilter never leaves a
+    # .part file and never reaches KMS.
+    allowed_account_ids = _require_allowed_account_ids(allowed_account_ids)
     logger.info("Decrypting file", extra={"input": str(input_path)})
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,6 +446,7 @@ def decrypt_file(
         dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".part"
     )
     tmp_path = Path(_tmp_name)
+    in_fd = -1
 
     try:
         # Nest fdopen so ownership is marked transferred before any later
@@ -387,7 +455,9 @@ def decrypt_file(
         # raise EBADF and skip cleanup.
         with os.fdopen(tmp_fd, "wb") as out:
             tmp_fd = -1  # ownership transferred; fdopen closes on exit
-            with input_path.open("rb") as encrypted_file:
+            in_fd = open_nofollow(input_path, os.O_RDONLY)
+            with os.fdopen(in_fd, "rb") as encrypted_file:
+                in_fd = -1  # ownership transferred; fdopen closes on exit
                 result = decrypt_to_stream(
                     encrypted_file,
                     out,
@@ -401,6 +471,11 @@ def decrypt_file(
         if tmp_fd >= 0:
             try:
                 os.close(tmp_fd)
+            except OSError:
+                pass
+        if in_fd >= 0:
+            try:
+                os.close(in_fd)
             except OSError:
                 pass
         # No-op after a successful rename; zero-overwrites partial plaintext
