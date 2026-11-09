@@ -6,6 +6,7 @@ import io
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import boto3
 
 from envault.config import boto_config
 from envault.exceptions import EnvaultError
+from envault.fileutils import open_nofollow
 from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
@@ -101,7 +103,7 @@ class S3Store:
         )
         return io.BytesIO(body)
 
-    @aws_retry()
+    @aws_retry(never=(EnvaultError,))
     def upload_file(self, local_path: Path, s3_key: str) -> str:
         """Upload a file to S3 and return the version ID atomically.
 
@@ -113,21 +115,41 @@ class S3Store:
             s3_key: S3 object key.
 
         Returns:
-            The S3 VersionId of the uploaded object (empty string if bucket not versioned).
+            The S3 VersionId of the uploaded object.
+
+        Raises:
+            EnvaultError: If PutObject returns no VersionId (bucket is not versioned).
+                Decrypt pins a specific version; an unversioned bucket would force
+                ``--latest`` and silently follow later overwrites.
         """
         logger.info("Uploading to S3", extra={"bucket": self._bucket, "key": s3_key})
-        with local_path.open("rb") as f:
-            put_kwargs: dict[str, Any] = {
-                "Bucket": self._bucket,
-                "Key": s3_key,
-                "Body": f,
-                "ChecksumAlgorithm": "SHA256",
-            }
-            if self._kms_key_id:
-                put_kwargs["ServerSideEncryption"] = "aws:kms"
-                put_kwargs["SSEKMSKeyId"] = self._kms_key_id
-            response = self._s3.put_object(**put_kwargs)
-        version_id: str = response.get("VersionId", "")
+        fd = open_nofollow(local_path, os.O_RDONLY)
+        try:
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                put_kwargs: dict[str, Any] = {
+                    "Bucket": self._bucket,
+                    "Key": s3_key,
+                    "Body": f,
+                    "ChecksumAlgorithm": "SHA256",
+                }
+                if self._kms_key_id:
+                    put_kwargs["ServerSideEncryption"] = "aws:kms"
+                    put_kwargs["SSEKMSKeyId"] = self._kms_key_id
+                response = self._s3.put_object(**put_kwargs)
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        version_id = str(response.get("VersionId") or "")
+        if not version_id:
+            raise EnvaultError(
+                f"S3 PutObject returned no VersionId for s3://{self._bucket}/{s3_key}. "
+                "Enable versioning on the bucket (the envault CDK stack does this) so "
+                "decrypt can pin the exact object that was uploaded."
+            )
         logger.info(
             "Upload complete",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
@@ -162,6 +184,11 @@ class S3Store:
     ) -> None:
         """Download a file from S3.
 
+        Writes to a sibling temp file and ``os.replace``s into place so a
+        mid-write failure cannot truncate an existing destination. A symlink
+        at ``local_path`` is refused so ciphertext cannot replace (or follow)
+        a link the operator did not intend to overwrite.
+
         Args:
             s3_key: S3 object key.
             local_path: Destination path on disk.
@@ -180,13 +207,43 @@ class S3Store:
             "Downloading from S3",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
         )
-        self._s3.download_file(
-            self._bucket,
-            s3_key,
-            str(local_path),
-            ExtraArgs=extra_args if extra_args else None,
+        # Write to a sibling temp, then os.replace. O_TRUNC on local_path
+        # would leave a truncated dest if download_fileobj fails mid-write.
+        # A symlink dest is refused after the download so the target is never
+        # overwritten (os.replace would replace the symlink inode, not follow it).
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=local_path.parent, prefix=f".{local_path.name}.", suffix=".s3part"
         )
-        os.chmod(str(local_path), 0o600)
+        tmp_path = Path(tmp_name)
+        succeeded = False
+        try:
+            os.fchmod(tmp_fd, 0o600)
+            with os.fdopen(tmp_fd, "wb") as out:
+                tmp_fd = -1
+                self._s3.download_fileobj(
+                    self._bucket,
+                    s3_key,
+                    out,
+                    ExtraArgs=extra_args if extra_args else None,
+                )
+            if local_path.is_symlink():
+                raise EnvaultError(
+                    f"Refusing to follow symlink: {local_path}. "
+                    "Ciphertext and plaintext must be regular files."
+                )
+            os.replace(tmp_path, local_path)
+            succeeded = True
+        finally:
+            if tmp_fd >= 0:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+            if not succeeded:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         logger.info("Download complete", extra={"local_path": str(local_path)})
 
     @staticmethod

@@ -16,6 +16,7 @@ import hashlib
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
@@ -29,7 +30,13 @@ from envault.crypto import (
     encrypt_file,
     sha256_file,
 )
-from envault.exceptions import ChecksumMismatchError, DecryptionError
+from envault.exceptions import (
+    ChecksumMismatchError,
+    ConfigurationError,
+    DecryptionError,
+    EnvaultError,
+)
+from envault.fileutils import open_nofollow
 
 KMS_KEY_ALIAS = "alias/envault-test"
 REGION = "us-east-1"
@@ -43,6 +50,84 @@ def test_sha256_file_correct_hash(tmp_path: Path) -> None:
 
     expected = hashlib.sha256(content).hexdigest()
     assert sha256_file(p) == expected
+
+
+def test_sha256_file_refuses_symlink(tmp_path: Path) -> None:
+    """A swapped-in symlink must not redirect the hash at another file."""
+    from envault.exceptions import EnvaultError
+
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"do-not-hash-me")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+
+    with pytest.raises(EnvaultError, match="symlink"):
+        sha256_file(link)
+
+
+def test_encrypt_file_refuses_symlink_input(tmp_path: Path) -> None:
+    """encrypt_file must not follow a symlink to plaintext the operator did not select."""
+    from envault.exceptions import EnvaultError
+
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"do-not-encrypt-me")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+    out = tmp_path / "out.enc"
+
+    with pytest.raises(EnvaultError, match="symlink"):
+        encrypt_file(link, "alias/x", {"purpose": "envault-backup"}, out)
+    assert not out.exists()
+
+
+def test_encrypt_file_unlinks_partial_output_on_stream_failure(
+    kms_key: str, tmp_path: Path
+) -> None:
+    """A failed SDK stream must not destroy a pre-existing ciphertext at output_path."""
+    src = tmp_path / "in.txt"
+    src.write_bytes(b"hello")
+    out = tmp_path / "out.enc"
+    out.write_bytes(b"pre-existing")
+
+    mock_client = MagicMock()
+    mock_client.stream.side_effect = OSError("stream failed")
+    with patch("envault.crypto.aws_encryption_sdk.EncryptionSDKClient", return_value=mock_client):
+        with pytest.raises(OSError, match="stream failed"):
+            encrypt_file(
+                src,
+                KMS_KEY_ALIAS,
+                {"purpose": "envault-backup"},
+                out,
+                REGION,
+            )
+    assert out.read_bytes() == b"pre-existing"
+    leftovers = list(tmp_path.glob(".out.enc.*.encpart"))
+    assert leftovers == []
+
+
+def test_decrypt_file_refuses_symlink_ciphertext(tmp_path: Path) -> None:
+    """decrypt_file must not read ciphertext through a swapped-in symlink."""
+    target = tmp_path / "victim.enc"
+    target.write_bytes(b"not-ciphertext")
+    link = tmp_path / "alias.enc"
+    link.symlink_to(target)
+    out = tmp_path / "out.txt"
+
+    with pytest.raises(EnvaultError, match="symlink"):
+        decrypt_file(link, out, allowed_account_ids=[MOTO_ACCOUNT_ID])
+    assert not out.exists()
+    assert target.read_bytes() == b"not-ciphertext"
+
+
+def test_open_nofollow_fails_closed_without_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing O_NOFOLLOW must refuse the open rather than follow a symlink."""
+    p = tmp_path / "f"
+    p.write_bytes(b"x")
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    with pytest.raises(EnvaultError, match="O_NOFOLLOW"):
+        open_nofollow(p, os.O_RDONLY)
 
 
 def test_sha256_file_empty(tmp_path: Path) -> None:
@@ -92,9 +177,6 @@ def test_decrypt_result_dataclass() -> None:
 
 def test_decrypt_file_requires_account_ids(tmp_path: Path) -> None:
     """decrypt_file must raise ConfigurationError when allowed_account_ids is empty."""
-
-    from envault.exceptions import ConfigurationError
-
     dummy_input = tmp_path / "dummy.enc"
     dummy_input.write_bytes(b"fake ciphertext")
     dummy_output = tmp_path / "out.txt"
@@ -114,6 +196,26 @@ def test_decrypt_file_requires_account_ids(tmp_path: Path) -> None:
             region="us-east-1",
             allowed_account_ids=None,
         )
+
+
+def test_decrypt_file_rejects_malformed_account_ids(tmp_path: Path) -> None:
+    """DiscoveryFilter must never see a truncated, glob, or non-numeric account ID."""
+    dummy_input = tmp_path / "dummy.enc"
+    dummy_input.write_bytes(b"fake ciphertext")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "secret.txt"
+
+    for bad in ("123", "*", "123456789012*", "12345678901a", " 123456789012"):
+        with pytest.raises(ConfigurationError, match="12 digits"):
+            decrypt_file(
+                input_path=dummy_input,
+                output_path=output,
+                region="us-east-1",
+                allowed_account_ids=[bad],
+            )
+        assert not output.exists()
+        assert list(out_dir.iterdir()) == []
 
 
 def test_checksum_mismatch_error() -> None:
@@ -400,6 +502,10 @@ def test_partition_for_region():
     assert _partition_for_region("eu-west-2") == "aws"
     assert _partition_for_region("us-gov-west-1") == "aws-us-gov"
     assert _partition_for_region("cn-north-1") == "aws-cn"
+    assert _partition_for_region("us-iso-east-1") == "aws-iso"
+    assert _partition_for_region("us-isob-east-1") == "aws-iso-b"
+    assert _partition_for_region("eu-isoe-west-1") == "aws-iso-e"
+    assert _partition_for_region("us-isof-east-1") == "aws-iso-f"
 
 
 def test_decrypt_missing_ciphertext_cleans_temp(tmp_path: Path) -> None:

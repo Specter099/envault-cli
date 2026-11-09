@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import uuid
@@ -36,6 +37,7 @@ from envault.exceptions import (
     StateConflictError,
 )
 from envault.fileutils import best_effort_delete as _best_effort_delete
+from envault.fileutils import open_nofollow
 from envault.identity import caller_arn
 from envault.isolation import CredentialFd, harden_process, wipe
 from envault.s3 import S3Store, assert_s3_key_matches_hash
@@ -608,7 +610,7 @@ def dashboard(table: str, region: str) -> None:
         t.add_row("Total tracked files:", str(summary["total"]))
         t.add_row("Currently encrypted:", f"[green]{summary['encrypted']}[/green]")
         t.add_row("Currently decrypted:", f"[yellow]{summary['decrypted']}[/yellow]")
-        t.add_row("Last activity:", summary["last_activity"])
+        t.add_row("Last activity:", escape(str(summary["last_activity"])))
         console.print(t)
         console.print()
 
@@ -631,9 +633,23 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
     """
     store = StateStore(table_name=table, region=region)
     imported = skipped = errors = 0
+    # O_NOFOLLOW refuses only the final FROM_PATH component. A directory
+    # symlink in the path would make parent.resolve() the real directory and
+    # widen the import sandbox to that target.
+    if _path_has_symlink_component(from_path):
+        console.print(
+            "[bold red]Error:[/bold red] Refusing to follow a symlink in the "
+            f"migration path {escape(str(from_path))}. Import is confined to the "
+            "real directory containing FROM_PATH."
+        )
+        sys.exit(1)
     import_root = from_path.parent.resolve()
 
-    lines = from_path.read_text().splitlines()
+    try:
+        lines = _read_text_nofollow(from_path).splitlines()
+    except EnvaultError as exc:
+        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+        sys.exit(1)
     for i, line in enumerate(track(lines, description="Migrating records..."), start=1):
         line = line.strip()
         if not line:
@@ -650,13 +666,26 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
                 continue
             if not dry_run:
                 store.put_current_state(record)
-                store.put_event(
-                    record,
-                    operation="ENCRYPT",
-                    correlation_id="migrated-from-output-json",
-                    audit_ttl_days=audit_ttl_days,
-                    principal_arn=caller_arn(region),
-                )
+                try:
+                    store.put_event(
+                        record,
+                        operation="ENCRYPT",
+                        correlation_id="migrated-from-output-json",
+                        audit_ttl_days=audit_ttl_days,
+                        principal_arn=caller_arn(region),
+                    )
+                except (ClientError, BotoCoreError, EnvaultError) as event_exc:
+                    # CURRENT is already written. Counting this as imported
+                    # would hide a missing audit row; retry hits StateConflict
+                    # and would skip the event forever.
+                    logger.error(
+                        "CURRENT written but audit event failed for line %d (%s): %s",
+                        i,
+                        record.sha256_hash[:16],
+                        event_exc,
+                    )
+                    errors += 1
+                    continue
             imported += 1
         except StateConflictError:
             logger.info("Record already exists, skipping migration for line %d", i)
@@ -668,6 +697,10 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
             TypeError,
             AttributeError,
             MigrationError,
+            EnvaultError,
+            OSError,
+            ClientError,
+            BotoCoreError,
         ) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
@@ -685,9 +718,7 @@ def _parse_output_json_entry(
     if entry.get("mode") != "encrypt":
         return None
 
-    header = entry.get("header", {}) or {}
-    if not isinstance(header, dict):
-        raise MigrationError("header must be a JSON object")
+    header = _json_object_field(entry.get("header", {}), "header")
     input_path = entry.get("input", "")
     if not input_path:
         return None
@@ -698,15 +729,31 @@ def _parse_output_json_entry(
     algorithm = _extract_algorithm(header)
     message_id = _extract_message_id(header)
     kms_key_id = _extract_kms_key_id(header)
-    enc_context = header.get("encryption_context", {}) or {}
-    if not isinstance(enc_context, dict):
-        raise MigrationError("encryption_context must be a JSON object")
+    enc_context = _json_object_field(header.get("encryption_context", {}), "encryption_context")
+    for ctx_key, ctx_value in enc_context.items():
+        if not isinstance(ctx_key, str) or not isinstance(ctx_value, str):
+            raise MigrationError("encryption_context keys and values must be strings")
+    if not enc_context:
+        logger.warning(
+            "Skipping migration record with empty encryption_context "
+            "(decrypt would not bind purpose/sha256/file_name/kms_key_alias): %s",
+            input_path,
+        )
+        return None
 
     if not plaintext_path.exists():
         logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
         return None
 
     sha256_hash = sha256_file(plaintext_path)
+    # lstat after the O_NOFOLLOW hash: a swapped-in symlink must not supply
+    # the target's size as this record's file_size_bytes.
+    try:
+        st = plaintext_path.lstat()
+    except OSError as exc:
+        raise MigrationError(f"Could not stat migration input {input_path!r}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise MigrationError(f"Symlink not allowed in migration input: {input_path!r}")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     return FileRecord(
@@ -719,11 +766,24 @@ def _parse_output_json_entry(
         encryption_context=enc_context,
         algorithm=algorithm,
         message_id=message_id,
-        file_size_bytes=plaintext_path.stat().st_size,
+        file_size_bytes=st.st_size,
         tags={"source": "migrated"},
         encrypted_at=now,
         last_updated=now,
     )
+
+
+def _json_object_field(value: Any, field: str) -> dict[str, Any]:
+    """Return a dict, treating JSON null as empty. Reject arrays/strings/numbers.
+
+    ``value or {}`` would coerce ``[]`` and ``""`` to an empty object and skip
+    the type check that follows, importing a record with no header at all.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise MigrationError(f"{field} must be a JSON object")
+    return value
 
 
 def _extract_algorithm(header: dict[str, Any]) -> str:
@@ -872,6 +932,13 @@ def rotate_key(
 
             new_ctx = new_key_config.build_encryption_context(record.sha256_hash, record.file_name)
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
+            if new_result.sha256_hash != record.sha256_hash:
+                raise EnvaultError(
+                    f"File {record.file_name!r} changed during rotation "
+                    f"(record hash {record.sha256_hash[:16]}… != "
+                    f"re-encrypted hash {new_result.sha256_hash[:16]}…). "
+                    "Aborting this file; ciphertext in S3 was not replaced."
+                )
             _best_effort_delete(tmp_pt)
 
             new_version_id = s3.upload_file(tmp_enc, record.s3_key)
@@ -1340,6 +1407,21 @@ def _path_has_symlink_component(path: Path) -> bool:
         except OSError:
             return True
     return False
+
+
+def _read_text_nofollow(path: Path) -> str:
+    """Read UTF-8 text without following a final-component symlink."""
+    fd = open_nofollow(path, os.O_RDONLY)
+    try:
+        with os.fdopen(fd, encoding="utf-8") as f:
+            fd = -1
+            return f.read()
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _confine_migration_path(input_path: str, import_root: Path | None) -> Path:

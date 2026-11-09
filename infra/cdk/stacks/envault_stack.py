@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import aws_cdk as cdk
 from aws_cdk import (
     Duration,
@@ -18,28 +20,32 @@ from aws_cdk import aws_sns as sns
 from cdk_nag import NagSuppressions
 from constructs import Construct
 
+# Full key/alias ARN with a 12-digit account. Wildcards, missing accounts, and
+# non-KMS services are rejected so a typo cannot widen GenerateDataKey/Decrypt.
+_KMS_KEY_OR_ALIAS_ARN = re.compile(
+    r"^arn:aws(?:-us-gov|-cn|-iso(?:-[bef])?)?:kms:[a-z0-9-]+:[0-9]{12}:"
+    r"(?:key/[A-Za-z0-9-]+|alias/[A-Za-z0-9/_-]+)$"
+)
+
 
 def _additional_kms_key_arns(scope: Construct) -> list[str]:
     """Optional extra KMS key ARNs for ``rotate-key --new-key-id``.
 
     Pass at deploy time::
 
-        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123:key/abc
+        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123456789012:alias/next
 
-    Multiple ARNs may be comma-separated. Values that are not KMS ARNs are
-    rejected at synth so a typo cannot widen the policy to an unrelated resource.
+    Multiple ARNs may be comma-separated. Values that are not KMS key/alias ARNs
+    with a 12-digit account (or that contain wildcards) are rejected at synth so
+    a typo cannot widen the policy to an unrelated resource.
     """
     raw = scope.node.try_get_context("additional_kms_key_arns") or ""
     arns = [a.strip() for a in str(raw).split(",") if a.strip()]
     for arn in arns:
-        is_kms_arn = (
-            arn.startswith("arn:")
-            and ":kms:" in arn
-            and (":key/" in arn or ":alias/" in arn)
-        )
-        if not is_kms_arn:
+        if "*" in arn or "?" in arn or _KMS_KEY_OR_ALIAS_ARN.fullmatch(arn) is None:
             raise ValueError(
-                "additional_kms_key_arns must be comma-separated KMS key or alias ARNs, "
+                "additional_kms_key_arns must be comma-separated KMS key or alias ARNs "
+                "with a 12-digit account id and no wildcards, "
                 f"got {arn!r}"
             )
     return arns
@@ -129,6 +135,7 @@ class EnvaultStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
             removal_policy=RemovalPolicy.RETAIN,
             lifecycle_rules=[
                 s3.LifecycleRule(
@@ -149,6 +156,7 @@ class EnvaultStack(Stack):
             bucket_key_enabled=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
             server_access_logs_bucket=access_logs_bucket,
             server_access_logs_prefix="envault-access-logs/",
             removal_policy=RemovalPolicy.RETAIN,
@@ -162,6 +170,38 @@ class EnvaultStack(Stack):
                     noncurrent_version_expiration=Duration.days(365),
                 )
             ],
+        )
+
+        # Defense in depth for the ciphertext blob. Client-side envelope
+        # encryption still holds if SSE is wrong; these denies stop a PutObject
+        # with AES256 (or no SSE header) from bypassing the envault CMK.
+        bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyNonKmsObjectPuts",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:PutObject"],
+                resources=[bucket.arn_for_objects("*")],
+                conditions={
+                    "StringNotEquals": {
+                        "s3:x-amz-server-side-encryption": "aws:kms",
+                    }
+                },
+            )
+        )
+        bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyUnencryptedObjectPuts",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:PutObject"],
+                resources=[bucket.arn_for_objects("*")],
+                conditions={
+                    "Null": {
+                        "s3:x-amz-server-side-encryption": True,
+                    }
+                },
+            )
         )
 
         # ------------------------------------------------------------------ #
@@ -210,6 +250,7 @@ class EnvaultStack(Stack):
         # ------------------------------------------------------------------ #
         # IAM Managed Policy (least-privilege)                                 #
         # ------------------------------------------------------------------ #
+        extra_kms_arns = _additional_kms_key_arns(self)
         policy = iam.ManagedPolicy(
             self,
             "EnvaultUserPolicy",
@@ -223,7 +264,7 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsEnvelopeEncryption",
                     actions=["kms:GenerateDataKey", "kms:Decrypt"],
-                    resources=[encryption_key.key_arn, *_additional_kms_key_arns(self)],
+                    resources=[encryption_key.key_arn, *extra_kms_arns],
                     conditions={
                         "StringEquals": {
                             "kms:EncryptionContext:purpose": ["envault-backup", "backup"]
@@ -231,11 +272,13 @@ class EnvaultStack(Stack):
                     },
                 ),
                 # SSE-KMS on the bucket and table: only when S3/DynamoDB call
-                # KMS on the user's behalf.
+                # KMS on the user's behalf. Extra ARNs are required so
+                # rotate-key can PutObject with SSEKMSKeyId set to the new CMK
+                # after it has already decrypted plaintext to a temp file.
                 iam.PolicyStatement(
                     sid="KmsViaStorageServices",
                     actions=["kms:GenerateDataKey", "kms:Decrypt"],
-                    resources=[encryption_key.key_arn],
+                    resources=[encryption_key.key_arn, *extra_kms_arns],
                     conditions={
                         "StringEquals": {
                             "kms:ViaService": [
@@ -248,7 +291,7 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsDescribeKey",
                     actions=["kms:DescribeKey"],
-                    resources=[encryption_key.key_arn, *_additional_kms_key_arns(self)],
+                    resources=[encryption_key.key_arn, *extra_kms_arns],
                 ),
                 iam.PolicyStatement(
                     sid="S3EncryptedObjects",
