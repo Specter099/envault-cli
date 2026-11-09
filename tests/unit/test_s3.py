@@ -111,6 +111,27 @@ def test_download_refuses_symlink_destination(tmp_path: Path):
     with pytest.raises(EnvaultError, match="symlink"):
         store.download_file("encrypted/aa/aaa.../file.enc", link, allow_latest=True)
     assert target.read_bytes() == b"keep-me"
+    leftovers = list(tmp_path.glob(".link.enc.*.s3part"))
+    assert leftovers == []
+
+
+@mock_aws
+def test_download_failure_preserves_existing_destination(tmp_path: Path):
+    """A mid-write download failure must not truncate an existing dest file."""
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    s3_client.put_object(Bucket=BUCKET, Key="encrypted/aa/aaa.../file.enc", Body=b"data")
+
+    dest = tmp_path / "existing.enc"
+    dest.write_bytes(b"keep-original")
+
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with patch.object(store._s3, "download_fileobj", side_effect=OSError("mid-write")):
+        with pytest.raises(OSError, match="mid-write"):
+            store.download_file("encrypted/aa/aaa.../file.enc", dest, allow_latest=True)
+    assert dest.read_bytes() == b"keep-original"
+    leftovers = list(tmp_path.glob(".existing.enc.*.s3part"))
+    assert leftovers == []
 
 
 @mock_aws

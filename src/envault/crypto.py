@@ -164,7 +164,9 @@ def encrypt_file(
     Uses streaming mode to avoid holding the full plaintext or ciphertext
     in memory. SHA256 is computed incrementally as data flows through the
     encryption stream, eliminating the TOCTOU window between hashing and
-    encrypting.
+    encrypting. Ciphertext is written to a sibling temp file and renamed
+    onto ``output_path`` only on success, so a failed stream cannot destroy
+    a pre-existing file.
 
     The plaintext never leaves this machine — only the data encryption key (DEK)
     is sent to KMS for wrapping. The file is encrypted locally with AES-256-GCM.
@@ -193,13 +195,17 @@ def encrypt_file(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     in_fd = open_nofollow(input_path, os.O_RDONLY)
-    fd = -1
-    output_created = False
+    tmp_fd = -1
+    tmp_path: Path | None = None
     succeeded = False
     try:
         file_size = os.fstat(in_fd).st_size
-        fd = open_nofollow(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        output_created = True
+        # Write to a sibling temp, then os.replace. O_TRUNC on output_path
+        # would destroy a pre-existing ciphertext if the stream fails.
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".encpart"
+        )
+        tmp_path = Path(tmp_name)
         with os.fdopen(in_fd, "rb") as raw_input:
             in_fd = -1  # ownership transferred; fdopen closes on exit
             hashing_reader = _HashingReader(raw_input)
@@ -210,8 +216,8 @@ def encrypt_file(
                 encryption_context=encryption_context,
                 frame_length=4096,
             ) as encryptor:
-                with os.fdopen(fd, "wb") as out:
-                    fd = -1  # ownership transferred; fdopen closes on exit
+                with os.fdopen(tmp_fd, "wb") as out:
+                    tmp_fd = -1  # ownership transferred; fdopen closes on exit
                     while True:
                         chunk = encryptor.read(_CHUNK_SIZE)
                         if not chunk:
@@ -237,6 +243,7 @@ def encrypt_file(
                 "message_id": message_id,
             },
         )
+        os.replace(tmp_path, output_path)
         succeeded = True
         return EncryptResult(
             sha256_hash=sha256_hash,
@@ -254,17 +261,16 @@ def encrypt_file(
                 os.close(in_fd)
             except OSError:
                 pass
-        if fd >= 0:
+        if tmp_fd >= 0:
             try:
-                os.close(fd)
+                os.close(tmp_fd)
             except OSError:
                 pass
-        # Library callers (unlike the CLI tmp-file path) may pass a durable
-        # output_path. O_TRUNC already destroyed any previous ciphertext; do
-        # not leave a partial envelope beside it.
-        if output_created and not succeeded:
+        # Library callers may pass a durable output_path. Leave it untouched
+        # and drop the sibling temp if the stream did not finish.
+        if tmp_path is not None and not succeeded:
             try:
-                output_path.unlink(missing_ok=True)
+                tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
 

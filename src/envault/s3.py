@@ -6,6 +6,7 @@ import io
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -183,8 +184,10 @@ class S3Store:
     ) -> None:
         """Download a file from S3.
 
-        Writes through an ``O_NOFOLLOW`` descriptor so a swapped-in symlink
-        cannot redirect ciphertext (or a later chmod) at another file.
+        Writes to a sibling temp file and ``os.replace``s into place so a
+        mid-write failure cannot truncate an existing destination. A symlink
+        at ``local_path`` is refused so ciphertext cannot replace (or follow)
+        a link the operator did not intend to overwrite.
 
         Args:
             s3_key: S3 object key.
@@ -204,23 +207,41 @@ class S3Store:
             "Downloading from S3",
             extra={"bucket": self._bucket, "key": s3_key, "version_id": version_id},
         )
-        # O_NOFOLLOW closes the TOCTOU window of is_symlink() then write;
-        # fchmod on the fd cannot be redirected at a swapped-in target.
-        fd = open_nofollow(local_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # Write to a sibling temp, then os.replace. O_TRUNC on local_path
+        # would leave a truncated dest if download_fileobj fails mid-write.
+        # A symlink dest is refused after the download so the target is never
+        # overwritten (os.replace would replace the symlink inode, not follow it).
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=local_path.parent, prefix=f".{local_path.name}.", suffix=".s3part"
+        )
+        tmp_path = Path(tmp_name)
+        succeeded = False
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as out:
-                fd = -1
+            os.fchmod(tmp_fd, 0o600)
+            with os.fdopen(tmp_fd, "wb") as out:
+                tmp_fd = -1
                 self._s3.download_fileobj(
                     self._bucket,
                     s3_key,
                     out,
                     ExtraArgs=extra_args if extra_args else None,
                 )
+            if local_path.is_symlink():
+                raise EnvaultError(
+                    f"Refusing to follow symlink: {local_path}. "
+                    "Ciphertext and plaintext must be regular files."
+                )
+            os.replace(tmp_path, local_path)
+            succeeded = True
         finally:
-            if fd >= 0:
+            if tmp_fd >= 0:
                 try:
-                    os.close(fd)
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+            if not succeeded:
+                try:
+                    tmp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
         logger.info("Download complete", extra={"local_path": str(local_path)})

@@ -11,8 +11,22 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
-- `encrypt_file` sets `max_encrypted_data_keys=1` (matching decrypt) and unlinks a
-  partial ciphertext at `output_path` if the SDK stream fails after `O_TRUNC`.
+- `encrypt_file` writes ciphertext to a sibling temp file and `os.replace`s into
+  place, so a failed SDK stream cannot destroy a pre-existing file at `output_path`.
+- S3 `download_file` writes to a sibling temp and `os.replace`s into place, so a
+  mid-write failure cannot truncate an existing destination.
+- `migrate` refuses FROM_PATH when any path component is a symlink (a directory
+  symlink parent would otherwise become `import_root` via `resolve()`).
+- `migrate` skips records with empty `encryption_context` (decrypt would skip AAD
+  checks on `purpose`/`sha256`/`file_name`/`kms_key_alias`) and rejects falsy
+  non-object `header`/`encryption_context` (`[]`, `""`) instead of coercing them
+  to `{}`.
+- `migrate` treats a failed audit-event write after CURRENT as an error (not an
+  import) and catches per-record DynamoDB `ClientError` so one AWS failure cannot
+  abort the rest of the file.
+- Pre-commit hook `rev` values are pinned to commit SHAs (same guarantee as
+  GitHub Actions).
+- `encrypt_file` sets `max_encrypted_data_keys=1` (matching decrypt).
 - `decrypt_to_stream` / `decrypt_file` reject non-12-digit account IDs before
   constructing a `DiscoveryFilter` (library callers bypassing the CLI).
 - `migrate` reads `FROM_PATH` with `O_NOFOLLOW` so a swapped-in symlink cannot redirect

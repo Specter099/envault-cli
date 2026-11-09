@@ -2144,15 +2144,43 @@ def test_parse_entry_rejects_non_string_encryption_context(tmp_path: Path) -> No
         _parse_output_json_entry(entry, import_root=tmp_path)
 
 
-def test_parse_entry_null_header_does_not_crash(tmp_path: Path) -> None:
-    """A null header must be treated as empty, not raise AttributeError."""
+def test_parse_entry_null_header_skips_empty_context(tmp_path: Path) -> None:
+    """A null header is empty context, which would skip AAD checks — skip the record."""
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"x")
     entry = {"mode": "encrypt", "input": str(plaintext), "header": None}
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-    assert record is not None
-    assert record.algorithm == ""
-    assert record.kms_key_id == "alias/s3_key"
+    assert _parse_output_json_entry(entry, import_root=tmp_path) is None
+
+
+def test_parse_entry_skips_empty_encryption_context(tmp_path: Path) -> None:
+    """Empty encryption_context would make verify_encryption_context a no-op."""
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"x")
+    entry = _make_entry(str(plaintext))
+    header = entry["header"]
+    assert isinstance(header, dict)
+    header["encryption_context"] = {}
+    assert _parse_output_json_entry(entry, import_root=tmp_path) is None
+
+
+def test_parse_entry_rejects_non_object_header(tmp_path: Path) -> None:
+    """Falsy non-dicts must not be coerced to {} by ``or {}``."""
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"x")
+    entry = {"mode": "encrypt", "input": str(plaintext), "header": []}
+    with pytest.raises(MigrationError, match="header must be a JSON object"):
+        _parse_output_json_entry(entry, import_root=tmp_path)
+
+
+def test_parse_entry_rejects_non_object_encryption_context(tmp_path: Path) -> None:
+    plaintext = tmp_path / "secret.txt"
+    plaintext.write_bytes(b"x")
+    entry = _make_entry(str(plaintext))
+    header = entry["header"]
+    assert isinstance(header, dict)
+    header["encryption_context"] = ""
+    with pytest.raises(MigrationError, match="encryption_context must be a JSON object"):
+        _parse_output_json_entry(entry, import_root=tmp_path)
 
 
 @mock_aws
@@ -2259,3 +2287,68 @@ def test_migrate_refuses_symlink_from_path(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "symlink" in result.output.lower()
+
+
+@mock_aws
+def test_migrate_refuses_symlink_parent_of_from_path(tmp_path: Path) -> None:
+    """A directory-symlink parent must not become import_root via resolve()."""
+    _create_table()
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "secret.txt").write_bytes(b"payload\n")
+    (real_dir / "output.json").write_text(json.dumps(_make_entry("secret.txt")) + "\n")
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir)
+    ndjson = link_dir / "output.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "migrate",
+            str(ndjson),
+            "--table",
+            TABLE_NAME,
+            "--region",
+            REGION,
+            "--dry-run",
+        ],
+        env=_CLI_ENV,
+    )
+    assert result.exit_code != 0
+    assert "symlink" in result.output.lower()
+
+
+@mock_aws
+def test_migrate_event_failure_after_current_is_error(tmp_path: Path) -> None:
+    """A failed audit write after CURRENT must not count the record as imported."""
+    _create_table()
+    import_root = tmp_path / "import"
+    import_root.mkdir()
+    (import_root / "secret.txt").write_bytes(b"payload\n")
+    ndjson = import_root / "output.json"
+    ndjson.write_text(json.dumps(_make_entry("secret.txt")) + "\n")
+
+    runner = CliRunner()
+    with patch(
+        "envault.cli.StateStore.put_event",
+        side_effect=ClientError(
+            {"Error": {"Code": "InternalServerError", "Message": "boom"}},
+            "PutItem",
+        ),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "migrate",
+                str(ndjson),
+                "--table",
+                TABLE_NAME,
+                "--region",
+                REGION,
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code == 0, result.output
+    assert "Migrated 0" in result.output
+    assert "errors 1" in result.output

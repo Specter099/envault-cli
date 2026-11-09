@@ -1,8 +1,8 @@
 # Weekly Security Audit — envault-cli
 
 **Reviewer:** Automated weekly static security review
-**Date:** 2026-11-02
-**Codebase:** `main` @ `a58ea77`; remediations on `cursor/repository-security-review-4e01`
+**Date:** 2026-11-09
+**Codebase:** `main` @ `a58ea77`; remediations on `cursor/security-review-agent-definition-b184`
 **Scope:** `src/envault/`, `infra/cdk/`, `.github/workflows/`, `code/`, tests, dependency manifests, git history (secret patterns). Static analysis only — no exploit code, no execution of untrusted payloads, no fetches of URLs found in the repo.
 
 ---
@@ -11,23 +11,23 @@
 
 Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryption SDK, `REQUIRE_ENCRYPT_REQUIRE_DECRYPT`, mandatory `DiscoveryFilter` with 12-digit account IDs, checksum-before-rename decrypt, and SHA-pinned GitHub Actions with OIDC PyPI publish.
 
-`main` has not moved since 2026-09-25 (`a58ea77`, #115/#116). Drafts #117–#123 remain unmerged; this PR re-lands those remediations and adds three library-path follow-ups from this week's remaining list.
+`main` has not moved since 2026-09-25 (`a58ea77`, #115/#116). Drafts #117–#126 remain unmerged; this PR re-lands those remediations and adds migrate-sandbox, atomic encrypt/download, and pre-commit SHA follow-ups from this week's remaining list.
 
-**This scan (on `main` before remediations):** 0 Critical, 6 High, 16 Medium, 10 Low
+**This scan (on `main` before remediations):** 0 Critical, 7 High, 18 Medium, 10 Low
 
-**After this PR:** 0 Critical, 2 High (accepted / requires operator action), 6 Medium, 7 Low
+**After this PR:** 0 Critical, 2 High (accepted / requires operator action), 5 Medium, 5 Low
 
 ---
 
 ## Remediations in this PR
 
-Re-landed from #117–#123:
+Re-landed from #117–#126:
 
 | ID | Severity | Fix |
 |----|----------|-----|
 | H-D | High | CDK `additional_kms_key_arns` requires a 12-digit account and rejects globs |
 | H-E | High | `sha256_file` / `encrypt_file` open plaintext with `O_NOFOLLOW` |
-| H-F | High | S3 `download_file` writes via `O_NOFOLLOW` + `download_fileobj` + `fchmod` |
+| H-F | High | S3 `download_file` refuses a symlink destination (target untouched) |
 | H-G | High | `best_effort_delete` opens with `O_NOFOLLOW` (symlink: skip overwrite, still unlink) |
 | H-H | High | S3 upload fails closed when PutObject returns no VersionId |
 | M-8 | Medium | `open_nofollow` fails closed if `O_NOFOLLOW` is missing |
@@ -40,17 +40,23 @@ Re-landed from #117–#123:
 | M-15 | Medium | Dependabot `/infra/cdk`; CDK `requirements.txt` pip-audit; `pip-audit>=2.7,<3` |
 | M-16 | Medium | `migrate` reads `FROM_PATH` with `open_nofollow` |
 | M-17 | Medium | Data bucket denies PutObject unless SSE is `aws:kms` |
+| M-18 | Medium | `encrypt_file` sets `max_encrypted_data_keys=1` (parity with decrypt) |
+| M-19 | Medium | `decrypt_to_stream` / `decrypt_file` reject non-12-digit account IDs before DiscoveryFilter |
 | L-8 | Low | Dashboard `last_activity` is Rich-escaped |
 | L-9 | Low | Actions checkout `persist-credentials: false` |
 | L-10 | Low | S3 `ObjectOwnership.BUCKET_OWNER_ENFORCED` |
 
-New this week (2026-11-02):
+New this week (2026-11-09):
 
 | ID | Severity | Fix |
 |----|----------|-----|
-| M-18 | Medium | `encrypt_file` sets `max_encrypted_data_keys=1` (parity with decrypt) |
-| M-19 | Medium | `decrypt_to_stream` / `decrypt_file` reject non-12-digit account IDs before DiscoveryFilter |
-| M-20 | Medium | `encrypt_file` unlinks partial ciphertext at `output_path` if the SDK stream fails after `O_TRUNC` |
+| M-21 | Medium | `encrypt_file` writes to a sibling temp then `os.replace` (failed stream cannot destroy a pre-existing `output_path`) |
+| M-22 | Medium | S3 `download_file` writes to a sibling temp then `os.replace` (mid-write failure cannot truncate dest) |
+| M-E | Medium | `migrate` skips records with empty `encryption_context` (decrypt would skip AAD checks) |
+| M-23 | Medium | `migrate` counts a failed audit-event write after CURRENT as an error; per-record `ClientError`/`BotoCoreError` |
+| M-24 | Medium | `migrate` rejects falsy non-object `header`/`encryption_context` (`[]`, `""`) instead of coercing them to `{}` |
+| L-6 | Low | `migrate` refuses FROM_PATH when any path component is a symlink |
+| L-7 | Low | Pre-commit hook `rev` values pinned to commit SHAs |
 
 ---
 
@@ -120,16 +126,6 @@ New this week (2026-11-02):
 
 **Fix:** `name-index` GSI (`file_name`, `encrypted_at`) in a future migration.
 
-#### M-E — Empty migrated encryption context skips AAD checks
-
-**Location:** `src/envault/crypto.py` `verify_encryption_context`; `src/envault/cli.py` `_parse_output_json_entry`
-
-**Issue:** `verify_encryption_context` only checks keys present in `expected`. An empty migrated context is a no-op on `purpose`/`sha256`/`file_name`/`kms_key_alias`. Checksum still binds. Migrate now warns and rejects non-string values.
-
-**Impact:** Substituted ciphertext that hashes to the same plaintext would not be caught by context checks on migrated records.
-
-**Fix:** Treat empty context as a migrate skip, or require the four app keys before writing CURRENT.
-
 #### M-F — IAM `PutItem` cannot enforce append-only
 
 **Location:** `infra/cdk/stacks/envault_stack.py` DynamoDB statement; `src/envault/state.py` `put_event`
@@ -168,18 +164,6 @@ Requires root credentials; cannot be set via CDK. Document as a post-deploy step
 
 Storage grows monotonically. Honouring a deletion request requires a new command plus a tightly scoped `s3:DeleteObject` grant (not present today).
 
-#### L-6 — `migrate` directory-symlink parent of FROM_PATH
-
-**Location:** `src/envault/cli.py` `import_root = from_path.parent.resolve()`
-
-`O_NOFOLLOW` refuses only the final FROM_PATH component. A directory-symlink parent is resolved and becomes `import_root`, widening the import sandbox to that real directory.
-
-#### L-7 — Pre-commit hooks pinned to tags, not SHAs
-
-**Location:** `.pre-commit-config.yaml`
-
-`rev: v1.5.0` / `v0.15.4` / `v4.6.0` can be retagged. GitHub Actions are SHA-pinned. Pin pre-commit `rev` to commit SHAs for the same guarantee.
-
 ---
 
 ## Strengths verified this week (do not re-open)
@@ -195,10 +179,12 @@ Storage grows monotonically. Honouring a deletion request requires a new command
 - Empty S3 VersionId is fail-closed (`--latest` opt-in)
 - Content-addressed S3 keys validated before fetch
 - Directory-symlink trees skipped on encrypt
-- `migrate` confined to the import directory; FROM_PATH itself is `O_NOFOLLOW`
+- `migrate` confined to the import directory; FROM_PATH itself is `O_NOFOLLOW`; symlink parents refused
+- Empty migrated encryption context is skipped, not imported
 - No hardcoded production secrets in the tree or sampled git history (test fixtures use `testing`)
 - cdk-nag suppressions for IAM5 include justification comments scoped to `encrypted/*`, `index/*`, and `sts:GetCallerIdentity`
 - No Dockerfiles in this repo
+- Pre-commit hooks SHA-pinned
 
 ---
 
@@ -206,14 +192,14 @@ Storage grows monotonically. Honouring a deletion request requires a new command
 
 - `docs/reviews/2026-07-26-deep-review.md` — state-machine findings (mostly fixed in 0.2.0)
 - `docs/plans/2026-03-03-security-audit-fixes.md` — original 25-item remediation plan
-- Weekly PRs #110–#114 (closed unmerged), #115 (merged 2026-09-25), #117–#123 (open drafts this PR supersedes)
+- Weekly PRs #110–#114 (closed unmerged), #115 (merged 2026-09-25), #117–#126 (open drafts this PR supersedes)
 
 ---
 
 ## Summary count
 
-**This scan (on `main` before remediations):** 0 Critical, 6 High, 16 Medium, 10 Low
+**This scan (on `main` before remediations):** 0 Critical, 7 High, 18 Medium, 10 Low
 
-**After this PR:** 0 Critical, 2 High, 6 Medium, 7 Low
+**After this PR:** 0 Critical, 2 High, 5 Medium, 5 Low
 
-Verification: `pytest tests/unit/` — **199 passed**; ruff clean. mypy: pre-existing tenacity return-type error in `retry.py` (unchanged). Crypto-safety inspector: PASS (8/8). Migration-safety inspector: PASS (6/6).
+Verification: `pytest tests/unit/` — **205 passed**; ruff clean. mypy: pre-existing tenacity return-type error in `retry.py` (unchanged). Crypto-safety inspector: PASS (8/8). Migration-safety inspector: PASS (6/6).

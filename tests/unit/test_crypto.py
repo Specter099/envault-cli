@@ -83,7 +83,7 @@ def test_encrypt_file_refuses_symlink_input(tmp_path: Path) -> None:
 def test_encrypt_file_unlinks_partial_output_on_stream_failure(
     kms_key: str, tmp_path: Path
 ) -> None:
-    """A failed SDK stream must not leave truncated ciphertext at output_path."""
+    """A failed SDK stream must not destroy a pre-existing ciphertext at output_path."""
     src = tmp_path / "in.txt"
     src.write_bytes(b"hello")
     out = tmp_path / "out.enc"
@@ -100,7 +100,9 @@ def test_encrypt_file_unlinks_partial_output_on_stream_failure(
                 out,
                 REGION,
             )
-    assert not out.exists()
+    assert out.read_bytes() == b"pre-existing"
+    leftovers = list(tmp_path.glob(".out.enc.*.encpart"))
+    assert leftovers == []
 
 
 def test_decrypt_file_refuses_symlink_ciphertext(tmp_path: Path) -> None:

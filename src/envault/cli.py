@@ -633,6 +633,16 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
     """
     store = StateStore(table_name=table, region=region)
     imported = skipped = errors = 0
+    # O_NOFOLLOW refuses only the final FROM_PATH component. A directory
+    # symlink in the path would make parent.resolve() the real directory and
+    # widen the import sandbox to that target.
+    if _path_has_symlink_component(from_path):
+        console.print(
+            "[bold red]Error:[/bold red] Refusing to follow a symlink in the "
+            f"migration path {escape(str(from_path))}. Import is confined to the "
+            "real directory containing FROM_PATH."
+        )
+        sys.exit(1)
     import_root = from_path.parent.resolve()
 
     try:
@@ -656,13 +666,26 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
                 continue
             if not dry_run:
                 store.put_current_state(record)
-                store.put_event(
-                    record,
-                    operation="ENCRYPT",
-                    correlation_id="migrated-from-output-json",
-                    audit_ttl_days=audit_ttl_days,
-                    principal_arn=caller_arn(region),
-                )
+                try:
+                    store.put_event(
+                        record,
+                        operation="ENCRYPT",
+                        correlation_id="migrated-from-output-json",
+                        audit_ttl_days=audit_ttl_days,
+                        principal_arn=caller_arn(region),
+                    )
+                except (ClientError, BotoCoreError, EnvaultError) as event_exc:
+                    # CURRENT is already written. Counting this as imported
+                    # would hide a missing audit row; retry hits StateConflict
+                    # and would skip the event forever.
+                    logger.error(
+                        "CURRENT written but audit event failed for line %d (%s): %s",
+                        i,
+                        record.sha256_hash[:16],
+                        event_exc,
+                    )
+                    errors += 1
+                    continue
             imported += 1
         except StateConflictError:
             logger.info("Record already exists, skipping migration for line %d", i)
@@ -676,6 +699,8 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
             MigrationError,
             EnvaultError,
             OSError,
+            ClientError,
+            BotoCoreError,
         ) as exc:
             logger.warning("Failed to migrate record at line %d: %s", i, exc)
             errors += 1
@@ -693,9 +718,7 @@ def _parse_output_json_entry(
     if entry.get("mode") != "encrypt":
         return None
 
-    header = entry.get("header", {}) or {}
-    if not isinstance(header, dict):
-        raise MigrationError("header must be a JSON object")
+    header = _json_object_field(entry.get("header", {}), "header")
     input_path = entry.get("input", "")
     if not input_path:
         return None
@@ -706,18 +729,17 @@ def _parse_output_json_entry(
     algorithm = _extract_algorithm(header)
     message_id = _extract_message_id(header)
     kms_key_id = _extract_kms_key_id(header)
-    enc_context = header.get("encryption_context", {}) or {}
-    if not isinstance(enc_context, dict):
-        raise MigrationError("encryption_context must be a JSON object")
+    enc_context = _json_object_field(header.get("encryption_context", {}), "encryption_context")
     for ctx_key, ctx_value in enc_context.items():
         if not isinstance(ctx_key, str) or not isinstance(ctx_value, str):
             raise MigrationError("encryption_context keys and values must be strings")
     if not enc_context:
         logger.warning(
-            "Migrating record with empty encryption_context; decrypt will not bind "
-            "purpose/sha256/file_name/kms_key_alias (checksum still verified): %s",
+            "Skipping migration record with empty encryption_context "
+            "(decrypt would not bind purpose/sha256/file_name/kms_key_alias): %s",
             input_path,
         )
+        return None
 
     if not plaintext_path.exists():
         logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
@@ -749,6 +771,19 @@ def _parse_output_json_entry(
         encrypted_at=now,
         last_updated=now,
     )
+
+
+def _json_object_field(value: Any, field: str) -> dict[str, Any]:
+    """Return a dict, treating JSON null as empty. Reject arrays/strings/numbers.
+
+    ``value or {}`` would coerce ``[]`` and ``""`` to an empty object and skip
+    the type check that follows, importing a record with no header at all.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise MigrationError(f"{field} must be a JSON object")
+    return value
 
 
 def _extract_algorithm(header: dict[str, Any]) -> str:
