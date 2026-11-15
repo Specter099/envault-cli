@@ -1,4 +1,17 @@
-"""DynamoDB state store — single-table design with current state + append-only event log."""
+"""DynamoDB state store — single-table design with current state + append-only event log.
+
+**What the audit trail can and cannot prove.** Events are written with
+``attribute_not_exists(SK)``, which stops envault from overwriting an event by
+accident (a retried write, an SK collision). It does not stop a principal that
+holds ``dynamodb:PutItem`` on the table, which every envault user needs: such a
+principal can write the same item without the condition, rewriting an event's
+operation, principal or timestamp, or can delete events outright. The
+``principal_arn`` on an event is reported by the client that wrote it, not
+verified by DynamoDB. Treat this table as a convenient index of activity. The
+authoritative record of who used which key and object is CloudTrail: KMS events
+(``Decrypt``, ``GenerateDataKey``), plus DynamoDB and S3 data events where those
+are enabled.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +19,7 @@ import logging
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import boto3
@@ -85,6 +98,10 @@ class StateStore:
     GSIs:
       state-index: PK=current_state, SK=encrypted_at  (CURRENT rows only)
       date-index:  PK=date, SK=last_updated          (EVENT rows only)
+
+    "Immutable" and "append-only" describe what envault itself does. Anyone with
+    write access to the table can change or delete any row, events included.
+    CloudTrail is the authoritative trail (see the module docstring).
     """
 
     def __init__(self, table_name: str, region: str = "us-east-1") -> None:
@@ -109,11 +126,20 @@ class StateStore:
             query_kwargs["ExclusiveStartKey"] = last_key
         return items
 
-    @aws_retry(never=(StateConflictError,))
     def put_current_state(
         self, record: FileRecord, expected_last_updated: str | None = None
     ) -> None:
         """Upsert the current state record for a file (PK=FILE#hash, SK=CURRENT).
+
+        Sets ``record.last_updated`` to a fresh microsecond timestamp, which is
+        the record's compare-and-swap token for the next writer.
+
+        Retries are idempotent. The token is generated once, before the first
+        attempt, so a retry re-sends the identical item. A write can land while
+        its reply is lost (a read timeout). The retry's condition then fails
+        because our own write is already there. In that case a consistent read
+        finds exactly the item we sent, and the call succeeds instead of
+        reporting a conflict that never happened.
 
         Args:
             record: The file record to write.
@@ -121,12 +147,23 @@ class StateStore:
                 only succeeds if the existing record's last_updated matches. If None
                 and no record exists yet, uses attribute_not_exists to prevent
                 clobbering an existing record.
+
+        Raises:
+            StateConflictError: If the condition fails and the stored item is not
+                the one this call wrote.
         """
         record.last_updated = _now_iso()
         item = record.to_dynamo_item(sk=CURRENT)
+        self._put_current_item(item, expected_last_updated)
+        logger.debug(
+            "put_current_state",
+            extra={"sha256": record.sha256_hash[:16], "state": record.current_state},
+        )
 
+    @aws_retry(never=(StateConflictError,))
+    def _put_current_item(self, item: dict[str, Any], expected_last_updated: str | None) -> None:
+        """Conditional PutItem of a fully built CURRENT item (retry loop of put_current_state)."""
         put_kwargs: dict[str, Any] = {"Item": item}
-
         if expected_last_updated is not None:
             put_kwargs["ConditionExpression"] = "last_updated = :expected"
             put_kwargs["ExpressionAttributeValues"] = {":expected": expected_last_updated}
@@ -136,18 +173,32 @@ class StateStore:
         try:
             self._table.put_item(**put_kwargs)
         except ClientError as exc:
-            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                raise StateConflictError(
-                    f"Concurrent modification detected for {record.sha256_hash[:16]}... "
-                    f"(expected last_updated={expected_last_updated!r}). "
-                    "Another process may have modified this record."
-                ) from exc
-            raise
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            if self._stored_item_equals(item):
+                logger.debug(
+                    "conditional write already applied by an earlier attempt",
+                    extra={"last_updated": item["last_updated"]},
+                )
+                return
+            raise StateConflictError(
+                f"Concurrent modification detected for {str(item['sha256_hash'])[:16]}... "
+                f"(expected last_updated={expected_last_updated!r}). "
+                "Another process may have modified this record."
+            ) from exc
 
-        logger.debug(
-            "put_current_state",
-            extra={"sha256": record.sha256_hash[:16], "state": record.current_state},
+    def _stored_item_equals(self, item: dict[str, Any]) -> bool:
+        """True if a strongly consistent read returns exactly ``item``.
+
+        The whole item is compared, not only its ``last_updated`` token: two
+        writers that drew the same microsecond must not mistake each other's
+        write for their own. DynamoDB returns numbers as Decimal, which compares
+        equal to the int that was written.
+        """
+        response = self._table.get_item(
+            Key={"PK": item["PK"], "SK": item["SK"]}, ConsistentRead=True
         )
+        return bool(response.get("Item") == item)
 
     def put_event(
         self,
@@ -157,15 +208,23 @@ class StateStore:
         audit_ttl_days: int = 365,
         principal_arn: str = "",
     ) -> None:
-        """Append an immutable event record to the audit trail.
+        """Append an event record to the audit trail.
+
+        The write is conditional on the SK being new, so envault never replaces
+        an existing event. That guards against accidents, not against a table
+        writer: anyone with ``dynamodb:PutItem`` can rewrite or forge events,
+        including ``principal_arn``. CloudTrail is the authoritative trail.
 
         Args:
             record: The file the event concerns.
             operation: ENCRYPT, DECRYPT, ACCESS, ROTATE_KEY.
             correlation_id: Groups events from a single invocation.
             audit_ttl_days: Retention before DynamoDB TTL expires the event.
-            principal_arn: The AWS identity performing the operation. Without
-                this the trail records what happened but not who did it.
+            principal_arn: The AWS identity performing the operation, as this
+                client resolved it (see :func:`envault.identity.caller_arn`).
+                Without this the trail records what happened but not who did
+                it. DynamoDB stores whatever the writer sends, so this
+                attributes honest clients only.
         """
         now = _now_iso()
         unique_suffix = uuid.uuid4().hex[:8]
@@ -197,9 +256,11 @@ class StateStore:
         item["date"] = _today_str()
         item["ttl"] = _ttl_epoch(audit_ttl_days)
         try:
-            # Enforce append-only at the write path. Without this an event can be
-            # silently overwritten at a known PK/SK by anyone holding PutItem,
-            # which is not what "immutable audit trail" should mean.
+            # Append-only at envault's own write path: a retry or an SK collision
+            # can never replace an existing event. This is a client-side
+            # condition. A principal holding PutItem can still overwrite the
+            # item by writing it without the condition (r08), so it prevents
+            # accidents, not tampering; CloudTrail is the authoritative trail.
             self._table.put_item(Item=item, ConditionExpression="attribute_not_exists(SK)")
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -276,6 +337,47 @@ class StateStore:
             KeyConditionExpression=Key("date").eq(date_str),
             FilterExpression=Attr("SK").begins_with(EVENT_PREFIX),
         )
+
+    def list_events_between(
+        self, start: date, end: date, *, max_days: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Return EVENT records dated ``start`` through ``end`` (inclusive), oldest first.
+
+        Days are UTC calendar days, the same ``date`` attribute
+        :meth:`put_event` writes. The date-index is partitioned by day, so this
+        runs one paginated query per day (via :meth:`list_events_by_date`, each
+        with its own retries). A transient failure on day 40 does not restart
+        the whole range. Results are sorted by SK, whose second component is
+        the event's ISO-8601 timestamp, so the order is chronological across
+        days and files.
+
+        Args:
+            start: First day to include.
+            end: Last day to include.
+            max_days: If given, refuse ranges longer than this many days instead
+                of issuing that many queries.
+
+        Raises:
+            TypeError: If ``start`` or ``end`` is a ``datetime`` rather than a ``date``.
+            ValueError: If ``start`` is after ``end``, or the range is longer
+                than ``max_days``.
+        """
+        for bound in (start, end):
+            if isinstance(bound, datetime) or not isinstance(bound, date):
+                raise TypeError(
+                    f"list_events_between takes datetime.date values (UTC days), got {bound!r}"
+                )
+        if start > end:
+            raise ValueError(f"start {start.isoformat()} is after end {end.isoformat()}")
+        days = (end - start).days + 1
+        if max_days is not None and days > max_days:
+            raise ValueError(f"range of {days} days exceeds max_days={max_days}")
+
+        events: list[dict[str, Any]] = []
+        for offset in range(days):
+            events.extend(self.list_events_by_date((start + timedelta(days=offset)).isoformat()))
+        events.sort(key=lambda event: str(event.get("SK", "")))
+        return events
 
     def _state_stats(self, state: str) -> tuple[int, str]:
         """Return (count, latest last_updated) of CURRENT records in a state.

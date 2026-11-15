@@ -1,4 +1,14 @@
-"""Caller identity resolution for audit attribution."""
+"""Caller identity resolution for audit attribution.
+
+The ARN resolved here is what envault *reports* in its own audit events. It is
+self-reported: DynamoDB stores whatever ``principal_arn`` the writing client
+sends, and any principal with ``dynamodb:PutItem`` on the table can write
+events naming someone else, or rewrite existing ones (see
+:mod:`envault.state`). It attributes honest clients, not adversaries. For
+attribution that a table writer cannot forge, use CloudTrail: KMS ``Decrypt``
+and ``GenerateDataKey`` events (recorded by default), plus DynamoDB and S3 data
+events where they are enabled.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +36,11 @@ def caller_arn(region: str = "us-east-1") -> str:
     :data:`UNKNOWN_PRINCIPAL` rather than blocking the operation: refusing to
     decrypt because the audit log would be less precise trades an outage for a
     bookkeeping problem, which is the wrong way round.
+
+    The value is only as trustworthy as the client recording it. A modified
+    client, or anyone writing to the table directly, can record any ARN.
+    CloudTrail's ``userIdentity`` on the KMS calls is the authoritative answer
+    to "who decrypted this".
 
     Args:
         region: AWS region for the STS endpoint.

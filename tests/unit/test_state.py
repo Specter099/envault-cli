@@ -737,3 +737,172 @@ def test_summary_last_activity_survives_legacy_event_rows():
     summary = store.summary()
     assert summary["encrypted"] == 1
     assert summary["last_activity"] == record.last_updated
+
+
+# ---------------------------------------------------------------------------
+# L1(c): a conditional write whose reply is lost must not report a conflict
+# ---------------------------------------------------------------------------
+
+
+def _lose_first_reply(real_put):
+    """put_item that lands every write but loses the reply to the first one."""
+    tokens: list[str] = []
+
+    def put(**kwargs):
+        tokens.append(kwargs["Item"]["last_updated"])
+        result = real_put(**kwargs)
+        if len(tokens) == 1:
+            raise ReadTimeoutError(endpoint_url="https://dynamodb.us-east-1.amazonaws.com")
+        return result
+
+    return put, tokens
+
+
+@mock_aws
+def test_put_current_state_tolerates_lost_reply(no_retry_sleep):
+    """r09 R09: our own landed write must not come back as StateConflictError."""
+    store = _create_table()
+    record = _make_record()
+    put, tokens = _lose_first_reply(store._table.put_item)
+
+    with patch.object(store._table, "put_item", side_effect=put):
+        store.put_current_state(record)
+
+    assert len(tokens) == 2, "the lost reply must be retried exactly once"
+    assert tokens[0] == tokens[1] == record.last_updated, "the CAS token must not change"
+    stored = store.get_current_state(record.sha256_hash)
+    assert stored is not None
+    assert stored.last_updated == record.last_updated
+
+
+@mock_aws
+def test_put_current_state_tolerates_lost_reply_on_update(no_retry_sleep):
+    """Same for an optimistic-locking update (expected_last_updated given)."""
+    store = _create_table()
+    record = _make_record()
+    store.put_current_state(record)
+    original = record.last_updated
+    record.current_state = DECRYPTED
+    put, tokens = _lose_first_reply(store._table.put_item)
+
+    with patch.object(store._table, "put_item", side_effect=put):
+        store.put_current_state(record, expected_last_updated=original)
+
+    assert tokens[0] == tokens[1] != original
+    stored = store.get_current_state(record.sha256_hash)
+    assert stored is not None
+    assert stored.current_state == DECRYPTED
+    assert stored.last_updated == record.last_updated
+
+
+@mock_aws
+def test_put_current_state_lost_reply_then_foreign_write_is_a_conflict(no_retry_sleep):
+    """If someone else's write replaced ours before the retry, that is a real conflict."""
+    store = _create_table()
+    record = _make_record()
+    real_put = store._table.put_item
+    calls = {"n": 0}
+
+    def put(**kwargs):
+        calls["n"] += 1
+        result = real_put(**kwargs)
+        if calls["n"] == 1:
+            # Another writer replaces our landed item, then our reply is lost.
+            real_put(Item={**kwargs["Item"], "file_name": "theirs.txt", "last_updated": "other"})
+            raise ReadTimeoutError(endpoint_url="https://dynamodb.us-east-1.amazonaws.com")
+        return result
+
+    with patch.object(store._table, "put_item", side_effect=put):
+        with pytest.raises(StateConflictError, match="Concurrent modification"):
+            store.put_current_state(record)
+    stored = store.get_current_state(record.sha256_hash)
+    assert stored is not None
+    assert stored.file_name == "theirs.txt"
+
+
+# ---------------------------------------------------------------------------
+# M3: audit ranges span days
+# ---------------------------------------------------------------------------
+
+
+def _event_on(store: StateStore, record: FileRecord, day: str, hhmm: str, op: str) -> None:
+    """Write an event as if it happened on ``day`` at ``hhmm`` UTC."""
+    with (
+        patch("envault.state._today_str", return_value=day),
+        patch("envault.state._now_iso", return_value=f"{day}T{hhmm}:00.000000+00:00"),
+    ):
+        store.put_event(record, operation=op, correlation_id=f"c-{day}-{hhmm}")
+
+
+@mock_aws
+def test_list_events_between_spans_days():
+    """r04: events on 11-01, 11-05 and 11-09 are all inside 11-01..11-30."""
+    from datetime import date
+
+    store = _create_table()
+    record = _make_record()
+    # Written out of order, and two on the same day in reverse time order.
+    _event_on(store, record, "2026-11-09", "08:00", "DECRYPT")
+    _event_on(store, record, "2026-11-05", "15:00", "ACCESS")
+    _event_on(store, record, "2026-11-01", "10:00", "ENCRYPT")
+    _event_on(store, record, "2026-11-05", "09:00", "ROTATE_KEY")
+    _event_on(store, record, "2026-12-01", "00:00", "ACCESS")  # outside the range
+
+    events = store.list_events_between(date(2026, 11, 1), date(2026, 11, 30))
+    assert [e["operation"] for e in events] == ["ENCRYPT", "ROTATE_KEY", "ACCESS", "DECRYPT"]
+    assert [e["SK"] for e in events] == sorted(e["SK"] for e in events)
+
+    later = store.list_events_between(date(2026, 11, 2), date(2026, 11, 9))
+    assert [e["operation"] for e in later] == ["ROTATE_KEY", "ACCESS", "DECRYPT"]
+
+    one_day = store.list_events_between(date(2026, 11, 5), date(2026, 11, 5))
+    assert [e["operation"] for e in one_day] == ["ROTATE_KEY", "ACCESS"]
+
+    assert store.list_events_between(date(2026, 11, 10), date(2026, 11, 30)) == []
+
+
+@mock_aws
+def test_list_events_between_excludes_current_records():
+    from datetime import date, datetime, timezone
+
+    store = _create_table()
+    record = _make_record()
+    store.put_current_state(record)
+    store.put_event(record, operation="ENCRYPT", correlation_id="c")
+    today = datetime.now(timezone.utc).date()
+    events = store.list_events_between(today, today)
+    assert len(events) == 1
+    assert events[0]["SK"].startswith("EVENT#")
+    assert store.list_events_between(date(2000, 1, 1), date(2000, 1, 1)) == []
+
+
+@mock_aws
+def test_list_events_between_queries_each_day_once():
+    """One (paginated) date-index query per day, inclusive of both ends."""
+    from datetime import date
+
+    store = _create_table()
+    days: list[str] = []
+    real = store.list_events_by_date
+
+    def spy(date_str: str):
+        days.append(date_str)
+        return real(date_str)
+
+    with patch.object(store, "list_events_by_date", side_effect=spy):
+        store.list_events_between(date(2026, 2, 27), date(2026, 3, 2))
+    assert days == ["2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02"]
+
+
+@mock_aws
+def test_list_events_between_validates_its_range():
+    from datetime import date, datetime, timezone
+
+    store = _create_table()
+    with pytest.raises(ValueError, match="after"):
+        store.list_events_between(date(2026, 11, 2), date(2026, 11, 1))
+    with pytest.raises(ValueError, match="max_days"):
+        store.list_events_between(date(2026, 1, 1), date(2026, 12, 31), max_days=31)
+    assert store.list_events_between(date(2026, 1, 1), date(2026, 1, 31), max_days=31) == []
+    with pytest.raises(TypeError, match="datetime.date"):
+        store.list_events_between(datetime(2026, 11, 1, tzinfo=timezone.utc), date(2026, 11, 2))
