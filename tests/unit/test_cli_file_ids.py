@@ -978,3 +978,34 @@ def test_records_keep_verifying_with_their_own_key_after_the_id_key_changes(
     # by name or by their identifier.
     assert by_sha.exit_code == 1
     assert "No record found" in by_sha.output
+
+
+def test_rotate_key_refuses_to_reencrypt_bytes_that_changed(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """The record keeps its identifier, so the bytes re-encrypted must be the bytes decrypted."""
+    file_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+    before = _current(file_id)
+    real = cli_mod.encrypt_file
+
+    def encrypt_other_bytes(*args: Any, **kwargs: Any) -> Any:
+        result = real(*args, **kwargs)
+        result.sha256_hash = _sha256(b"493018\n")
+        return result
+
+    with patch.object(cli_mod, "encrypt_file", encrypt_other_bytes):
+        result = _run(env, "rotate-key", "--new-key-id", NEW_ALIAS)
+
+    assert result.exit_code == 1, result.output
+    assert "changed between decryption and re-encryption" in result.output
+    assert _current(file_id) == before
+    versions = boto3.client("s3", region_name=REGION).list_object_versions(Bucket=BUCKET)
+    assert len(versions["Versions"]) == 1  # nothing uploaded
+
+
+@pytest.mark.parametrize("command", ["status", "audit"])
+def test_file_option_takes_only_an_identifier(env: dict[str, str], command: str) -> None:
+    result = _run(env, command, "--file", "not-an-id")
+
+    assert result.exit_code == 1
+    assert "Invalid identifier" in result.output
