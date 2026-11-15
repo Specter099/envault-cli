@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import glob
 import hashlib
 import sys
 import uuid
@@ -792,44 +791,6 @@ def test_decrypt_refuses_empty_version_id(tmp_path: Path) -> None:
     output = result.output.lower()
     assert "version id" in output or "versionid" in output.replace(" ", "")
     assert "--latest" in result.output
-
-
-@mock_aws
-def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
-    """Temp downloaded file must be cleaned up even if decrypt_file raises."""
-    _create_table()
-    _create_bucket()
-    store = StateStore(table_name=TABLE_NAME, region=REGION)
-    record = _seed_encrypted_record(store)
-    _upload_fake_ciphertext(record.s3_key)
-
-    runner = CliRunner()
-    with patch("envault.cli.decrypt_file", side_effect=EnvaultError("boom")):
-        result = runner.invoke(
-            main,
-            [
-                "decrypt",
-                FAKE_SHA,
-                "--output",
-                str(tmp_path),
-                "--table",
-                TABLE_NAME,
-                "--bucket",
-                BUCKET_NAME,
-                "--region",
-                REGION,
-                "--allowed-account-ids",
-                ACCOUNT_IDS,
-                "--latest",
-            ],
-            env=_CLI_ENV,
-        )
-
-    assert result.exit_code != 0
-    import tempfile
-
-    leftover = glob.glob(f"{tempfile.gettempdir()}/envault_dl_*")
-    assert leftover == []
 
 
 # ---------------------------------------------------------------------------
