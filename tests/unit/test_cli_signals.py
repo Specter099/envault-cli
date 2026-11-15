@@ -35,6 +35,8 @@ from envault import identity
 from envault.cli import main
 from envault.state import ENCRYPTED, StateStore
 
+from ._id_key import ID_KEY_ALIAS, TESTS_DIR, id_key_env
+
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
 ALIAS = "alias/envault-test"
@@ -224,6 +226,7 @@ def env(tmp_path: pathlib.Path) -> Iterator[dict[str, str]]:
             "ENVAULT_TABLE": TABLE,
             "ENVAULT_REGION": REGION,
             "ENVAULT_ALLOWED_ACCOUNT_IDS": str(account),
+            **id_key_env(),
         }
         (tmp_path / "big.dat").write_bytes(BIG)
         result = CliRunner().invoke(main, ["encrypt", str(tmp_path / "big.dat")], env=environment)
@@ -346,11 +349,14 @@ _CHILD = textwrap.dedent(
     import boto3
     from moto import mock_aws
     from envault.cli import cli, main
+    from unit._id_key import create_id_key, install_generate_mac_key_arn_fix
 
+    install_generate_mac_key_arn_fix()
     with mock_aws():
         kms = boto3.client("kms", region_name="us-east-1")
         for alias in ("alias/envault-test", "alias/new-key"):
             kms.create_alias(AliasName=alias, TargetKeyId=kms.create_key()["KeyMetadata"]["KeyId"])
+        create_id_key()
         ddb = boto3.client("dynamodb", region_name="us-east-1")
         ddb.create_table(
             TableName="envault-test-state", BillingMode="PAY_PER_REQUEST",
@@ -402,6 +408,8 @@ def _spawn(
         "ENVAULT_BUCKET": BUCKET,
         "ENVAULT_TABLE": TABLE,
         "ENVAULT_ALLOWED_ACCOUNT_IDS": "123456789012",
+        "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS,
+        "PYTHONPATH": str(TESTS_DIR),
         "TMPDIR": str(private_tmp),
         "BIG_MB": "48",
         **(extra or {}),

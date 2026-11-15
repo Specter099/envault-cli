@@ -30,6 +30,8 @@ from envault import identity
 from envault.cli import main
 from envault.state import ENCRYPTED, StateStore
 
+from ._id_key import id_key_env
+
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
 ALIAS = "alias/envault-test"
@@ -100,6 +102,7 @@ def env() -> Iterator[dict[str, str]]:
             "ENVAULT_REGION": REGION,
             "ENVAULT_ALLOWED_ACCOUNT_IDS": str(account),
             "COLUMNS": "250",
+            **id_key_env(),
         }
 
 

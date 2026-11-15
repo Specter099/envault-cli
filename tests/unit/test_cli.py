@@ -27,6 +27,8 @@ from envault.crypto import DecryptResult, EncryptResult, verify_encryption_conte
 from envault.exceptions import ChecksumMismatchError, EnvaultError
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
+from ._id_key import ID_KEY_ALIAS, create_id_key
+
 TABLE_NAME = "envault-test-state"
 BUCKET_NAME = "envault-test-bucket"
 REGION = "us-east-1"
@@ -38,6 +40,8 @@ _CLI_ENV = {
     "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
     "AWS_DEFAULT_REGION": REGION,
 }
+# encrypt needs the HMAC key that names files (created with create_id_key()).
+_ENCRYPT_ENV = {**_CLI_ENV, "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS}
 
 
 @pytest.fixture(autouse=True)
@@ -347,6 +351,7 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
     """encrypt command: mocked crypto, real DynamoDB + S3."""
     _create_table()
     _create_bucket()
+    create_id_key()
 
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"sensitive data")
@@ -368,7 +373,7 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
                 "--region",
                 REGION,
             ],
-            env=_CLI_ENV,
+            env=_ENCRYPT_ENV,
         )
 
     assert result.exit_code == 0, result.output
@@ -807,6 +812,7 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(
 
     _create_table()
     _create_bucket()
+    create_id_key()
 
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"sensitive data")
@@ -831,7 +837,7 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(
                 "--region",
                 REGION,
             ],
-            env=_CLI_ENV,
+            env=_ENCRYPT_ENV,
         )
 
     assert result.exit_code != 0

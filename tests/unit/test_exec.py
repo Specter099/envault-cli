@@ -22,6 +22,8 @@ from envault import identity
 from envault.cli import main
 from envault.state import StateStore
 
+from ._id_key import ID_KEY_ALIAS, create_id_key
+
 TABLE_NAME = "envault-test-state"
 BUCKET_NAME = "envault-test-bucket"
 KEY_ALIAS = "alias/envault-test"
@@ -69,6 +71,7 @@ def _provision() -> str:
     kms = boto3.client("kms", region_name=REGION)
     key_id = kms.create_key(Description="envault-test")["KeyMetadata"]["KeyId"]
     kms.create_alias(AliasName=KEY_ALIAS, TargetKeyId=key_id)
+    create_id_key()
     return boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
 
 
@@ -89,6 +92,7 @@ def _env(account: str) -> dict[str, str]:
         "ENVAULT_TABLE": TABLE_NAME,
         "ENVAULT_REGION": REGION,
         "ENVAULT_ALLOWED_ACCOUNT_IDS": account,
+        "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS,
     }
 
 

@@ -16,6 +16,8 @@ from envault import identity
 from envault.cli import main
 from envault.state import ENCRYPTED, FileRecord, StateStore
 
+from ._id_key import id_key_env
+
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
 ALIAS = "alias/envault-test"
@@ -83,6 +85,7 @@ def env(tmp_path: pathlib.Path) -> Iterator[dict[str, str]]:
             "ENVAULT_REGION": REGION,
             "ENVAULT_ALLOWED_ACCOUNT_IDS": str(account),
             "COLUMNS": "250",
+            **id_key_env(),
         }
         (tmp_path / "db.env").write_bytes(SECRET)
         result = CliRunner().invoke(main, ["encrypt", str(tmp_path / "db.env")], env=environment)

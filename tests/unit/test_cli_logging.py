@@ -33,6 +33,8 @@ from envault import cli as cli_mod
 from envault import identity
 from envault.cli import main
 
+from ._id_key import ID_KEY_ALIAS, TESTS_DIR, create_id_key
+
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
 ALIAS = "alias/envault-test"
@@ -108,6 +110,7 @@ def _provision() -> str:
     kms = boto3.client("kms", region_name=REGION)
     key_id = kms.create_key(Description="envault-test")["KeyMetadata"]["KeyId"]
     kms.create_alias(AliasName=ALIAS, TargetKeyId=key_id)
+    create_id_key()
     return str(boto3.client("sts", region_name=REGION).get_caller_identity()["Account"])
 
 
@@ -121,6 +124,7 @@ def _env(account: str, **extra: str) -> dict[str, str]:
         "ENVAULT_TABLE": TABLE,
         "ENVAULT_REGION": REGION,
         "ENVAULT_ALLOWED_ACCOUNT_IDS": account,
+        "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS,
         **extra,
     }
 
@@ -294,11 +298,14 @@ _FINALIZER_SCRIPT = textwrap.dedent(
     import boto3
     from moto import mock_aws
     from envault.cli import cli, main
+    from unit._id_key import create_id_key, install_generate_mac_key_arn_fix
 
+    install_generate_mac_key_arn_fix()
     with mock_aws():
         kms = boto3.client("kms", region_name="us-east-1")
         kid = kms.create_key()["KeyMetadata"]["KeyId"]
         kms.create_alias(AliasName="alias/envault-test", TargetKeyId=kid)
+        create_id_key()
         ddb = boto3.client("dynamodb", region_name="us-east-1")
         ddb.create_table(
             TableName="envault-test-state", BillingMode="PAY_PER_REQUEST",
@@ -358,6 +365,8 @@ def test_failed_decrypt_prints_no_sdk_tracebacks_in_a_real_process(tmp_path: pat
         "ENVAULT_BUCKET": BUCKET,
         "ENVAULT_TABLE": TABLE,
         "ENVAULT_ALLOWED_ACCOUNT_IDS": "123456789012",
+        "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS,
+        "PYTHONPATH": str(TESTS_DIR),
         "TMPDIR": str(tmp_path),
         "COLUMNS": "200",
     }

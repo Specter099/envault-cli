@@ -52,6 +52,8 @@ from envault.state import (
     StateStore,
 )
 
+from ._id_key import id_key_env
+
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
 REGION = "us-east-1"
@@ -228,6 +230,7 @@ def _provision() -> tuple[str, dict[str, str]]:
         "ENVAULT_REGION": REGION,
         "ENVAULT_ALLOWED_ACCOUNT_IDS": str(account),
         "COLUMNS": "250",
+        **id_key_env(),
     }
     return str(legacy["Arn"]), env
 

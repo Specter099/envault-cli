@@ -32,6 +32,8 @@ from envault import identity
 from envault.cli import main
 from envault.state import ENCRYPTED, FileRecord, StateStore
 
+from ._id_key import ID_KEY_ALIAS, create_id_key
+
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
 ALIAS = "alias/envault-test"
@@ -161,6 +163,7 @@ def _provision() -> str:
     kms.create_alias(
         AliasName="alias/new-key", TargetKeyId=kms.create_key()["KeyMetadata"]["KeyId"]
     )
+    create_id_key()
     return str(boto3.client("sts", region_name=REGION).get_caller_identity()["Account"])
 
 
@@ -174,6 +177,7 @@ def _env(account: str) -> dict[str, str]:
         "ENVAULT_TABLE": TABLE,
         "ENVAULT_REGION": REGION,
         "ENVAULT_ALLOWED_ACCOUNT_IDS": account,
+        "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS,
     }
 
 
