@@ -216,10 +216,20 @@ class CredentialFd:
 
         Sealing prevents the bytes from being altered after verification — by
         this process or anything it spawns. Also clears ``FD_CLOEXEC`` so the
-        descriptor survives ``execve``.
+        descriptor survives ``execve``, and rewinds it to offset 0.
+
+        The rewind matters because the writer leaves the file offset at end of
+        file, and the child may share that offset. On macOS and the BSDs,
+        opening ``/dev/fd/N`` duplicates the descriptor rather than reopening
+        the file, and a program can also read the inherited descriptor
+        directly. Either would read nothing without the rewind. (Linux's
+        ``/proc/self/fd/N`` reopens the file with its own offset.)
+
+        Close every :meth:`writer` before calling this: a writer flushed
+        afterwards would write at the rewound offset.
 
         Seals are a Linux ``memfd`` feature; on other backends only the
-        inheritance change applies.
+        inheritance change and the rewind apply.
         """
         if _IS_LINUX and self.backing == "memfd":
             try:
@@ -227,6 +237,7 @@ class CredentialFd:
                 self._sealed = True
             except OSError as exc:  # pragma: no cover - kernel dependent
                 logger.debug("could not seal credential fd: %s", exc)
+        os.lseek(self.fd, 0, os.SEEK_SET)
         os.set_inheritable(self.fd, True)
 
     def close(self) -> None:

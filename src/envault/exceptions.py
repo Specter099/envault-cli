@@ -65,6 +65,15 @@ class MigrationError(EnvaultError):
     """Raised when a migration from output.json fails."""
 
 
+class UnsafeFileError(EnvaultError):
+    """Raised when a local path is not the regular file envault expected to read.
+
+    The path is a symbolic link, not a regular file (directory, FIFO, device),
+    or no longer the inode recorded when it was collected. Opening it anyway
+    could encrypt a file the operator never selected.
+    """
+
+
 class InvalidS3KeyError(EnvaultError):
     """Raised when an S3 object key fails validation.
 
