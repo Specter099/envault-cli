@@ -25,6 +25,9 @@ from constructs import Construct
 #: matches ``...:alarm:<prefix>*``, so a new alarm must keep the prefix.
 ALARM_NAME_PREFIX = "envault-"
 
+#: Alias of the HMAC key that names files (the CLI's ENVAULT_ID_KEY_ID).
+ID_KEY_ALIAS = "alias/envault-id"
+
 #: Bucket name prefixes. Unless ``keep_generated_bucket_names`` is set, the
 #: buckets are created in the S3 account-regional namespace and CloudFormation
 #: names them ``<prefix>-<account-id>-<region>-an``.
@@ -153,6 +156,7 @@ class EnvaultStack(Stack):
 
     Resources:
       - KMS Customer Managed Key with annual rotation
+      - KMS HMAC key that names files (file identifiers, ``alias/envault-id``)
       - S3 bucket with versioning, SSE-KMS, and block public access
       - DynamoDB table with single-table design, GSIs, PITR, and KMS encryption
       - IAM managed policy for least-privilege access
@@ -227,6 +231,42 @@ class EnvaultStack(Stack):
         # intentionally allowed so operators can freeze a compromised CMK
         # during incident response without a CloudFormation change.
         encryption_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyScheduleKeyDeletion",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["kms:ScheduleKeyDeletion"],
+                resources=["*"],
+            )
+        )
+
+        # ------------------------------------------------------------------ #
+        # KMS HMAC key: file identifiers                                       #
+        # ------------------------------------------------------------------ #
+        # The CLI names each new file by HMAC-SHA-256(this key, SHA-256 of the
+        # plaintext), so S3 keys, DynamoDB keys and the KMS encryption context
+        # (which CloudTrail records) say nothing about a file's content: for a
+        # short secret the bare SHA-256 would. Every record stores this key's
+        # ARN and is verified against it (VerifyMac) on every read, so losing
+        # the key makes those records unreadable through envault: retained,
+        # and its deletion denied like the data key's. KMS does not rotate HMAC
+        # keys automatically (and a new key would give every file a new
+        # identifier), so automatic rotation stays off.
+        id_key = kms.Key(
+            self,
+            "EnvaultIdKey",
+            description="envault — names files: HMAC of each file's SHA-256 (file identifiers)",
+            key_spec=kms.KeySpec.HMAC_256,
+            key_usage=kms.KeyUsage.GENERATE_VERIFY_MAC,
+            removal_policy=RemovalPolicy.RETAIN,  # never auto-delete a KMS key
+        )
+        kms.Alias(
+            self,
+            "EnvaultIdKeyAlias",
+            alias_name=ID_KEY_ALIAS,
+            target_key=id_key,
+        )
+        id_key.add_to_resource_policy(
             iam.PolicyStatement(
                 sid="DenyScheduleKeyDeletion",
                 effect=iam.Effect.DENY,
@@ -327,8 +367,8 @@ class EnvaultStack(Stack):
 
         # GSI: query all events on a given calendar date.
         # Projection ALL kept to avoid CloudFormation table replacement on existing stacks.
-        # For new deployments, INCLUDE with [SK, file_name, sha256_hash, correlation_id,
-        # operation] would reduce storage and exposure surface.
+        # For new deployments, INCLUDE with [SK, file_name, file_id (sha256_hash on
+        # legacy rows), correlation_id, operation] would reduce storage and exposure surface.
         table.add_global_secondary_index(
             index_name="date-index",
             partition_key=dynamodb.Attribute(name="date", type=dynamodb.AttributeType.STRING),
@@ -384,6 +424,16 @@ class EnvaultStack(Stack):
                     sid="KmsDescribeKey",
                     actions=["kms:DescribeKey"],
                     resources=kms_key_arns,
+                ),
+                # File identifiers: GenerateMac names a file (encrypt, migrate,
+                # lookups by SHA-256), VerifyMac checks one on every read of a
+                # keyed record. Either is an oracle for guessing a file's
+                # content from its identifier, so it goes to the people who may
+                # decrypt the file anyway, on this one key.
+                iam.PolicyStatement(
+                    sid="KmsFileIdentifiers",
+                    actions=["kms:GenerateMac", "kms:VerifyMac"],
+                    resources=[id_key.key_arn],
                 ),
                 iam.PolicyStatement(
                     sid="S3EncryptedObjects",
@@ -578,6 +628,7 @@ class EnvaultStack(Stack):
         # CloudFormation Outputs                                               #
         # ------------------------------------------------------------------ #
         cdk.CfnOutput(self, "KmsKeyAlias", value="alias/envault")
+        cdk.CfnOutput(self, "IdKeyAlias", value=ID_KEY_ALIAS)
         cdk.CfnOutput(self, "BucketName", value=bucket.bucket_name)
         cdk.CfnOutput(self, "TableName", value=table.table_name)
         cdk.CfnOutput(self, "ManagedPolicyArn", value=policy.managed_policy_arn)
@@ -587,6 +638,7 @@ class EnvaultStack(Stack):
             "EnvaultEnvVars",
             value=(
                 f"export ENVAULT_KEY_ID=alias/envault\n"
+                f"export ENVAULT_ID_KEY_ID={ID_KEY_ALIAS}\n"
                 f"export ENVAULT_BUCKET={bucket.bucket_name}\n"
                 f"export ENVAULT_TABLE={table.table_name}"
             ),

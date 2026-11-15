@@ -6,6 +6,7 @@ as app.py does, and the CloudFormation template is inspected. Covered:
 - M10: CloudWatch alarms can publish to the KMS-encrypted ops topic.
 - L9: account-regional bucket names, and the opt-out for existing stacks.
 - L10: validation of ``additional_kms_key_arns`` and the statements it feeds.
+- M6: the HMAC key that names files, its alias, and the MAC grant on it alone.
 - cdk-nag: no unsuppressed findings, and IAM5 suppressions are scoped.
 
 These run in CI's cdk-synth job from infra/cdk/ (``python -m pytest``) and are
@@ -41,12 +42,16 @@ PSEUDO_PARAMETERS = {
 # original (and every S3 VersionId pinned in DynamoDB). Replacing the topic or
 # its subscription would drop the confirmed alert email subscription.
 DATA_KEY = "EnvaultKeyBB09333A"
+# Every keyed record stores this key's ARN and is verified against it: a
+# replacement key would leave all of them unverifiable.
+ID_KEY = "EnvaultIdKey595DF692"
 DATA_BUCKET = "EnvaultBucketE28C9184"
 LOGS_BUCKET = "EnvaultAccessLogsBucket0E6D48BE"
 STATE_TABLE = "EnvaultStateTableC0CCED58"
 OPS_TOPIC = "EnvaultOpsTopic959F0C23"
 RETAINED = {
     DATA_KEY: "AWS::KMS::Key",
+    ID_KEY: "AWS::KMS::Key",
     DATA_BUCKET: "AWS::S3::Bucket",
     LOGS_BUCKET: "AWS::S3::Bucket",
     STATE_TABLE: "AWS::DynamoDB::Table",
@@ -281,6 +286,7 @@ def test_outputs_point_at_the_data_bucket(tmp_path: Path, context: dict[str, Any
     assert outputs["BucketName"]["Value"] == {"Ref": DATA_BUCKET}
     assert render(outputs["EnvaultEnvVars"]["Value"]) == (
         "export ENVAULT_KEY_ID=alias/envault\n"
+        "export ENVAULT_ID_KEY_ID=alias/envault-id\n"
         f"export ENVAULT_BUCKET=<{DATA_BUCKET}>\n"
         f"export ENVAULT_TABLE=<{STATE_TABLE}>"
     )
@@ -399,6 +405,68 @@ def test_additional_kms_key_arns_reach_every_kms_statement(tmp_path: Path) -> No
         f"s3.{REGION}.amazonaws.com",
     ]
     assert "Condition" not in statements["KmsDescribeKey"]
+
+
+# --------------------------------------------------------------------------- #
+# M6: the HMAC key that names files                                           #
+# --------------------------------------------------------------------------- #
+
+
+def test_id_key_is_an_hmac_key_without_automatic_rotation(template: dict[str, Any]) -> None:
+    props = resources(template, "AWS::KMS::Key")[ID_KEY]["Properties"]
+    assert props["KeySpec"] == "HMAC_256"
+    assert props["KeyUsage"] == "GENERATE_VERIFY_MAC"
+    # KMS rotates only symmetric encryption keys automatically; a new HMAC key
+    # would also give every file a new identifier.
+    assert props.get("EnableKeyRotation", False) is False
+
+
+def test_id_key_is_retained_and_its_deletion_denied(template: dict[str, Any]) -> None:
+    key = resources(template, "AWS::KMS::Key")[ID_KEY]
+    assert key["DeletionPolicy"] == "Retain"
+    assert key["UpdateReplacePolicy"] == "Retain"
+    (deny,) = [s for s in key["Properties"]["KeyPolicy"]["Statement"] if s["Effect"] == "Deny"]
+    assert deny["Sid"] == "DenyScheduleKeyDeletion"
+    assert as_list(deny["Action"]) == ["kms:ScheduleKeyDeletion"]
+    assert deny["Principal"] == {"AWS": "*"}
+    for statement in key["Properties"]["KeyPolicy"]["Statement"]:  # no AWS service is admitted
+        principal = statement.get("Principal")
+        assert not (isinstance(principal, dict) and "Service" in principal), statement
+
+
+def test_id_key_alias_is_what_the_cli_is_told(template: dict[str, Any]) -> None:
+    aliases = resources(template, "AWS::KMS::Alias").values()
+    (alias,) = [a for a in aliases if a["Properties"]["AliasName"] == "alias/envault-id"]
+    assert alias["Properties"]["TargetKeyId"] == {"Fn::GetAtt": [ID_KEY, "Arn"]}
+    assert envault_stack.ID_KEY_ALIAS == "alias/envault-id"
+    assert template["Outputs"]["IdKeyAlias"]["Value"] == "alias/envault-id"
+
+
+def test_user_policy_may_mac_with_the_id_key_and_nothing_else(template: dict[str, Any]) -> None:
+    statements = managed_policy_statements(template)
+    grant = statements["KmsFileIdentifiers"]
+    assert grant["Effect"] == "Allow"
+    assert sorted(as_list(grant["Action"])) == ["kms:GenerateMac", "kms:VerifyMac"]
+    assert as_list(grant["Resource"]) == [{"Fn::GetAtt": [ID_KEY, "Arn"]}]
+    assert "Condition" not in grant
+    for sid, statement in statements.items():
+        if sid == "KmsFileIdentifiers":
+            continue
+        # MAC operations nowhere else, and the ID key in no other statement.
+        assert not [a for a in as_list(statement["Action"]) if "Mac" in a or a == "kms:*"], sid
+        assert {"Fn::GetAtt": [ID_KEY, "Arn"]} not in as_list(statement["Resource"]), sid
+
+
+def test_additional_kms_key_arns_never_reach_the_mac_grant(tmp_path: Path) -> None:
+    _, tpl = synth(tmp_path, {"additional_kms_key_arns": f"{KEY_ARN},{MRK_ARN}"})
+    grant = managed_policy_statements(tpl)["KmsFileIdentifiers"]
+    assert as_list(grant["Resource"]) == [{"Fn::GetAtt": [ID_KEY, "Arn"]}]
+
+
+def test_id_key_needs_no_cdk_nag_waiver(template: dict[str, Any]) -> None:
+    """cdk-nag's KMS5 (rotation) covers symmetric keys only: nothing is suppressed for it."""
+    key = resources(template, "AWS::KMS::Key")[ID_KEY]
+    assert "cdk_nag" not in key.get("Metadata", {})
 
 
 # --------------------------------------------------------------------------- #
