@@ -42,14 +42,15 @@ CLI (cli.py) → crypto / s3 / state → AWS (KMS, S3, DynamoDB)
 
 - **`cli.py`** — Click command group: `encrypt`, `decrypt`, `exec`, `status`, `audit`, `dashboard`, `rotate-key`, `migrate`. Orchestrates the other modules. Uses Rich for terminal output.
 - **`crypto.py`** — Pure-Python encryption/decryption via `aws-encryption-sdk`. `encrypt_file()` uses `StrictAwsKmsMasterKeyProvider` (requires explicit key ID); `decrypt_file()` uses `DiscoveryAwsKmsMasterKeyProvider` (discovers key from ciphertext). SHA256 checksum verification on decrypt.
+- **`fileid.py`** — File identifier schemes. New records: `file_id = hex(HMAC-SHA-256(ID key, SHA-256(plaintext)))` via KMS `GenerateMac` (`IdKey`), verified on read with `VerifyMac` under the record's `id_key_arn` (`FileIdVerifier`, after `check_id_key_arn`: trusted account and partition, before any KMS call). Legacy records: the raw SHA-256.
 - **`s3.py`** — `S3Store` class for upload/download with tenacity retry. Captures S3 version IDs.
-- **`state.py`** — `StateStore` with DynamoDB single-table design. PK=`FILE#{sha256}`, SK=`CURRENT` (upserted) or `EVENT#{timestamp}#{operation}` (append-only audit trail). Two GSIs: `state-index`, `date-index`.
+- **`state.py`** — `StateStore` with DynamoDB single-table design. PK=`FILE#{file_id}`, SK=`CURRENT` (upserted) or `EVENT#{timestamp}#{operation}` (append-only audit trail). Two GSIs: `state-index`, `date-index`. `FileRecord` carries `file_id`, `id_scheme`, `id_key_arn`; keyed rows store `file_id`/`id_scheme`/`id_key_arn`, legacy rows `sha256_hash` and no `id_scheme`.
 - **`config.py`** — shared `boto_config` and the `Config` dataclass that builds the per-file encryption context. Env vars are read by Click options (`envvar=`), not by `Config`.
 - **`exceptions.py`** — Exception hierarchy rooted at `EnvaultError`.
 
 ### CDK Infrastructure (`infra/cdk/`)
 
-Single stack (`EnvaultStack`) provisioning KMS CMK, S3 bucket (versioned, SSE-KMS), DynamoDB table (on-demand, PITR, KMS-encrypted), and IAM managed policy.
+Single stack (`EnvaultStack`) provisioning KMS CMK, KMS HMAC key `alias/envault-id` (file identifiers; retained, deletion denied), S3 bucket (versioned, SSE-KMS), DynamoDB table (on-demand, PITR, KMS-encrypted), and IAM managed policy (including `kms:GenerateMac`/`kms:VerifyMac` on the HMAC key only).
 
 ### Legacy Shell Scripts (`code/`)
 
@@ -66,6 +67,7 @@ All runtime config via environment variables (no config files with secrets):
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ENVAULT_KEY_ID` | Yes | KMS key alias (e.g. `alias/my-key`) |
+| `ENVAULT_ID_KEY_ID` | For encrypt/migrate | KMS HMAC key (HMAC_256, GENERATE_VERIFY_MAC) that names files, e.g. `alias/envault-id`; elsewhere enables lookup by the SHA-256 of a file's content |
 | `ENVAULT_BUCKET` | Yes | S3 bucket for encrypted files |
 | `ENVAULT_TABLE` | Yes | DynamoDB table name |
 | `ENVAULT_REGION` | No | AWS region (default: `us-east-1`) |
@@ -87,5 +89,5 @@ All runtime config via environment variables (no config files with secrets):
 
 - Encryption uses key **alias** (`alias/s3_key`); decryption uses **discovery** (key auto-detected from ciphertext header)
 - `--commitment-policy require-encrypt-require-decrypt` is mandatory on all operations
-- SHA256 of plaintext is the primary file identifier across the entire system (DynamoDB PK, CLI lookup)
+- The file identifier (DynamoDB PK, S3 key component, encryption context `file_id`, CLI lookup) is `HMAC-SHA-256(ID key, SHA-256(plaintext))`, never the SHA-256 itself: the raw hash of a new record's plaintext must not be stored, uploaded, logged, printed or put in an exception. Legacy rows (no `id_scheme`) are identified by the raw SHA-256 and keep working; rotate-key keeps each record's scheme. `encrypt`/`migrate` require `ENVAULT_ID_KEY_ID`; a 64-hex IDENTIFIER is looked up as stored first, then (with the ID key) as the SHA-256 of the content
 - DynamoDB events are append-only and TTL-expired; current state is upserted separately

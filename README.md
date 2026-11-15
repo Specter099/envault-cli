@@ -35,6 +35,8 @@ Requires Python 3.10+.
 ```bash
 # Set required environment variables
 export ENVAULT_KEY_ID=alias/my-kms-key
+# KMS HMAC key that names files (see "File identifiers") — required to encrypt
+export ENVAULT_ID_KEY_ID=alias/envault-id
 export ENVAULT_BUCKET=my-encrypted-files-bucket
 export ENVAULT_TABLE=envault-state
 # Accounts trusted to have encrypted your data — required for every read
@@ -49,7 +51,7 @@ envault dashboard
 # Run a command with the secret in its environment — never written to disk
 envault exec -s secret.txt=API_TOKEN -- ./my-app
 
-# Or decrypt to a file, by filename or SHA256 hash
+# Or decrypt to a file, by name, file ID or the SHA-256 of its content
 envault decrypt secret.txt -o ./
 ```
 
@@ -62,6 +64,7 @@ All config via environment variables — no config files with secrets.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ENVAULT_KEY_ID` | Yes | — | KMS key alias (e.g. `alias/my-key`) |
+| `ENVAULT_ID_KEY_ID` | For `encrypt`, `migrate` | — | KMS HMAC key (key spec `HMAC_256`, usage `GENERATE_VERIFY_MAC`) that names files: alias, key ID or ARN, e.g. `alias/envault-id` from the CDK stack. `encrypt` and `migrate` exit 2 without it; elsewhere it lets IDENTIFIER be the SHA-256 of a file's content. Same as `--id-key-id`. See [File identifiers](#file-identifiers). |
 | `ENVAULT_BUCKET` | Yes | — | S3 bucket for encrypted files |
 | `ENVAULT_TABLE` | Yes | — | DynamoDB table name |
 | `ENVAULT_ALLOWED_ACCOUNT_IDS` | For reads | — | Comma-separated AWS account IDs trusted to have encrypted the data. Required by `decrypt`, `exec`, and `rotate-key`: it constrains KMS discovery so a ciphertext header cannot name a key outside your control. |
@@ -79,18 +82,18 @@ envault encrypt INPUT_PATH [--tag KEY=VALUE]... [--force]
 # Run a command with secrets supplied in memory, never on disk
 envault exec -s IDENTIFIER=VAR [-f IDENTIFIER=VAR]... [--clean-env] [--latest] -- COMMAND [ARGS]...
 
-# Decrypt by filename or SHA256 hash
+# Decrypt by stored name, file ID, or the SHA-256 of the content (needs ENVAULT_ID_KEY_ID)
 # -o takes an existing directory or a file path; existing files need --force
 envault decrypt IDENTIFIER [-o OUTPUT_DIR|OUTPUT_FILE] [--version N] [--force] [--latest]
 
 # List all encrypted/decrypted files
 envault status [--state encrypted|decrypted|all]
 
-# Show state for a specific file
-envault status --file SHA256
+# Show state for a specific file (its ID, or the SHA-256 of its content)
+envault status --file ID
 
 # View audit events
-envault audit [--since YYYY-MM-DD] [--file SHA256]
+envault audit [--since YYYY-MM-DD] [--file ID]
 
 # Summary dashboard
 envault dashboard
@@ -101,6 +104,50 @@ envault rotate-key --new-key-id alias/new-key [--dry-run] [--latest]
 # Migrate from legacy output.json (NDJSON format)
 envault migrate FROM_PATH [--dry-run]
 ```
+
+---
+
+## File identifiers
+
+Every stored file has a 64-character hex identifier: its DynamoDB key, part of its S3 key, the
+value `status` and `audit` show. New files are named by a keyed hash,
+
+```text
+file_id = HMAC-SHA-256(ID key, SHA-256(plaintext))
+```
+
+computed by KMS `GenerateMac` with the HMAC key in `ENVAULT_ID_KEY_ID` (the CDK stack creates
+`alias/envault-id`). The plain SHA-256 is never stored, uploaded, put in the encryption context,
+logged or printed: for a short secret such as a PIN it gives the content away to anyone who can
+list the bucket or read CloudTrail. `encrypt` and `migrate` refuse to run without the key (exit 2).
+
+- **Every read of a keyed file is verified.** After decrypting, and before anything is written,
+  sealed or handed to a command, KMS `VerifyMac` must confirm that the plaintext has the record's
+  identifier, under the key ARN stored on the record. That ARN must be in an account listed in
+  `ENVAULT_ALLOWED_ACCOUNT_IDS`; envault checks this before any KMS call.
+- **Looking a file up by its SHA-256 still works.** `decrypt`, `exec`, `status --file` and
+  `audit --file` take a file's ID or, with `ENVAULT_ID_KEY_ID` set, the SHA-256 of its content;
+  the content must then also hash to the value you typed. A value is first looked up as an ID, so
+  a typed SHA-256 does reach DynamoDB as a lookup key.
+- **Files stored by earlier versions** keep their SHA-256 identifier (rows without `id_scheme`),
+  and decrypt, exec, rotate-key, status, audit and dashboard keep working with them. Their hash
+  stays where it already was; `rotate-key` does not convert them. Encrypting such a file again
+  creates a new, keyed record next to the old one.
+- **IAM.** `kms:GenerateMac` (encrypt, migrate, lookups by SHA-256) and `kms:VerifyMac` (reads
+  of keyed files) on the ID key. Either lets a principal test guesses against an identifier, so
+  give them only to principals that may decrypt the files anyway. The stack's managed policy
+  grants both, on that key only.
+- **CloudTrail** records every `GenerateMac` and `VerifyMac` request: key, caller, time. The
+  `Message` sent with it (the SHA-256 digest) is a sensitive parameter in the KMS API and is not
+  expected in the record. The encryption context logged with `GenerateDataKey` and `Decrypt`
+  carries the keyed `file_id`.
+- **Keep the key.** KMS does not rotate HMAC keys automatically, and deleting the key makes every
+  keyed record unverifiable, so unreadable through envault. The stack retains the key and denies
+  `kms:ScheduleKeyDeletion` on it.
+
+Upgrading: deploy the stack (it adds the key and the grant), then set
+`ENVAULT_ID_KEY_ID=alias/envault-id`. Principals without the stack's managed policy need the two
+permissions above on the key.
 
 ---
 
@@ -145,11 +192,13 @@ treated as a failure, not a warning.
 The `infra/cdk/` directory contains a CDK Python stack that provisions:
 
 - **KMS CMK** with automatic annual key rotation
+- **KMS HMAC key** (`alias/envault-id`) that names files; retained, deletion denied (see
+  [File identifiers](#file-identifiers))
 - **S3 bucket** — versioned, SSE-KMS, block-public-access enforced
 - **DynamoDB table** — on-demand billing, KMS encryption, PITR, all GSIs
 - **IAM managed policy** — least-privilege, ready to attach to users/roles. Direct KMS use is
   limited to envault ciphertexts (encryption context `purpose`); bucket/table encryption is
-  allowed only via S3 and DynamoDB.
+  allowed only via S3 and DynamoDB; `kms:GenerateMac`/`kms:VerifyMac` on the HMAC key only.
 - **SNS topic + DynamoDB alarms** — pass `AlertEmailParam` to get notified
 
 ```bash
@@ -185,8 +234,11 @@ mypy src/envault/
 
 - KMS alias only in config — ARN is never stored or committed
 - `detect-secrets` pre-commit hook prevents credential leaks
-- Encryption context and SHA256 checksum are both verified **before** any plaintext is
-  written or handed to a command — a substituted ciphertext never materialises
+- Encryption context and the file's identifier (its keyed HMAC, or the SHA-256 for files from
+  earlier versions) are both verified **before** any plaintext is written or handed to a
+  command — a substituted ciphertext never materialises
+- Files are named by a keyed HMAC of their content hash, never by the hash itself (see
+  [File identifiers](#file-identifiers))
 - KMS discovery is constrained to explicitly trusted account IDs, so a ciphertext header
   cannot direct a decrypt at a key outside your control
 - DynamoDB events are append-only, enforced by a write condition rather than convention,
