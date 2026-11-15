@@ -613,11 +613,10 @@ def _encrypt_fd(
         )
 
         if sha256 != result.sha256_hash:
+            # Neither hash is named: both are hashes of plaintext (M6).
             raise EnvaultError(
-                f"File {name!r} was modified during encryption "
-                f"(pre-read hash {sha256[:16]}… != encrypted hash "
-                f"{result.sha256_hash[:16]}…). "
-                "Aborting to avoid storing mismatched metadata."
+                f"File {name!r} was modified during encryption: the bytes encrypted are not "
+                "the bytes hashed before. Aborting to avoid storing mismatched metadata."
             )
 
         # A key of its own for every upload (it embeds the message id), written
@@ -834,12 +833,13 @@ def decrypt(
                 f"  File: {_display(record.file_name)}  SHA256: {_id_prefix(sha256_hash)}..."
             )
             sys.exit(1)
-        except ChecksumMismatchError as exc:
+        except ChecksumMismatchError:
+            # Named by the identifier it should have had, never by the hash of
+            # what was decrypted (M6): for a short file that hash is the content.
             console.print(
                 "[bold red]Decryption failed:[/bold red] checksum mismatch.\n"
-                f"Expected SHA256 {_id_prefix(exc.expected)}... "
-                f"but got {_id_prefix(exc.actual)}...\n"
-                "The decrypted content does not match the original file.\n"
+                "The decrypted content is not the file this record identifies "
+                f"({_id_prefix(selection.expected_sha256)}...). No plaintext was written.\n"
                 "The encrypted data in S3 may have been corrupted or tampered with."
             )
             sys.exit(1)
@@ -1864,9 +1864,12 @@ def exec_(
     creds: list[CredentialFd] = []
     sinks: list[_BufferSink] = []
     accessed: list[FileRecord] = []
+    # The secret being fetched, for messages: (target variable, selection).
+    checking: tuple[str, _Selection] | None = None
     try:
         for identifier, var in env_pairs:
             selection = _resolve_identifier(identifier, store, newest_only=True)
+            checking = (var, selection)
             sink = _BufferSink()
             sinks.append(sink)
             _stream_secret(selection, sink, s3, region, account_ids, allow_latest=latest)
@@ -1875,6 +1878,7 @@ def exec_(
 
         for identifier, var in file_pairs:
             selection = _resolve_identifier(identifier, store, newest_only=True)
+            checking = (var, selection)
             cred = CredentialFd(var)
             creds.append(cred)
             with cred.writer() as out:
@@ -1908,11 +1912,18 @@ def exec_(
             "A ciphertext in S3 does not match its record in DynamoDB."
         )
         sys.exit(1)
-    except ChecksumMismatchError as exc:
+    except ChecksumMismatchError:
         _close_all(creds, sinks)
+        # Named by the identifier it should have had, never by the hash of what
+        # was decrypted (M6).
+        which = (
+            f"the secret for {_display(checking[0])} is not the file its record identifies "
+            f"({_id_prefix(checking[1].expected_sha256)}...)"
+            if checking
+            else "a secret is not the file its record identifies"
+        )
         console.print(
-            "[bold red]Refusing to run:[/bold red] checksum mismatch "
-            f"(expected {_id_prefix(exc.expected)}..., got {_id_prefix(exc.actual)}...).\n"
+            f"[bold red]Refusing to run:[/bold red] checksum mismatch: {which}.\n"
             "The encrypted data may have been corrupted or tampered with."
         )
         sys.exit(1)

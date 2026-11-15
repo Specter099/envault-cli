@@ -127,10 +127,84 @@ def test_decrypt_file_requires_account_ids(tmp_path: Path) -> None:
         )
 
 
-def test_checksum_mismatch_error() -> None:
-    err = ChecksumMismatchError(expected="aaa", actual="bbb")
-    assert "aaa" in str(err)
-    assert "bbb" in str(err)
+def test_checksum_mismatch_error_carries_only_what_was_expected() -> None:
+    """The plaintext's own hash is not kept: for a short file it is as good as the content."""
+    err = ChecksumMismatchError(expected="a" * 64)
+
+    assert err.expected == "a" * 64
+    assert not hasattr(err, "actual")
+    assert "mismatch" in str(err).lower()
+
+
+def _assert_hash_absent(digest: str, *texts: object) -> None:
+    for text in texts:
+        assert digest not in str(text)
+        assert digest[:16] not in str(text)
+
+
+@pytest.mark.parametrize("api", ["decrypt_file", "decrypt_to_stream"])
+def test_checksum_mismatch_never_names_the_plaintext_hash(
+    kms_key: str, tmp_path: Path, api: str
+) -> None:
+    """M6: a 6-digit PIN's SHA-256 is the PIN. No prefix of it may reach an error."""
+    content = b"493017\n"
+    actual = hashlib.sha256(content).hexdigest()
+    plaintext = tmp_path / "pin.txt"
+    plaintext.write_bytes(content)
+    encrypted = tmp_path / "pin.enc"
+    encrypt_file(plaintext, KMS_KEY_ALIAS, {"purpose": "envault-backup"}, encrypted, REGION)
+
+    with pytest.raises(ChecksumMismatchError) as exc_info:
+        if api == "decrypt_file":
+            decrypt_file(
+                encrypted,
+                tmp_path / "out.txt",
+                expected_sha256="0" * 64,
+                region=REGION,
+                allowed_account_ids=[MOTO_ACCOUNT_ID],
+            )
+        else:
+            with encrypted.open("rb") as source:
+                decrypt_to_stream(
+                    source,
+                    io.BytesIO(),
+                    expected_sha256="0" * 64,
+                    region=REGION,
+                    allowed_account_ids=[MOTO_ACCOUNT_ID],
+                )
+
+    err = exc_info.value
+    _assert_hash_absent(actual, err, repr(err), *vars(err).values(), *err.args)
+
+
+def test_crypto_logs_never_carry_the_plaintext_hash(
+    kms_key: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M6: under -v envault's INFO records reach stderr with their extras as JSON fields."""
+    import logging
+
+    content = b"493017\n"
+    digest = hashlib.sha256(content).hexdigest()
+    plaintext = tmp_path / "pin.txt"
+    plaintext.write_bytes(content)
+    encrypted = tmp_path / "pin.enc"
+
+    with caplog.at_level(logging.DEBUG, logger="envault"):
+        result = encrypt_file(
+            plaintext, KMS_KEY_ALIAS, {"purpose": "envault-backup"}, encrypted, REGION
+        )
+        decrypt_file(
+            encrypted,
+            tmp_path / "out.txt",
+            expected_sha256=result.sha256_hash,
+            region=REGION,
+            allowed_account_ids=[MOTO_ACCOUNT_ID],
+        )
+
+    records = [r for r in caplog.records if r.name.startswith("envault")]
+    assert records, "expected envault's own log records"
+    for record in records:
+        _assert_hash_absent(digest, record.getMessage(), *vars(record).values())
 
 
 # ---------------------------------------------------------------------------

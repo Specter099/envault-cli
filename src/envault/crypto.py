@@ -9,7 +9,7 @@ import os
 import tempfile
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -308,9 +308,14 @@ def _decrypt_failure(
 
 @dataclass
 class EncryptResult:
-    """Result of an encryption operation."""
+    """Result of an encryption operation.
 
-    sha256_hash: str
+    ``sha256_hash`` is the plaintext's SHA-256 (hex). It is kept out of the
+    repr: for a short file it is as good as the content, and envault never
+    logs or prints it.
+    """
+
+    sha256_hash: str = field(repr=False)
     file_size_bytes: int
     algorithm: str
     message_id: str
@@ -322,10 +327,11 @@ class DecryptResult:
     """Result of a decryption operation.
 
     ``output_path`` is None when the plaintext was streamed to a caller-supplied
-    sink (a memfd, a buffer) rather than written to a file.
+    sink (a memfd, a buffer) rather than written to a file. ``sha256_hash``,
+    the plaintext's SHA-256, is kept out of the repr (see :class:`EncryptResult`).
     """
 
-    sha256_hash: str
+    sha256_hash: str = field(repr=False)
     file_size_bytes: int
     encryption_context: dict[str, str]
     output_path: Path | None = None
@@ -521,10 +527,11 @@ def encrypt_fd(
             if isinstance(header.message_id, bytes)
             else str(header.message_id)
         )
+        # No hash of the plaintext here or in any other log record: under -v
+        # these records reach stderr with every extra as a JSON field (M6).
         logger.info(
             "Encryption complete",
             extra={
-                "sha256": sha256_hash[:16],
                 "output": str(output_path),
                 "algorithm": algorithm,
                 "message_id": message_id,
@@ -710,7 +717,8 @@ def _decrypt_stream_once(
 
     actual_sha256 = hasher.hexdigest()
     if expected_sha256 and actual_sha256 != expected_sha256:
-        raise ChecksumMismatchError(expected=expected_sha256, actual=actual_sha256)
+        # The actual hash stays out of the error (M6): see ChecksumMismatchError.
+        raise ChecksumMismatchError(expected=expected_sha256)
 
     return DecryptResult(
         sha256_hash=actual_sha256,
@@ -798,10 +806,7 @@ def decrypt_file(
         # left behind by any failure above.
         best_effort_delete(tmp_path)
 
-    logger.info(
-        "Decryption complete",
-        extra={"sha256": result.sha256_hash[:16], "output": str(output_path)},
-    )
+    logger.info("Decryption complete", extra={"output": str(output_path)})
 
     result.output_path = output_path
     return result

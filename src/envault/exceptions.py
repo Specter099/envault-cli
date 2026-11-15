@@ -22,15 +22,26 @@ class StateConflictError(EnvaultError):
 
 
 class ChecksumMismatchError(EnvaultError):
-    """Raised when SHA256 checksum does not match after decryption."""
+    """The decrypted plaintext is not the file its record identifies.
 
-    def __init__(self, expected: str, actual: str) -> None:
+    Raised before the plaintext is published, sealed or handed to a command.
+    Neither the message nor the exception carries the plaintext's actual
+    SHA-256, or any prefix of it: for a short or guessable file (a PIN, a
+    password) that hash is as good as the content. Callers that want to name
+    the file print the identifier they expected.
+
+    Attributes:
+        expected: The value the plaintext was checked against: a SHA-256 (the
+            crypto layer's ``expected_sha256``) or a keyed file identifier
+            (:class:`FileIdMismatchError`).
+    """
+
+    def __init__(self, expected: str, message: str | None = None) -> None:
         self.expected = expected
-        self.actual = actual
         super().__init__(
-            f"Checksum mismatch: expected SHA256 {expected[:16]}..., "
-            f"got {actual[:16]}... "
-            "The decrypted content does not match the original file."
+            message
+            or "Checksum mismatch: the decrypted content does not match the file its "
+            "record identifies."
         )
 
 

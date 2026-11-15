@@ -473,7 +473,7 @@ def test_decrypt_checksum_mismatch(tmp_path: Path) -> None:
     runner = CliRunner()
     with patch(
         "envault.cli.decrypt_file",
-        side_effect=ChecksumMismatchError(expected="aaa", actual="bbb"),
+        side_effect=ChecksumMismatchError(expected="aaa"),
     ):
         result = runner.invoke(
             main,
@@ -593,7 +593,7 @@ def test_decrypt_checksum_mismatch_shows_friendly_message(tmp_path: Path) -> Non
     runner = CliRunner()
     with patch(
         "envault.cli.decrypt_file",
-        side_effect=ChecksumMismatchError(expected="aaa", actual="bbb"),
+        side_effect=ChecksumMismatchError(expected="aaa"),
     ):
         result = runner.invoke(
             main,
