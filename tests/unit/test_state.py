@@ -12,7 +12,15 @@ from botocore.exceptions import ClientError, ReadTimeoutError
 from moto import mock_aws
 
 from envault.exceptions import StateConflictError
-from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
+from envault.fileid import ID_SCHEME_HMAC_SHA256, ID_SCHEME_SHA256
+from envault.state import (
+    DECRYPTED,
+    ENCRYPTED,
+    FileRecord,
+    StateStore,
+    item_file_id,
+    item_id_scheme,
+)
 
 TABLE = "envault-test-state"
 REGION = "us-east-1"
@@ -20,7 +28,8 @@ REGION = "us-east-1"
 
 def _make_record(**kwargs) -> FileRecord:
     defaults = {
-        "sha256_hash": "a" * 64,
+        "file_id": "a" * 64,
+        "id_scheme": ID_SCHEME_SHA256,
         "file_name": "test.txt",
         "current_state": ENCRYPTED,
         "s3_key": "encrypted/test.txt.encrypted",
@@ -82,9 +91,9 @@ def test_put_and_get_current_state():
     record = _make_record()
     store.put_current_state(record)
 
-    fetched = store.get_current_state(record.sha256_hash)
+    fetched = store.get_current_state(record.file_id)
     assert fetched is not None
-    assert fetched.sha256_hash == record.sha256_hash
+    assert fetched.file_id == record.file_id
     assert fetched.file_name == "test.txt"
     assert fetched.current_state == ENCRYPTED
 
@@ -104,7 +113,7 @@ def test_put_event_appends_to_audit_log():
     store.put_event(record, operation="ENCRYPT", correlation_id="corr-1")
     store.put_event(record, operation="DECRYPT", correlation_id="corr-2")
 
-    events = store.list_events_for_file(record.sha256_hash)
+    events = store.list_events_for_file(record.file_id)
     assert len(events) == 2
     operations = {e["operation"] for e in events}
     assert operations == {"ENCRYPT", "DECRYPT"}
@@ -114,17 +123,17 @@ def test_put_event_appends_to_audit_log():
 def test_list_by_state_encrypted():
     store = _create_table()
     r1 = _make_record(
-        sha256_hash="b" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
+        file_id="b" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
     )
     r2 = _make_record(
-        sha256_hash="c" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
+        file_id="c" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
     )
     store.put_current_state(r1)
     store.put_current_state(r2)
 
     encrypted = store.list_by_state(ENCRYPTED)
     assert len(encrypted) == 1
-    assert encrypted[0].sha256_hash == "b" * 64
+    assert encrypted[0].file_id == "b" * 64
 
 
 @mock_aws
@@ -133,14 +142,14 @@ def test_put_current_state_upserts():
     record = _make_record()
     store.put_current_state(record)
 
-    fetched = store.get_current_state(record.sha256_hash)
+    fetched = store.get_current_state(record.file_id)
     assert fetched is not None
     original_last_updated = fetched.last_updated
 
     record.current_state = DECRYPTED
     store.put_current_state(record, expected_last_updated=original_last_updated)
 
-    fetched2 = store.get_current_state(record.sha256_hash)
+    fetched2 = store.get_current_state(record.file_id)
     assert fetched2 is not None
     assert fetched2.current_state == DECRYPTED
 
@@ -149,13 +158,13 @@ def test_put_current_state_upserts():
 def test_summary_counts():
     store = _create_table()
     r1 = _make_record(
-        sha256_hash="d" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
+        file_id="d" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
     )
     r2 = _make_record(
-        sha256_hash="e" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
+        file_id="e" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
     )
     r3 = _make_record(
-        sha256_hash="f" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T12:00:00+00:00"
+        file_id="f" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T12:00:00+00:00"
     )
     store.put_current_state(r1)
     store.put_current_state(r2)
@@ -174,7 +183,7 @@ def test_tags_preserved_in_roundtrip():
     record = _make_record(tags=tags)
     store.put_current_state(record)
 
-    fetched = store.get_current_state(record.sha256_hash)
+    fetched = store.get_current_state(record.file_id)
     assert fetched is not None
     assert fetched.tags == tags
 
@@ -185,7 +194,7 @@ def test_s3_version_id_preserved():
     record = _make_record(s3_version_id="abc-version-123")
     store.put_current_state(record)
 
-    fetched = store.get_current_state(record.sha256_hash)
+    fetched = store.get_current_state(record.file_id)
     assert fetched is not None
     assert fetched.s3_version_id == "abc-version-123"
 
@@ -196,7 +205,7 @@ def test_events_have_ttl():
     record = _make_record()
     store.put_event(record, operation="ENCRYPT", correlation_id="corr", audit_ttl_days=30)
 
-    events = store.list_events_for_file(record.sha256_hash)
+    events = store.list_events_for_file(record.file_id)
     assert len(events) == 1
     ttl = int(events[0].get("ttl", 0))
     assert ttl > int(time.time())
@@ -297,7 +306,7 @@ def test_put_current_state_new_record_succeeds():
     record = _make_record()
     store.put_current_state(record)
 
-    fetched = store.get_current_state(record.sha256_hash)
+    fetched = store.get_current_state(record.file_id)
     assert fetched is not None
     assert fetched.current_state == ENCRYPTED
 
@@ -336,7 +345,7 @@ def test_paginate_query_respects_max_items():
     for i in range(5):
         sha = f"{chr(ord('a') + i)}" * 64
         r = _make_record(
-            sha256_hash=sha,
+            file_id=sha,
             current_state=ENCRYPTED,
             encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
         )
@@ -351,10 +360,10 @@ def test_summary_uses_count_query():
     """summary() must return correct counts without loading all records."""
     store = _create_table()
     r1 = _make_record(
-        sha256_hash="d" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
+        file_id="d" * 64, current_state=ENCRYPTED, encrypted_at="2026-03-03T10:00:00+00:00"
     )
     r2 = _make_record(
-        sha256_hash="e" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
+        file_id="e" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T11:00:00+00:00"
     )
     store.put_current_state(r1)
     store.put_current_state(r2)
@@ -373,13 +382,13 @@ def test_count_by_state_returns_correct_count():
     for i in range(4):
         sha = f"{chr(ord('a') + i)}" * 64
         r = _make_record(
-            sha256_hash=sha,
+            file_id=sha,
             current_state=ENCRYPTED,
             encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
         )
         store.put_current_state(r)
     r_dec = _make_record(
-        sha256_hash="z" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T15:00:00+00:00"
+        file_id="z" * 64, current_state=DECRYPTED, encrypted_at="2026-03-03T15:00:00+00:00"
     )
     store.put_current_state(r_dec)
 
@@ -394,7 +403,7 @@ def test_list_by_state_max_items_zero_returns_all():
     for i in range(5):
         sha = f"{chr(ord('a') + i)}" * 64
         r = _make_record(
-            sha256_hash=sha,
+            file_id=sha,
             current_state=ENCRYPTED,
             encrypted_at=f"2026-03-03T{10 + i}:00:00+00:00",
         )
@@ -413,7 +422,7 @@ def test_list_by_state_excludes_event_records():
     """
     store = _create_table()
     record = _make_record(
-        sha256_hash="a" * 64,
+        file_id="a" * 64,
         current_state=ENCRYPTED,
         encrypted_at="2026-03-03T10:00:00+00:00",
     )
@@ -423,7 +432,7 @@ def test_list_by_state_excludes_event_records():
     # Should return exactly 1 record (the CURRENT), not 2
     results = store.list_by_state(ENCRYPTED)
     assert len(results) == 1, f"Expected 1 record, got {len(results)} — EVENT records leaked"
-    assert results[0].sha256_hash == "a" * 64
+    assert results[0].file_id == "a" * 64
 
 
 @mock_aws
@@ -435,7 +444,7 @@ def test_count_by_state_excludes_event_records():
     """
     store = _create_table()
     record = _make_record(
-        sha256_hash="a" * 64,
+        file_id="a" * 64,
         current_state=ENCRYPTED,
         encrypted_at="2026-03-03T10:00:00+00:00",
     )
@@ -452,7 +461,7 @@ def test_summary_returns_last_activity_timestamp():
     """summary() must return the actual last_updated timestamp, not a hard-coded dash."""
     store = _create_table()
     record = _make_record(
-        sha256_hash="a" * 64,
+        file_id="a" * 64,
         current_state=ENCRYPTED,
         encrypted_at="2026-03-03T10:00:00+00:00",
     )
@@ -471,7 +480,7 @@ def test_summary_last_activity_pages_past_event_items():
     """Event items share the GSI; last_activity must still find the CURRENT record."""
     store = _create_table()
     record = _make_record(
-        sha256_hash="a" * 64,
+        file_id="a" * 64,
         current_state=ENCRYPTED,
         encrypted_at="2026-03-03T10:00:00+00:00",
     )
@@ -489,7 +498,7 @@ def test_summary_counts_exclude_events():
     """summary() total/encrypted/decrypted counts must not double-count EVENT records."""
     store = _create_table()
     r1 = _make_record(
-        sha256_hash="a" * 64,
+        file_id="a" * 64,
         current_state=ENCRYPTED,
         encrypted_at="2026-03-03T10:00:00+00:00",
     )
@@ -497,7 +506,7 @@ def test_summary_counts_exclude_events():
     store.put_event(r1, operation="ENCRYPT", correlation_id="corr-1")
 
     r2 = _make_record(
-        sha256_hash="b" * 64,
+        file_id="b" * 64,
         current_state=DECRYPTED,
         encrypted_at="2026-03-03T11:00:00+00:00",
     )
@@ -546,7 +555,7 @@ def test_put_event_retry_is_idempotent(no_retry_sleep):
 
     assert len(sks_seen) == 2, f"expected one retry after the lost reply, saw {sks_seen}"
     assert sks_seen[0] == sks_seen[1], f"Retry used different SK: {sks_seen}"
-    assert len(store.list_events_for_file(record.sha256_hash)) == 1
+    assert len(store.list_events_for_file(record.file_id)) == 1
 
 
 @mock_aws
@@ -573,9 +582,9 @@ def test_get_current_state_does_not_retry_missing_table(no_retry_sleep):
 def test_list_by_file_name_returns_matching_records():
     """list_by_file_name returns only CURRENT records with the given file_name."""
     store = _create_table()
-    r1 = _make_record(sha256_hash="a" * 64, file_name="secret.env")
-    r2 = _make_record(sha256_hash="b" * 64, file_name="secret.env")
-    r3 = _make_record(sha256_hash="c" * 64, file_name="other.env")
+    r1 = _make_record(file_id="a" * 64, file_name="secret.env")
+    r2 = _make_record(file_id="b" * 64, file_name="secret.env")
+    r3 = _make_record(file_id="c" * 64, file_name="other.env")
     store.put_current_state(r1)
     store.put_current_state(r2)
     store.put_current_state(r3)
@@ -591,7 +600,7 @@ def test_list_by_file_name_returns_matching_records():
 def test_list_by_file_name_returns_empty_for_no_match():
     """list_by_file_name returns empty list when no files match."""
     store = _create_table()
-    r1 = _make_record(sha256_hash="a" * 64, file_name="secret.env")
+    r1 = _make_record(file_id="a" * 64, file_name="secret.env")
     store.put_current_state(r1)
 
     results = store.list_by_file_name("nonexistent.txt", ENCRYPTED)
@@ -603,12 +612,12 @@ def test_list_by_file_name_sorted_by_encrypted_at_descending():
     """list_by_file_name returns results sorted newest-first by encrypted_at."""
     store = _create_table()
     r_old = _make_record(
-        sha256_hash="a" * 64,
+        file_id="a" * 64,
         file_name="data.csv",
         encrypted_at="2026-01-01T00:00:00+00:00",
     )
     r_new = _make_record(
-        sha256_hash="b" * 64,
+        file_id="b" * 64,
         file_name="data.csv",
         encrypted_at="2026-03-04T12:00:00+00:00",
     )
@@ -632,7 +641,7 @@ def test_event_cannot_be_overwritten():
     record = _make_record()
     store.put_event(record, operation="ENCRYPT", correlation_id="corr")
 
-    events = store.list_events_for_file(record.sha256_hash)
+    events = store.list_events_for_file(record.file_id)
     assert len(events) == 1
     original = events[0]
 
@@ -644,7 +653,7 @@ def test_event_cannot_be_overwritten():
         )
     assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
 
-    surviving = store.list_events_for_file(record.sha256_hash)
+    surviving = store.list_events_for_file(record.file_id)
     assert surviving[0]["operation"] == "ENCRYPT"
 
 
@@ -659,7 +668,7 @@ def test_put_event_records_principal_arn():
         correlation_id="corr",
         principal_arn="arn:aws:sts::123456789012:assumed-role/Deploy/session",
     )
-    events = store.list_events_for_file(record.sha256_hash)
+    events = store.list_events_for_file(record.file_id)
     assert events[0]["principal_arn"] == "arn:aws:sts::123456789012:assumed-role/Deploy/session"
 
 
@@ -675,7 +684,7 @@ def test_put_event_inner_duplicate_write_is_tolerated():
     # Same fixed SK both times, as the retry path uses.
     store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
     store._put_event_inner(record, "ENCRYPT", "corr", 365, "2026-01-01T00:00:00+00:00", "abcd1234")
-    assert len(store.list_events_for_file(record.sha256_hash)) == 1
+    assert len(store.list_events_for_file(record.file_id)) == 1
 
 
 @mock_aws
@@ -699,14 +708,14 @@ def test_retry_exhaustion_reraises_original_exception():
             store.put_current_state(record)
     with patch.object(store._table, "get_item", side_effect=throttled):
         with pytest.raises(ClientError):
-            store.get_current_state(record.sha256_hash)
+            store.get_current_state(record.file_id)
 
 
 @mock_aws
 def test_events_are_kept_out_of_state_index():
     """Audit events must not land in state-index, or every lookup reads all history."""
     store = _create_table()
-    record = _make_record(sha256_hash="a" * 64, current_state=ENCRYPTED)
+    record = _make_record(file_id="a" * 64, current_state=ENCRYPTED)
     store.put_current_state(record)
     for _ in range(3):
         store.put_event(record, operation="DECRYPT", correlation_id="c")
@@ -716,7 +725,7 @@ def test_events_are_kept_out_of_state_index():
         KeyConditionExpression=Key("current_state").eq(ENCRYPTED),
     )
     assert raw["Count"] == 1
-    event = store.list_events_for_file(record.sha256_hash)[0]
+    event = store.list_events_for_file(record.file_id)[0]
     assert event["record_state"] == ENCRYPTED
     assert "current_state" not in event
 
@@ -726,7 +735,7 @@ def test_summary_last_activity_survives_legacy_event_rows():
     """Legacy events in state-index sort ahead of CURRENT rows; last_activity must still resolve."""
     store = _create_table()
     record = _make_record(
-        sha256_hash="a" * 64, current_state=ENCRYPTED, encrypted_at="2026-01-01T00:00:00+00:00"
+        file_id="a" * 64, current_state=ENCRYPTED, encrypted_at="2026-01-01T00:00:00+00:00"
     )
     store.put_current_state(record)
     # An event as written by earlier versions: carries current_state and a later encrypted_at.
@@ -770,7 +779,7 @@ def test_put_current_state_tolerates_lost_reply(no_retry_sleep):
 
     assert len(tokens) == 2, "the lost reply must be retried exactly once"
     assert tokens[0] == tokens[1] == record.last_updated, "the CAS token must not change"
-    stored = store.get_current_state(record.sha256_hash)
+    stored = store.get_current_state(record.file_id)
     assert stored is not None
     assert stored.last_updated == record.last_updated
 
@@ -789,7 +798,7 @@ def test_put_current_state_tolerates_lost_reply_on_update(no_retry_sleep):
         store.put_current_state(record, expected_last_updated=original)
 
     assert tokens[0] == tokens[1] != original
-    stored = store.get_current_state(record.sha256_hash)
+    stored = store.get_current_state(record.file_id)
     assert stored is not None
     assert stored.current_state == DECRYPTED
     assert stored.last_updated == record.last_updated
@@ -815,7 +824,7 @@ def test_put_current_state_lost_reply_then_foreign_write_is_a_conflict(no_retry_
     with patch.object(store._table, "put_item", side_effect=put):
         with pytest.raises(StateConflictError, match="Concurrent modification"):
             store.put_current_state(record)
-    stored = store.get_current_state(record.sha256_hash)
+    stored = store.get_current_state(record.file_id)
     assert stored is not None
     assert stored.file_name == "theirs.txt"
 
@@ -906,3 +915,136 @@ def test_list_events_between_validates_its_range():
     assert store.list_events_between(date(2026, 1, 1), date(2026, 1, 31), max_days=31) == []
     with pytest.raises(TypeError, match="datetime.date"):
         store.list_events_between(datetime(2026, 11, 1, tzinfo=timezone.utc), date(2026, 11, 2))
+
+
+# ---------------------------------------------------------------------------
+# M6: how a row stores its identifier, by scheme
+# ---------------------------------------------------------------------------
+
+KEYED_ID = "ab" * 32
+ID_KEY_ARN = "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+
+
+def _keyed(**kwargs) -> FileRecord:
+    return _make_record(
+        file_id=KEYED_ID, id_scheme=ID_SCHEME_HMAC_SHA256, id_key_arn=ID_KEY_ARN, **kwargs
+    )
+
+
+def test_keyed_row_stores_its_identifier_and_key_and_no_content_hash():
+    item = _keyed().to_dynamo_item(sk="CURRENT")
+
+    assert item["PK"] == f"FILE#{KEYED_ID}"
+    assert item["file_id"] == KEYED_ID
+    assert item["id_scheme"] == "hmac-sha256-v1"
+    assert item["id_key_arn"] == ID_KEY_ARN
+    assert "sha256_hash" not in item
+
+
+def test_legacy_row_keeps_the_layout_older_clients_wrote():
+    item = _make_record(file_id="c" * 64).to_dynamo_item(sk="CURRENT")
+
+    assert item["PK"] == "FILE#" + "c" * 64
+    assert item["sha256_hash"] == "c" * 64
+    assert not {"file_id", "id_scheme", "id_key_arn"} & set(item)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        _make_record(file_id=KEYED_ID, id_scheme=ID_SCHEME_HMAC_SHA256),  # no key ARN
+        _make_record(file_id=KEYED_ID, id_scheme="hmac-sha512-v9"),
+        _make_record(file_id=KEYED_ID, id_scheme=""),
+    ],
+)
+def test_rows_in_an_unwritable_scheme_are_refused(record: FileRecord):
+    with pytest.raises(ValueError):
+        record.to_dynamo_item(sk="CURRENT")
+
+
+def test_record_requires_an_identifier_scheme():
+    with pytest.raises(TypeError, match="id_scheme"):
+        FileRecord(  # type: ignore[call-arg]
+            file_id=KEYED_ID,
+            file_name="x",
+            current_state=ENCRYPTED,
+            s3_key="k",
+            kms_key_id="alias/k",
+            encryption_context={},
+            algorithm="a",
+            message_id="m",
+            file_size_bytes=1,
+        )
+
+
+@mock_aws
+def test_rows_of_both_layouts_read_back():
+    store = _create_table()
+    keyed = _keyed(file_name="new.env")
+    store.put_current_state(keyed)
+    # A row exactly as envault wrote it before keyed identifiers.
+    legacy_item = _make_record(file_id="d" * 64, file_name="old.env").to_dynamo_item("CURRENT")
+    del legacy_item["s3_key_scheme"]
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(Item=legacy_item)
+
+    new = store.get_current_state(KEYED_ID)
+    old = store.get_current_state("d" * 64)
+
+    assert new is not None and old is not None
+    assert (new.file_id, new.id_scheme, new.id_key_arn) == (
+        KEYED_ID,
+        ID_SCHEME_HMAC_SHA256,
+        ID_KEY_ARN,
+    )
+    assert (old.file_id, old.id_scheme, old.id_key_arn) == ("d" * 64, ID_SCHEME_SHA256, "")
+    assert {r.file_name for r in store.list_by_state(ENCRYPTED)} == {"new.env", "old.env"}
+
+
+@mock_aws
+def test_a_row_of_an_unknown_scheme_is_never_read_as_legacy():
+    store = _create_table()
+    item = _keyed().to_dynamo_item("CURRENT")
+    item.update(id_scheme="hmac-sha512-v9", sha256_hash="e" * 64)
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(Item=item)
+
+    record = store.get_current_state(KEYED_ID)
+
+    assert record is not None
+    assert record.id_scheme == "hmac-sha512-v9"
+    assert record.file_id == KEYED_ID  # never the stray sha256_hash
+
+
+@mock_aws
+def test_events_carry_the_identifier_of_their_scheme():
+    store = _create_table()
+    store.put_event(_keyed(), operation="ENCRYPT", correlation_id="c")
+    store.put_event(_make_record(file_id="f" * 64), operation="ENCRYPT", correlation_id="c")
+
+    [keyed_event] = store.list_events_for_file(KEYED_ID)
+    [legacy_event] = store.list_events_for_file("f" * 64)
+
+    assert "sha256_hash" not in keyed_event
+    assert item_file_id(keyed_event) == KEYED_ID
+    assert item_id_scheme(keyed_event) == ID_SCHEME_HMAC_SHA256
+    assert keyed_event["id_key_arn"] == ID_KEY_ARN
+    assert item_file_id(legacy_event) == "f" * 64
+    assert item_id_scheme(legacy_event) == ID_SCHEME_SHA256
+
+
+@mock_aws
+def test_state_logs_name_the_file_id(caplog: pytest.LogCaptureFixture):
+    import logging
+
+    store = _create_table()
+    with caplog.at_level(logging.DEBUG, logger="envault.state"):
+        record = _keyed()
+        store.put_current_state(record)
+        store.put_event(record, operation="ENCRYPT", correlation_id="c")
+
+    extras = [
+        vars(r) for r in caplog.records if r.getMessage() in ("put_current_state", "put_event")
+    ]
+    assert len(extras) == 2
+    for extra in extras:
+        assert extra["file_id"] == KEYED_ID[:16]
+        assert "sha256" not in extra

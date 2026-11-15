@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -28,6 +29,7 @@ from botocore.exceptions import ClientError
 
 from envault.config import boto_config
 from envault.exceptions import StateConflictError
+from envault.fileid import ID_SCHEME_HMAC_SHA256, ID_SCHEME_SHA256
 from envault.retry import aws_retry
 
 logger = logging.getLogger(__name__)
@@ -51,9 +53,19 @@ S3_KEY_LEGACY_SYNC = "legacy-sync"
 
 @dataclass
 class FileRecord:
-    """Represents the state of a file tracked by envault."""
+    """Represents the state of a file tracked by envault.
 
-    sha256_hash: str
+    ``file_id`` is the record's identifier and DynamoDB key (``FILE#<file_id>``)
+    under its ``id_scheme`` (see :mod:`envault.fileid`): a keyed
+    ``hmac-sha256-v1`` identifier with the ARN of the key that made it, or,
+    for rows written before keyed identifiers, the plaintext's SHA-256. There
+    is no field for a content hash as such, so nothing can put one into a
+    keyed row: :meth:`to_dynamo_item` stores the identifier under the
+    attribute its scheme uses, and only a legacy row gets ``sha256_hash``.
+    ``id_scheme`` has no default; whoever builds a record says which it is.
+    """
+
+    file_id: str
     file_name: str
     current_state: str
     s3_key: str
@@ -69,18 +81,61 @@ class FileRecord:
     #: :data:`S3_KEY_CONTENT_ADDRESSED` or :data:`S3_KEY_LEGACY_SYNC`. Rows
     #: written before this attribute existed are content-addressed.
     s3_key_scheme: str = S3_KEY_CONTENT_ADDRESSED
+    #: :data:`~envault.fileid.ID_SCHEME_HMAC_SHA256` or
+    #: :data:`~envault.fileid.ID_SCHEME_SHA256` (rows without ``id_scheme``).
+    id_scheme: str = field(kw_only=True)
+    #: ARN of the HMAC key that made a keyed identifier ("" for legacy rows).
+    id_key_arn: str = field(default="", kw_only=True)
 
     def to_dynamo_item(self, sk: str) -> dict[str, Any]:
-        """Serialize to a DynamoDB item dict."""
+        """Serialize to a DynamoDB item dict.
+
+        Raises:
+            ValueError: The identifier scheme is unknown, or a keyed record
+                lacks the ARN of its identifier key. No such row is written.
+        """
         now = _now_iso()
         if not self.last_updated:
             self.last_updated = now
+        attributes = asdict(self)
+        for name in ("file_id", "id_scheme", "id_key_arn"):
+            del attributes[name]
         item: dict[str, Any] = {
-            "PK": f"{FILE_PREFIX}{self.sha256_hash}",
+            "PK": f"{FILE_PREFIX}{self.file_id}",
             "SK": sk,
-            **asdict(self),
+            **_identifier_attributes(self),
+            **attributes,
         }
         return item
+
+
+def _identifier_attributes(record: FileRecord) -> dict[str, str]:
+    """How a row stores its identifier: by scheme, and never a content hash in a keyed row."""
+    if record.id_scheme == ID_SCHEME_SHA256:
+        # Rows of the legacy scheme keep the layout older clients wrote and read.
+        return {"sha256_hash": record.file_id}
+    if record.id_scheme == ID_SCHEME_HMAC_SHA256:
+        if not record.id_key_arn:
+            raise ValueError("a keyed record needs the ARN of the key that made its identifier")
+        return {
+            "file_id": record.file_id,
+            "id_scheme": record.id_scheme,
+            "id_key_arn": record.id_key_arn,
+        }
+    raise ValueError(
+        f"refusing to write a record of unknown identifier scheme {record.id_scheme!r}"
+    )
+
+
+def item_id_scheme(item: Mapping[str, Any]) -> str:
+    """The identifier scheme of a CURRENT or EVENT item: no ``id_scheme`` means legacy."""
+    return str(item.get("id_scheme") or ID_SCHEME_SHA256)
+
+
+def item_file_id(item: Mapping[str, Any]) -> str:
+    """The identifier a CURRENT or EVENT item carries, whichever scheme wrote it."""
+    attribute = "sha256_hash" if item_id_scheme(item) == ID_SCHEME_SHA256 else "file_id"
+    return str(item.get(attribute, ""))
 
 
 def _now_iso() -> str:
@@ -101,7 +156,7 @@ class StateStore:
     """DynamoDB-backed state store for envault file records.
 
     Table design:
-      PK: FILE#{sha256_hash}
+      PK: FILE#{file_id}  (see envault.fileid: keyed, or the SHA-256 on legacy rows)
       SK: CURRENT  (current operational state, upserted)
           EVENT#{iso_timestamp}#{operation}  (immutable audit trail)
 
@@ -139,7 +194,7 @@ class StateStore:
     def put_current_state(
         self, record: FileRecord, expected_last_updated: str | None = None
     ) -> None:
-        """Upsert the current state record for a file (PK=FILE#hash, SK=CURRENT).
+        """Upsert the current state record for a file (PK=FILE#file_id, SK=CURRENT).
 
         Sets ``record.last_updated`` to a fresh microsecond timestamp, which is
         the record's compare-and-swap token for the next writer.
@@ -167,7 +222,7 @@ class StateStore:
         self._put_current_item(item, expected_last_updated)
         logger.debug(
             "put_current_state",
-            extra={"sha256": record.sha256_hash[:16], "state": record.current_state},
+            extra={"file_id": record.file_id[:16], "state": record.current_state},
         )
 
     @aws_retry(never=(StateConflictError,))
@@ -192,7 +247,8 @@ class StateStore:
                 )
                 return
             raise StateConflictError(
-                f"Concurrent modification detected for {str(item['sha256_hash'])[:16]}... "
+                f"Concurrent modification detected for "
+                f"{str(item['PK']).removeprefix(FILE_PREFIX)[:16]}... "
                 f"(expected last_updated={expected_last_updated!r}). "
                 "Another process may have modified this record."
             ) from exc
@@ -282,13 +338,13 @@ class StateStore:
             raise
         logger.debug(
             "put_event",
-            extra={"sha256": record.sha256_hash[:16], "operation": operation},
+            extra={"file_id": record.file_id[:16], "operation": operation},
         )
 
     @aws_retry()
-    def get_current_state(self, sha256_hash: str) -> FileRecord | None:
-        """Return the current state record for a file, or None if not found."""
-        response = self._table.get_item(Key={"PK": f"{FILE_PREFIX}{sha256_hash}", "SK": CURRENT})
+    def get_current_state(self, file_id: str) -> FileRecord | None:
+        """Return the current state record stored under ``file_id``, or None if not found."""
+        response = self._table.get_item(Key={"PK": f"{FILE_PREFIX}{file_id}", "SK": CURRENT})
         item = response.get("Item")
         if not item:
             return None
@@ -327,11 +383,11 @@ class StateStore:
         return records
 
     @aws_retry()
-    def list_events_for_file(self, sha256_hash: str) -> list[dict[str, Any]]:
-        """Return all event records for a file, sorted by timestamp."""
+    def list_events_for_file(self, file_id: str) -> list[dict[str, Any]]:
+        """Return all event records stored under ``file_id``, sorted by timestamp."""
         return self._paginate_query(
             KeyConditionExpression=(
-                Key("PK").eq(f"{FILE_PREFIX}{sha256_hash}") & Key("SK").begins_with(EVENT_PREFIX)
+                Key("PK").eq(f"{FILE_PREFIX}{file_id}") & Key("SK").begins_with(EVENT_PREFIX)
             )
         )
 
@@ -430,9 +486,14 @@ class StateStore:
 
 
 def _item_to_record(item: dict[str, Any]) -> FileRecord:
-    """Convert a raw DynamoDB item to a FileRecord."""
+    """Convert a raw DynamoDB item to a FileRecord, in either identifier layout.
+
+    An unknown ``id_scheme`` is kept as it is, so that whoever uses the
+    record can refuse it; it is never read as legacy.
+    """
+    scheme = item_id_scheme(item)
     return FileRecord(
-        sha256_hash=item.get("sha256_hash", ""),
+        file_id=item_file_id(item),
         file_name=item.get("file_name", ""),
         current_state=item.get("current_state", ""),
         s3_key=item.get("s3_key", ""),
@@ -446,4 +507,6 @@ def _item_to_record(item: dict[str, Any]) -> FileRecord:
         encrypted_at=item.get("encrypted_at", ""),
         last_updated=item.get("last_updated", ""),
         s3_key_scheme=item.get("s3_key_scheme", S3_KEY_CONTENT_ADDRESSED),
+        id_scheme=scheme,
+        id_key_arn=str(item.get("id_key_arn", "")) if scheme != ID_SCHEME_SHA256 else "",
     )

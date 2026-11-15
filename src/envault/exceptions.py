@@ -6,13 +6,18 @@ class EnvaultError(Exception):
 
 
 class AlreadyEncryptedError(EnvaultError):
-    """Raised when attempting to encrypt a file that is already in ENCRYPTED state."""
+    """Raised when attempting to encrypt a file that is already in ENCRYPTED state.
 
-    def __init__(self, sha256_hash: str, file_name: str) -> None:
-        self.sha256_hash = sha256_hash
+    ``file_id`` is the record's identifier (keyed for new records, see
+    :mod:`envault.fileid`), never a hash of the plaintext computed for the
+    occasion.
+    """
+
+    def __init__(self, file_id: str, file_name: str) -> None:
+        self.file_id = file_id
         self.file_name = file_name
         super().__init__(
-            f"File '{file_name}' (sha256: {sha256_hash[:16]}...) is already ENCRYPTED. "
+            f"File '{file_name}' (id: {file_id[:16]}...) is already ENCRYPTED. "
             "Use --force to re-encrypt."
         )
 

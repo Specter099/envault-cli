@@ -190,7 +190,7 @@ def test_encrypt_hashes_and_encrypts_one_open_file(env: dict[str, str], tree: pa
 
     assert result.exit_code == 0, result.output
     [record] = _records()
-    assert record.sha256_hash == hashlib.sha256(HARMLESS).hexdigest()  # type: ignore[attr-defined]
+    assert record.file_id == hashlib.sha256(HARMLESS).hexdigest()  # type: ignore[attr-defined]
     out = tree.parent / "out.txt"
     decrypted = _run(env, "decrypt", "notes.txt", "-o", str(out))
     assert decrypted.exit_code == 0, decrypted.output
@@ -269,7 +269,7 @@ def test_encrypt_uploads_to_a_per_upload_key(env: dict[str, str], tree: pathlib.
 
     assert result.exit_code == 0, result.output
     [record] = _records()
-    sha, message_id = record.sha256_hash, record.message_id  # type: ignore[attr-defined]
+    sha, message_id = record.file_id, record.message_id  # type: ignore[attr-defined]
     assert record.s3_key == f"encrypted/{sha[:2]}/{sha}/{message_id}/notes.txt.encrypted"  # type: ignore[attr-defined]
     assert calls == [{"s3_key": record.s3_key, "if_none_match": True}]  # type: ignore[attr-defined]
 

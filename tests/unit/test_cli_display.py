@@ -30,6 +30,7 @@ from rich.console import Console
 from envault import cli as cli_mod
 from envault import identity
 from envault.cli import main
+from envault.fileid import ID_SCHEME_SHA256
 from envault.state import ENCRYPTED, FileRecord, StateStore
 
 from ._id_key import ID_KEY_ALIAS, create_id_key
@@ -185,7 +186,8 @@ def _seed_row(file_name: str = EVIL) -> FileRecord:
     """A CURRENT row and one event, every free-text attribute carrying escapes."""
     sha = "c" * 64
     record = FileRecord(
-        sha256_hash=sha,
+        id_scheme=ID_SCHEME_SHA256,
+        file_id=sha,
         file_name=file_name,
         current_state=ENCRYPTED,
         s3_key=f"encrypted/{sha[:2]}/{sha}/report.txt.encrypted",
@@ -226,7 +228,7 @@ def test_audit_strips_control_characters(terminal: io.StringIO) -> None:
     env = _env(_provision())
     record = _seed_row()
 
-    by_file = CliRunner().invoke(main, ["audit", "--file", record.sha256_hash], env=env)
+    by_file = CliRunner().invoke(main, ["audit", "--file", record.file_id], env=env)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # the event's date
     by_date = CliRunner().invoke(main, ["audit", "--since", today], env=env)
 
@@ -259,7 +261,7 @@ def test_decrypt_messages_strip_control_characters(
     record = store.list_by_state(ENCRYPTED)[0]
     table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
     table.update_item(
-        Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+        Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
         UpdateExpression="SET encryption_context.purpose = :p",
         ExpressionAttributeValues={":p": "tampered"},
     )

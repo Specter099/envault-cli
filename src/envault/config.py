@@ -43,15 +43,23 @@ class Config:
     region: str
     audit_ttl_days: int = 365
 
-    def build_encryption_context(self, sha256_hash: str, file_name: str) -> dict[str, str]:
+    def build_encryption_context(
+        self, file_id: str, file_name: str, *, legacy: bool = False
+    ) -> dict[str, str]:
         """Build per-file encryption context bound to the ciphertext as AAD.
 
         Returns a dict that is unique per file, preventing cross-file
-        ciphertext substitution attacks.
+        ciphertext substitution attacks. The context is not secret: CloudTrail
+        records it with every GenerateDataKey and Decrypt. It names the file by
+        its identifier (see :mod:`envault.fileid`): under ``file_id`` for keyed
+        records, which reveals nothing about the content. Only ``legacy=True``,
+        for records identified by the plaintext's SHA-256 (rows written before
+        keyed identifiers, which rotate-key keeps in their own scheme), puts it
+        under ``sha256`` as those records always had it.
         """
         return {
             "purpose": "envault-backup",
-            "sha256": sha256_hash,
+            ("sha256" if legacy else "file_id"): file_id,
             "file_name": file_name,
             "kms_key_alias": self.key_id,
         }

@@ -50,6 +50,7 @@ from envault.exceptions import (
     MigrationError,
     StateConflictError,
 )
+from envault.fileid import ID_SCHEME_SHA256
 from envault.fileutils import best_effort_delete as _best_effort_delete
 from envault.fileutils import open_regular_nofollow
 from envault.identity import caller_arn
@@ -68,6 +69,7 @@ from envault.state import (
     S3_KEY_LEGACY_SYNC,
     FileRecord,
     StateStore,
+    item_file_id,
 )
 
 # emoji=False: a stored name like ":skull:" must print as typed.
@@ -594,13 +596,13 @@ def _encrypt_fd(
 
     existing = store.get_current_state(sha256)
     if existing and existing.current_state == ENCRYPTED and not force:
-        raise AlreadyEncryptedError(sha256_hash=sha256, file_name=name)
+        raise AlreadyEncryptedError(file_id=sha256, file_name=name)
 
     # Microseconds: versions of one name are ordered by this, and two files
     # encrypted within the same second must not tie.
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     # enc_context uses the pre-read hash; it will be validated against result.sha256_hash below
-    enc_context = config.build_encryption_context(sha256, name)
+    enc_context = config.build_encryption_context(sha256, name, legacy=True)
 
     with _Scratch() as scratch:
         tmp_encrypted = scratch.file(prefix="envault_enc_", suffix=".encrypted")
@@ -623,12 +625,12 @@ def _encrypt_fd(
         # only if nothing is there: no upload can make the version another
         # record pins noncurrent. The name part is the stored name's basename.
         s3_key = s3.s3_key_for_file(
-            sha256_hash=result.sha256_hash, file_name=name, message_id=result.message_id
+            file_id=result.sha256_hash, file_name=name, message_id=result.message_id
         )
         version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key, if_none_match=True)
 
     record = FileRecord(
-        sha256_hash=result.sha256_hash,
+        file_id=result.sha256_hash,
         file_name=name,
         current_state=ENCRYPTED,
         s3_key=s3_key,
@@ -641,6 +643,7 @@ def _encrypt_fd(
         tags=tags,
         encrypted_at=now,
         last_updated=now,
+        id_scheme=ID_SCHEME_SHA256,
     )
     try:
         store.put_current_state(
@@ -749,7 +752,7 @@ def decrypt(
         selection = _resolve_identifier(identifier, store, version=version)
         record = selection.record
         _check_record(record)
-    sha256_hash = record.sha256_hash
+    sha256_hash = record.file_id
 
     if output.is_dir():
         safe_name = Path(record.file_name).name
@@ -941,7 +944,7 @@ def _print_records(records: list[FileRecord]) -> None:
         t.add_row(
             _display(r.file_name),
             f"[{state_color}]{_display(r.current_state)}[/{state_color}]",
-            _id_prefix(r.sha256_hash),
+            _id_prefix(r.file_id),
             _display(r.encrypted_at),
             _display(tags_str),
         )
@@ -1023,7 +1026,7 @@ def audit(
                 _display(ts),
                 _display(op),
                 _display(str(e.get("file_name", ""))),
-                _id_prefix(e.get("sha256_hash", "")),
+                _id_prefix(item_file_id(e)),
                 _display(_short_principal(str(e.get("principal_arn", "")))),
                 _display(str(e.get("correlation_id", ""))[:8]),
             )
@@ -1178,10 +1181,10 @@ def migrate(
             if record is None:  # a decrypt record, or anything else that is not an encryption
                 skipped += 1
                 continue
-            if record.sha256_hash in imported_from:
+            if record.file_id in imported_from:
                 console.print(
                     f"[dim]line {lineno}: skipped, same content as line "
-                    f"{imported_from[record.sha256_hash]}[/dim]"
+                    f"{imported_from[record.file_id]}[/dim]"
                 )
                 skipped += 1
                 continue
@@ -1196,7 +1199,7 @@ def migrate(
                     audit_ttl_days=audit_ttl_days,
                     principal_arn=caller_arn(region),
                 )
-            imported_from[record.sha256_hash] = lineno
+            imported_from[record.file_id] = lineno
             imported += 1
             console.print(
                 f"[green]✓[/green] {_display(record.file_name)} → {_display(record.s3_key)}"
@@ -1339,7 +1342,7 @@ def _parse_output_json_entry(entry: dict[str, Any], *, roots: _LegacyRoots) -> F
         os.close(fd)
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     return FileRecord(
-        sha256_hash=sha256,
+        file_id=sha256,
         file_name=plain_rel.as_posix(),
         current_state=ENCRYPTED,
         s3_key=s3_key,
@@ -1353,6 +1356,7 @@ def _parse_output_json_entry(entry: dict[str, Any], *, roots: _LegacyRoots) -> F
         encrypted_at=now,
         last_updated=now,
         s3_key_scheme=S3_KEY_LEGACY_SYNC,
+        id_scheme=ID_SCHEME_SHA256,
     )
 
 
@@ -1517,8 +1521,8 @@ def rotate_key(
     # would silently leave the most-accessed files under the old key.
     with _exit_on_error():
         records = store.list_by_state(ENCRYPTED)
-        seen = {r.sha256_hash for r in records}
-        legacy = [r for r in store.list_by_state(DECRYPTED) if r.sha256_hash not in seen]
+        seen = {r.file_id for r in records}
+        legacy = [r for r in store.list_by_state(DECRYPTED) if r.file_id not in seen]
     if legacy:
         console.print(
             f"[dim]Including {len(legacy)} record(s) marked DECRYPTED by an earlier "
@@ -1534,9 +1538,7 @@ def rotate_key(
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]")
         for r in records:
-            console.print(
-                f"  Would rotate: {_display(r.file_name)} ({_id_prefix(r.sha256_hash)}...)"
-            )
+            console.print(f"  Would rotate: {_display(r.file_name)} ({_id_prefix(r.file_id)}...)")
         return
 
     # Plaintext copies live in a private RAM directory where there is one; the
@@ -1608,14 +1610,16 @@ def _rotate_records(
             decrypt_file(
                 tmp_dl,
                 tmp_pt,
-                expected_sha256=record.sha256_hash,
+                expected_sha256=record.file_id,
                 region=region,
                 allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
             )
             scratch.discard(tmp_dl)
 
-            new_ctx = new_key_config.build_encryption_context(record.sha256_hash, record.file_name)
+            new_ctx = new_key_config.build_encryption_context(
+                record.file_id, record.file_name, legacy=record.id_scheme == ID_SCHEME_SHA256
+            )
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
             scratch.discard(tmp_pt)
 
@@ -1623,7 +1627,7 @@ def _rotate_records(
             # pinned so far is left exactly as it is (and stays readable with
             # the old key until that key is disabled).
             new_s3_key = s3.s3_key_for_file(
-                record.sha256_hash, record.file_name, message_id=new_result.message_id
+                record.file_id, record.file_name, message_id=new_result.message_id
             )
             new_version_id = s3.upload_file(tmp_enc, new_s3_key, if_none_match=True)
 
@@ -1650,7 +1654,7 @@ def _rotate_records(
                     "object is an orphan: the record still points to the old, intact one, "
                     "and the orphan can be deleted.",
                     extra={
-                        "sha256": record.sha256_hash,
+                        "sha256": record.file_id,
                         "s3_key": new_s3_key,
                         "s3_version_id": new_version_id,
                         "old_s3_key": old_s3_key,
@@ -2170,7 +2174,7 @@ def _id_prefix(identifier: object) -> str:
 
 def _fallback_output_name(record: FileRecord) -> str:
     """Output file name when a record's stored name cannot be used as one."""
-    return f"decrypted_{record.sha256_hash[:16]}"
+    return f"decrypted_{record.file_id[:16]}"
 
 
 def _check_record(record: FileRecord) -> None:
@@ -2186,12 +2190,12 @@ def _check_record(record: FileRecord) -> None:
             identifier's content-addressed path, or (migrated records) a key in
             the legacy-sync layout.
     """
-    if not _is_sha256(record.sha256_hash):
+    if not _is_sha256(record.file_id):
         raise _IdentifierError(
             f"The record for {record.file_name!r} has a malformed identifier; refusing to use it."
         )
     if record.s3_key_scheme == S3_KEY_CONTENT_ADDRESSED:
-        assert_s3_key_matches_hash(record.s3_key, record.sha256_hash, message_id=record.message_id)
+        assert_s3_key_matches_hash(record.s3_key, record.file_id, message_id=record.message_id)
     elif record.s3_key_scheme == S3_KEY_LEGACY_SYNC:
         # Migrated records point where the legacy `aws s3 sync` put the object;
         # the key carries no identifier, so the plaintext checksum and the
@@ -2259,10 +2263,10 @@ def _resolve_identifier(
         record = store.get_current_state(identifier)
         if record is None:
             raise _IdentifierError(f"No record found for hash {identifier[:16]}...")
-        if record.sha256_hash != identifier:
+        if record.file_id != identifier:
             raise _IdentifierError(
                 f"The record stored under {identifier[:16]}... describes a different file "
-                f"({str(record.sha256_hash)[:16]}...). Refusing to use it: the state table "
+                f"({str(record.file_id)[:16]}...). Refusing to use it: the state table "
                 "may have been tampered with."
             )
         return _Selection(record, expected_sha256=identifier)
@@ -2299,7 +2303,7 @@ def _resolve_identifier(
             f"[dim]{len(versions)} versions found. Using {label} "
             f"({_display(selected.encrypted_at)}).{hint}[/dim]"
         )
-    return _Selection(selected, expected_sha256=selected.sha256_hash)
+    return _Selection(selected, expected_sha256=selected.file_id)
 
 
 def _records_named(name: str, store: StateStore) -> list[FileRecord]:
@@ -2327,7 +2331,7 @@ def _encrypted_at(record: FileRecord) -> datetime:
 
 def _newest_first(records: Iterable[FileRecord]) -> list[FileRecord]:
     """Newest first by ``encrypted_at``; ties ordered by identifier, so --version N is stable."""
-    return sorted(records, key=lambda r: (_encrypted_at(r), r.sha256_hash), reverse=True)
+    return sorted(records, key=lambda r: (_encrypted_at(r), r.file_id), reverse=True)
 
 
 def _error_message(exc: BaseException) -> str:
@@ -2344,7 +2348,7 @@ def _report_error(headline: str, exc: BaseException) -> None:
         for number, record in enumerate(exc.candidates, start=1):
             label = f"--version {number}  " if exc.numbered else ""
             console.print(
-                f"  {label}{_id_prefix(record.sha256_hash)}  {_display(record.file_name)}"
+                f"  {label}{_id_prefix(record.file_id)}  {_display(record.file_name)}"
                 f"  {_display(record.encrypted_at)}"
             )
 

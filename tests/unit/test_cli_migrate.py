@@ -296,7 +296,7 @@ def test_migrate_imports_real_aws_encryption_cli_output(legacy: Legacy) -> None:
     assert "errors 0" in result.output
     records = legacy.records()
     assert set(records) == {"alpha.txt", "sub/beta.txt"}
-    assert records["alpha.txt"].sha256_hash == hashlib.sha256(ALPHA).hexdigest()
+    assert records["alpha.txt"].file_id == hashlib.sha256(ALPHA).hexdigest()
     assert records["sub/beta.txt"].file_size_bytes == len(BETA)
     assert records["alpha.txt"].tags == {"source": "migrated"}
 
@@ -669,7 +669,7 @@ def test_exec_and_rotate_key_handle_migrated_records(
     assert rotated.exit_code == 0, rotated.output
     record = legacy.records()["alpha.txt"]
     assert record.s3_key_scheme == S3_KEY_CONTENT_ADDRESSED
-    assert record.s3_key.startswith(f"encrypted/{record.sha256_hash[:2]}/{record.sha256_hash}/")
+    assert record.s3_key.startswith(f"encrypted/{record.file_id[:2]}/{record.file_id}/")
     # The legacy object is left as it was.
     s3 = boto3.client("s3", region_name=REGION)
     assert s3.head_object(Bucket=BUCKET, Key="encrypted/alpha.txt.encrypted")
@@ -694,7 +694,7 @@ def test_record_key_is_validated_by_its_scheme(
     record = legacy.records()["alpha.txt"]
     table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
     table.update_item(
-        Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+        Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
         UpdateExpression="SET s3_key = :k, s3_key_scheme = :s",
         ExpressionAttributeValues={":k": key, ":s": scheme},
     )

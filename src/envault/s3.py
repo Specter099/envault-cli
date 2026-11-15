@@ -57,9 +57,7 @@ _MAX_S3_KEY_BYTES = 1024
 _UNSAFE_CHAR_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 
-def assert_s3_key_matches_hash(
-    s3_key: str, sha256_hash: str, *, message_id: str | None = None
-) -> None:
+def assert_s3_key_matches_hash(s3_key: str, file_id: str, *, message_id: str | None = None) -> None:
     """Reject DynamoDB-sourced keys that are not this file's content-addressed path.
 
     A poisoned ``s3_key`` must not be able to make the CLI fetch an arbitrary
@@ -69,7 +67,8 @@ def assert_s3_key_matches_hash(
 
     Args:
         s3_key: Key from the record.
-        sha256_hash: The record's identifier; the key must be its path.
+        file_id: The record's identifier (see :mod:`envault.fileid`); the key
+            must be its path.
         message_id: If given and the key is in the per-upload format, the key's
             message id segment must equal it. Ignored for the original format,
             whose keys carry no message id.
@@ -80,10 +79,10 @@ def assert_s3_key_matches_hash(
     """
     upload = _S3_UPLOAD_KEY_RE.fullmatch(s3_key)
     match = upload or _S3_KEY_RE.fullmatch(s3_key)
-    if not match or match.group(1) != sha256_hash[:2] or match.group(2) != sha256_hash:
+    if not match or match.group(1) != file_id[:2] or match.group(2) != file_id:
         raise InvalidS3KeyError(
             "Refusing to fetch S3 object: key is not the content-addressed "
-            f"path for hash {sha256_hash[:16]}...."
+            f"path for identifier {file_id[:16]}...."
         )
     if upload and message_id is not None and upload.group(3) != message_id:
         raise InvalidS3KeyError(
@@ -372,19 +371,21 @@ class S3Store:
             return None
         return str(head.get("VersionId", ""))
 
-    def s3_key_for_file(
-        self, sha256_hash: str, file_name: str, message_id: str | None = None
-    ) -> str:
+    def s3_key_for_file(self, file_id: str, file_name: str, message_id: str | None = None) -> str:
         """Generate a content-addressed S3 key for an encrypted file.
 
+        ``file_id`` is the record's identifier (see :mod:`envault.fileid`): a
+        keyed identifier for new records, which reveals nothing about the
+        content, or the plaintext's SHA-256 for legacy ones.
+
         Without ``message_id`` (original format, kept for existing callers):
-        ``encrypted/{sha256[:2]}/{sha256}/{filename}.encrypted``. Every upload
+        ``encrypted/{file_id[:2]}/{file_id}/{filename}.encrypted``. Every upload
         of the same content shares the key, so a later upload makes the
         version a record pins noncurrent.
 
         With ``message_id`` (the Encryption SDK message id of this ciphertext,
         64 lowercase hex characters):
-        ``encrypted/{sha256[:2]}/{sha256}/{message_id}/{filename}.encrypted``.
+        ``encrypted/{file_id[:2]}/{file_id}/{message_id}/{filename}.encrypted``.
         Message ids are random per encryption, so the key is never reused.
         Upload it with ``upload_file(..., if_none_match=True)``.
 
@@ -392,19 +393,19 @@ class S3Store:
         preventing S3 listing bottlenecks at scale.
 
         Raises:
-            InvalidS3KeyError: ``message_id`` is given and it, or ``sha256_hash``,
+            InvalidS3KeyError: ``message_id`` is given and it, or ``file_id``,
                 is not 64 lowercase hex characters.
         """
         safe_name = self._sanitize_filename(file_name)
         if message_id is None:
-            return f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{safe_name}.encrypted"
+            return f"encrypted/{file_id[:2]}/{file_id}/{safe_name}.encrypted"
         if not _HEX64_RE.fullmatch(message_id):
             raise InvalidS3KeyError(
                 f"Invalid message id for an S3 key: expected {MESSAGE_ID_HEX_LENGTH} "
                 "lowercase hex characters (the Encryption SDK message id)."
             )
-        if not _HEX64_RE.fullmatch(sha256_hash):
+        if not _HEX64_RE.fullmatch(file_id):
             raise InvalidS3KeyError(
                 "Invalid file identifier for an S3 key: expected 64 lowercase hex characters."
             )
-        return f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{message_id}/{safe_name}.encrypted"
+        return f"encrypted/{file_id[:2]}/{file_id}/{message_id}/{safe_name}.encrypted"

@@ -241,7 +241,7 @@ def test_exec_records_access_with_principal() -> None:
             )
         store = StateStore(table_name=TABLE_NAME, region=REGION)
         records = store.list_by_state("ENCRYPTED")
-        events = store.list_events_for_file(records[0].sha256_hash)
+        events = store.list_events_for_file(records[0].file_id)
         access = [e for e in events if e.get("operation") == "ACCESS"]
         assert len(access) == 1
         assert access[0]["principal_arn"].startswith("arn:aws:")
@@ -294,7 +294,7 @@ def test_exec_refuses_on_checksum_mismatch() -> None:
         put = s3.put_object(Bucket=BUCKET_NAME, Key=new_key, Body=body)
         table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
         table.update_item(
-            Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+            Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
             UpdateExpression="SET sha256_hash = :h, s3_key = :k, s3_version_id = :v",
             ExpressionAttributeValues={
                 ":h": new_hash,
@@ -325,7 +325,7 @@ def test_exec_refuses_on_encryption_context_mismatch() -> None:
         tampered = dict(record.encryption_context)
         tampered["purpose"] = "not-what-was-encrypted"
         table.update_item(
-            Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+            Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
             UpdateExpression="SET encryption_context = :c",
             ExpressionAttributeValues={":c": tampered},
         )

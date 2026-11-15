@@ -16,6 +16,7 @@ from moto import mock_aws
 from envault import cli as cli_mod
 from envault import state as state_mod
 from envault.cli import main
+from envault.fileid import ID_SCHEME_SHA256
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
 TABLE = "envault-test-state"
@@ -67,7 +68,8 @@ def _create_table() -> None:
 
 def _record(sha: str, name: str, state: str = ENCRYPTED) -> FileRecord:
     return FileRecord(
-        sha256_hash=sha,
+        id_scheme=ID_SCHEME_SHA256,
+        file_id=sha,
         file_name=name,
         current_state=state,
         s3_key=f"encrypted/{sha[:2]}/{sha}/{name}.encrypted",

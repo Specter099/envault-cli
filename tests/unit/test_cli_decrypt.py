@@ -137,7 +137,7 @@ def test_decrypt_command_end_to_end_real_crypto(
     assert len(events) == 2
     # Reading does not consume: the record still says ENCRYPTED.
     [record] = store.list_by_state(ENCRYPTED)
-    assert record.sha256_hash == sha
+    assert record.file_id == sha
 
 
 def test_publish_interrupted_between_link_and_unlink_keeps_output(
@@ -191,7 +191,7 @@ def test_decrypt_of_tampered_ciphertext_leaves_nothing(
     body[len(body) // 2] ^= 0x01
     put = s3.put_object(Bucket=BUCKET, Key=record.s3_key, Body=bytes(body))
     boto3.resource("dynamodb", region_name=REGION).Table(TABLE).update_item(
-        Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+        Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
         UpdateExpression="SET s3_version_id = :v",
         ExpressionAttributeValues={":v": put["VersionId"]},
     )
@@ -204,5 +204,5 @@ def test_decrypt_of_tampered_ciphertext_leaves_nothing(
     assert "Failed to decrypt" in result.output
     assert list(out_dir.iterdir()) == []
     assert list(private_tempdir.iterdir()) == []
-    events = store.list_events_for_file(record.sha256_hash)
+    events = store.list_events_for_file(record.file_id)
     assert not [e for e in events if e["operation"] == "DECRYPT"]

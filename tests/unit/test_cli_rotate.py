@@ -125,7 +125,7 @@ def test_rotate_key_repoints_to_a_new_key_and_leaves_the_old_object(
     assert result.exit_code == 0, result.output
     after = _record()
     assert after.kms_key_id == NEW_ALIAS
-    sha = after.sha256_hash
+    sha = after.file_id
     assert after.s3_key == f"encrypted/{sha[:2]}/{sha}/{after.message_id}/db.env.encrypted"
     assert after.message_id != before.message_id
     assert _versions_at(before.s3_key) == [old_version]  # untouched, still current

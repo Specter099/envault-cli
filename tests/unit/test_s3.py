@@ -115,7 +115,7 @@ def test_s3_key_for_file_is_content_addressed():
     store = S3Store(bucket="b", region="us-east-1")
     sha = "a" * 64
 
-    key = store.s3_key_for_file(sha256_hash=sha, file_name="report.xlsx")
+    key = store.s3_key_for_file(file_id=sha, file_name="report.xlsx")
 
     # Key must contain the hash prefix (sharding) and full hash
     assert sha[:2] in key
@@ -124,7 +124,7 @@ def test_s3_key_for_file_is_content_addressed():
 
     # Two files with same name but different hashes get different keys
     sha2 = "b" * 64
-    key2 = store.s3_key_for_file(sha256_hash=sha2, file_name="report.xlsx")
+    key2 = store.s3_key_for_file(file_id=sha2, file_name="report.xlsx")
     assert key != key2
 
 
@@ -133,11 +133,11 @@ def test_s3_key_sanitizes_traversal_characters():
     store = S3Store(bucket="b", region="us-east-1")
     sha = "c" * 64
 
-    key = store.s3_key_for_file(sha256_hash=sha, file_name="../../etc/passwd")
+    key = store.s3_key_for_file(file_id=sha, file_name="../../etc/passwd")
     assert "../" not in key
     assert "/" not in key.split(sha + "/")[1].replace(".encrypted", "")
 
-    key2 = store.s3_key_for_file(sha256_hash=sha, file_name="file with spaces & (parens).txt")
+    key2 = store.s3_key_for_file(file_id=sha, file_name="file with spaces & (parens).txt")
     assert " " not in key2
     assert "&" not in key2
     assert "(" not in key2
@@ -148,7 +148,7 @@ def test_s3_key_sanitize_preserves_safe_names():
     store = S3Store(bucket="b", region="us-east-1")
     sha = "d" * 64
 
-    key = store.s3_key_for_file(sha256_hash=sha, file_name="my-file_v2.tar.gz")
+    key = store.s3_key_for_file(file_id=sha, file_name="my-file_v2.tar.gz")
     assert "my-file_v2.tar.gz.encrypted" in key
 
 
@@ -317,7 +317,7 @@ def test_s3_key_for_file_without_message_id_keeps_old_format():
     store = S3Store(bucket="b", region="us-east-1")
     assert store.s3_key_for_file(SHA, "report.xlsx") == f"encrypted/aa/{SHA}/report.xlsx.encrypted"
     assert (
-        store.s3_key_for_file(sha256_hash=SHA, file_name="r.xlsx", message_id=None)
+        store.s3_key_for_file(file_id=SHA, file_name="r.xlsx", message_id=None)
         == f"encrypted/aa/{SHA}/r.xlsx.encrypted"
     )
 

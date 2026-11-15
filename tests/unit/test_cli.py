@@ -25,6 +25,7 @@ from envault.cli import (
 )
 from envault.crypto import DecryptResult, EncryptResult, verify_encryption_context
 from envault.exceptions import ChecksumMismatchError, EnvaultError
+from envault.fileid import ID_SCHEME_SHA256
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
 from ._id_key import ID_KEY_ALIAS, create_id_key
@@ -124,7 +125,8 @@ def _seed_encrypted_record(
             "kms_key_alias": KEY_ID,
         }
     record = FileRecord(
-        sha256_hash=sha256,
+        id_scheme=ID_SCHEME_SHA256,
+        file_id=sha256,
         file_name="test.txt",
         current_state=ENCRYPTED,
         s3_key=f"encrypted/{sha256[:2]}/{sha256}/test.txt.encrypted",
@@ -1715,7 +1717,7 @@ def test_decrypt_rejects_poisoned_s3_key(tmp_path: Path) -> None:
     record = _seed_encrypted_record(store)
     table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
     table.update_item(
-        Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+        Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
         UpdateExpression="SET s3_key = :k",
         ExpressionAttributeValues={":k": "other-prefix/not-ours"},
     )
