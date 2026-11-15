@@ -42,6 +42,7 @@ from envault.exceptions import (
     ConfigurationError,
     EncryptionContextMismatchError,
     EnvaultError,
+    KMSError,
     MigrationError,
     StateConflictError,
 )
@@ -295,8 +296,8 @@ def encrypt(
                 f"[yellow]⏭[/yellow] {_display(item.name)} already ENCRYPTED "
                 "(use --force to re-encrypt)"
             )
-        except (EnvaultError, ClientError, BotoCoreError) as exc:
-            console.print(f"[red]✗[/red] {_display(item.name)}: {_display(exc)}")
+        except (EnvaultError, ClientError, BotoCoreError, OSError) as exc:
+            console.print(f"[red]✗[/red] {_display(item.name)}: {_display(_error_message(exc))}")
             # The ✗ line is the report; the traceback is for -v only.
             logger.debug("Failed to encrypt %s", item.path, exc_info=True)
             errors += 1
@@ -527,13 +528,14 @@ def decrypt(
         console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
         sys.exit(1)
 
-    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
-    os.close(_fd)
-    tmp_encrypted = Path(_tmp)
+    tmp_encrypted: Path | None = None
     # Verified plaintext waits here, hidden, until the read is on the audit trail.
     staging = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex[:8]}.verified")
 
     try:
+        _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
+        tmp_encrypted = Path(_tmp)
+        os.close(_fd)
         s3.download_file(
             s3_key=record.s3_key,
             local_path=tmp_encrypted,
@@ -593,6 +595,10 @@ def decrypt(
     except ConfigurationError as exc:
         console.print(f"[bold red]Configuration error:[/bold red] {_display(exc)}")
         sys.exit(1)
+    except KMSError as exc:
+        # Availability or permission, never a statement about the ciphertext.
+        _report_error("KMS error", exc)
+        sys.exit(1)
     except (ClientError, BotoCoreError) as exc:
         error_msg = str(exc)
         if isinstance(exc, ClientError):
@@ -606,7 +612,8 @@ def decrypt(
         console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
         sys.exit(1)
     finally:
-        tmp_encrypted.unlink(missing_ok=True)
+        if tmp_encrypted is not None:
+            tmp_encrypted.unlink(missing_ok=True)
         # No-op once published; otherwise zero-overwrites verified plaintext.
         _best_effort_delete(staging)
 
@@ -1018,9 +1025,10 @@ def rotate_key(
     # recorded against it, so rotation must cover them all. Records written by
     # earlier versions were flipped to DECRYPTED on first read; skipping those
     # would silently leave the most-accessed files under the old key.
-    records = store.list_by_state(ENCRYPTED)
-    seen = {r.sha256_hash for r in records}
-    legacy = [r for r in store.list_by_state(DECRYPTED) if r.sha256_hash not in seen]
+    with _exit_on_error():
+        records = store.list_by_state(ENCRYPTED)
+        seen = {r.sha256_hash for r in records}
+        legacy = [r for r in store.list_by_state(DECRYPTED) if r.sha256_hash not in seen]
     if legacy:
         console.print(
             f"[dim]Including {len(legacy)} record(s) marked DECRYPTED by an earlier "
@@ -1397,7 +1405,7 @@ def exec_(
             "The encrypted data may have been corrupted or tampered with."
         )
         sys.exit(1)
-    except (EnvaultError, ClientError, BotoCoreError) as exc:
+    except (EnvaultError, ClientError, BotoCoreError, OSError) as exc:
         _close_all(creds, sinks)
         _report_error("Refusing to run", exc)
         console.print("No command was started and no secrets were delivered.")
@@ -1559,10 +1567,10 @@ def _preflight_kms_key(key_id: str, region: str) -> None:
     kms = boto3.client("kms", region_name=region, config=boto_config)
     try:
         metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
-    except ClientError as exc:
-        msg = exc.response.get("Error", {}).get("Message", str(exc))
+    except (ClientError, BotoCoreError) as exc:
         console.print(
-            f"[bold red]Cannot use KMS key {_display(key_id)}:[/bold red] {_display(msg)}\n"
+            f"[bold red]Cannot use KMS key {_display(key_id)}:[/bold red] "
+            f"{_display(_error_message(exc))}\n"
             "Rotation did not download or decrypt any files. Grant kms:DescribeKey "
             "(and GenerateDataKey) on the target key, or pass a key this principal can use."
         )
