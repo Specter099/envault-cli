@@ -303,3 +303,309 @@ def test_assert_s3_key_matches_hash_rejects_hash_mismatch():
     other = "b" * 64
     with pytest.raises(EnvaultError, match="content-addressed"):
         assert_s3_key_matches_hash(f"encrypted/{other[:2]}/{other}/file.txt.encrypted", sha)
+
+
+# ---------------------------------------------------------------------------
+# M7: one never-reused key per upload, written with If-None-Match: *
+# ---------------------------------------------------------------------------
+
+SHA = "a" * 64
+MID = "0123456789abcdef" * 4  # an Encryption SDK message id: 32 bytes as lowercase hex
+
+
+def test_s3_key_for_file_without_message_id_keeps_old_format():
+    store = S3Store(bucket="b", region="us-east-1")
+    assert store.s3_key_for_file(SHA, "report.xlsx") == f"encrypted/aa/{SHA}/report.xlsx.encrypted"
+    assert (
+        store.s3_key_for_file(sha256_hash=SHA, file_name="r.xlsx", message_id=None)
+        == f"encrypted/aa/{SHA}/r.xlsx.encrypted"
+    )
+
+
+def test_s3_key_for_file_with_message_id_is_unique_per_upload():
+    store = S3Store(bucket="b", region="us-east-1")
+    key = store.s3_key_for_file(SHA, "../secrets/db env", message_id=MID)
+    assert key == f"encrypted/aa/{SHA}/{MID}/db_env.encrypted"
+    other = store.s3_key_for_file(SHA, "../secrets/db env", message_id="f" * 64)
+    assert other != key
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "abc", MID.upper(), MID[:-1], MID + "0", "g" * 64, f"{MID[:32]}/../{MID[:28]}"],
+)
+def test_s3_key_for_file_rejects_malformed_message_id(bad: str):
+    from envault.exceptions import InvalidS3KeyError
+
+    store = S3Store(bucket="b", region="us-east-1")
+    with pytest.raises(InvalidS3KeyError, match="message id"):
+        store.s3_key_for_file(SHA, "f.txt", message_id=bad)
+
+
+def test_s3_key_for_file_with_message_id_rejects_malformed_identifier():
+    from envault.exceptions import InvalidS3KeyError
+
+    store = S3Store(bucket="b", region="us-east-1")
+    with pytest.raises(InvalidS3KeyError):
+        store.s3_key_for_file("../../etc", "f.txt", message_id=MID)
+
+
+def test_s3_key_validator_accepts_both_formats():
+    from envault.s3 import assert_s3_key_matches_hash
+
+    store = S3Store(bucket="b", region="us-east-1")
+    old = store.s3_key_for_file(SHA, "f.txt")
+    new = store.s3_key_for_file(SHA, "f.txt", message_id=MID)
+    assert_s3_key_matches_hash(old, SHA)
+    assert_s3_key_matches_hash(new, SHA)
+    assert_s3_key_matches_hash(new, SHA, message_id=MID)
+    # Old-format keys carry no message id, so there is nothing to compare.
+    assert_s3_key_matches_hash(old, SHA, message_id=MID)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        f"encrypted/aa/{SHA}/{MID.upper()}/f.txt.encrypted",
+        f"encrypted/aa/{SHA}/{MID[:-1]}/f.txt.encrypted",
+        f"encrypted/aa/{SHA}/{MID}0/f.txt.encrypted",
+        f"encrypted/aa/{SHA}/{MID}/extra/f.txt.encrypted",
+        f"encrypted/aa/{SHA}/{MID}/.encrypted",
+        f"encrypted/aa/{SHA}/{MID}/f.txt",
+        f"encrypted/bb/{SHA}/{MID}/f.txt.encrypted",
+        f"encrypted/aa/{'b' * 64}/{MID}/f.txt.encrypted",
+        f"other/aa/{SHA}/{MID}/f.txt.encrypted",
+    ],
+)
+def test_s3_key_validator_rejects_malformed_keys(key: str):
+    from envault.exceptions import EnvaultError, InvalidS3KeyError
+    from envault.s3 import assert_s3_key_matches_hash
+
+    with pytest.raises(InvalidS3KeyError, match="content-addressed") as exc_info:
+        assert_s3_key_matches_hash(key, SHA)
+    assert isinstance(exc_info.value, EnvaultError)
+
+
+def test_s3_key_validator_checks_message_id_when_given():
+    from envault.exceptions import InvalidS3KeyError
+    from envault.s3 import assert_s3_key_matches_hash
+
+    key = f"encrypted/aa/{SHA}/{MID}/f.txt.encrypted"
+    with pytest.raises(InvalidS3KeyError, match="message id"):
+        assert_s3_key_matches_hash(key, SHA, message_id="f" * 64)
+
+
+KEY = f"encrypted/aa/{SHA}/{MID}/f.txt.encrypted"
+
+
+@mock_aws
+def test_upload_if_none_match_refuses_existing_key(tmp_path: Path, no_retry_sleep):
+    """M7: a conditional upload must never replace an object a record may pin."""
+    from envault.exceptions import EnvaultError, S3ObjectExistsError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    pinned = s3_client.put_object(Bucket=BUCKET, Key=KEY, Body=b"pinned ciphertext")["VersionId"]
+
+    p = tmp_path / "new.enc"
+    p.write_bytes(b"different ciphertext")
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with pytest.raises(S3ObjectExistsError) as exc_info:
+        store.upload_file(p, KEY, if_none_match=True)
+
+    assert isinstance(exc_info.value, EnvaultError)
+    assert exc_info.value.bucket == BUCKET
+    assert exc_info.value.s3_key == KEY
+    versions = s3_client.list_object_versions(Bucket=BUCKET, Prefix=KEY)["Versions"]
+    assert [v["VersionId"] for v in versions] == [pinned]
+    assert s3_client.get_object(Bucket=BUCKET, Key=KEY)["Body"].read() == b"pinned ciphertext"
+    assert no_retry_sleep == [], "a 412 is deterministic and must not be retried"
+
+
+@mock_aws
+def test_upload_if_none_match_sends_condition_and_returns_version(tmp_path: Path):
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    p = tmp_path / "new.enc"
+    p.write_bytes(b"ciphertext")
+    store = S3Store(bucket=BUCKET, region=REGION, kms_key_id="alias/k")
+
+    with patch.object(store._s3, "put_object", wraps=store._s3.put_object) as mock_put:
+        version_id = store.upload_file(p, KEY, if_none_match=True)
+
+    kwargs = mock_put.call_args.kwargs
+    assert kwargs["IfNoneMatch"] == "*"
+    assert kwargs["SSEKMSKeyId"] == "alias/k"
+    assert kwargs["ChecksumAlgorithm"] == "SHA256"
+    versions = s3_client.list_object_versions(Bucket=BUCKET, Prefix=KEY)["Versions"]
+    assert [v["VersionId"] for v in versions] == [version_id]
+
+
+@mock_aws
+def test_upload_default_sends_no_condition(tmp_path: Path):
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    p = tmp_path / "new.enc"
+    p.write_bytes(b"ciphertext")
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with patch.object(store._s3, "put_object", wraps=store._s3.put_object) as mock_put:
+        store.upload_file(p, KEY)
+    assert "IfNoneMatch" not in mock_put.call_args.kwargs
+
+
+@mock_aws
+def test_upload_if_none_match_recovers_from_lost_reply(tmp_path: Path, no_retry_sleep):
+    """Our first PUT lands but its reply is lost; the retry's 412 is our own object."""
+    from botocore.exceptions import ReadTimeoutError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    p = tmp_path / "new.enc"
+    p.write_bytes(b"our ciphertext")
+    store = S3Store(bucket=BUCKET, region=REGION)
+    real_put = store._s3.put_object
+    calls = {"n": 0}
+
+    def put_then_lose_reply(**kwargs):
+        calls["n"] += 1
+        response = real_put(**kwargs)
+        if calls["n"] == 1:
+            raise ReadTimeoutError(endpoint_url="https://s3.us-east-1.amazonaws.com")
+        return response
+
+    with patch.object(store._s3, "put_object", side_effect=put_then_lose_reply):
+        version_id = store.upload_file(p, KEY, if_none_match=True)
+
+    assert calls["n"] == 2
+    versions = s3_client.list_object_versions(Bucket=BUCKET, Prefix=KEY)["Versions"]
+    assert [v["VersionId"] for v in versions] == [version_id]
+
+
+@mock_aws
+def test_upload_if_none_match_does_not_adopt_a_foreign_object(tmp_path: Path, no_retry_sleep):
+    """After a lost reply, a different object at the key is still a refusal."""
+    from botocore.exceptions import ReadTimeoutError
+
+    from envault.exceptions import S3ObjectExistsError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    p = tmp_path / "new.enc"
+    p.write_bytes(b"our ciphertext")
+    store = S3Store(bucket=BUCKET, region=REGION)
+
+    def foreign_put_then_lost_reply(**kwargs):
+        s3_client.put_object(Bucket=BUCKET, Key=KEY, Body=b"someone else's bytes")
+        raise ReadTimeoutError(endpoint_url="https://s3.us-east-1.amazonaws.com")
+
+    real_put = store._s3.put_object
+    calls = {"n": 0}
+
+    def put(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return foreign_put_then_lost_reply(**kwargs)
+        return real_put(**kwargs)
+
+    with patch.object(store._s3, "put_object", side_effect=put):
+        with pytest.raises(S3ObjectExistsError):
+            store.upload_file(p, KEY, if_none_match=True)
+    body = s3_client.get_object(Bucket=BUCKET, Key=KEY)["Body"].read()
+    assert body == b"someone else's bytes"
+
+
+@mock_aws
+def test_upload_if_none_match_requires_botocore_support(tmp_path: Path):
+    """Old botocore drops nothing silently: it would reject IfNoneMatch client-side."""
+    from envault.exceptions import ConfigurationError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    p = tmp_path / "new.enc"
+    p.write_bytes(b"ciphertext")
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with (
+        patch("envault.s3._put_object_supports_if_none_match", return_value=False),
+        patch.object(store._s3, "put_object") as mock_put,
+    ):
+        with pytest.raises(ConfigurationError, match="1.35.2"):
+            store.upload_file(p, KEY, if_none_match=True)
+    mock_put.assert_not_called()
+
+
+@mock_aws
+def test_download_file_does_not_retry_missing_object(tmp_path: Path, no_retry_sleep):
+    """A 404 is deterministic: one attempt, no backoff."""
+    from botocore.exceptions import ClientError
+
+    s3_client = boto3.client("s3", region_name=REGION)
+    _create_versioned_bucket(s3_client)
+    store = S3Store(bucket=BUCKET, region=REGION)
+    with pytest.raises(ClientError):
+        store.download_file("encrypted/missing.encrypted", tmp_path / "x", allow_latest=True)
+    assert no_retry_sleep == []
+
+
+# ---------------------------------------------------------------------------
+# M4: keys written by the legacy `aws s3 sync ../encrypted s3://$BUCKET/encrypted`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "encrypted/alpha.txt.encrypted",
+        "encrypted/sub/beta.txt.encrypted",
+        "encrypted/deep/er/still/fine.env.encrypted",
+        "encrypted/.env.encrypted",
+        "encrypted/with space/café.txt.encrypted",
+        f"encrypted/aa/{SHA}/f.txt.encrypted",
+    ],
+)
+def test_assert_legacy_s3_key_accepts_sync_layout(key: str):
+    from envault.s3 import assert_legacy_s3_key
+
+    assert_legacy_s3_key(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "alpha.txt.encrypted",
+        "encrypt/alpha.txt.encrypted",
+        "encrypted/alpha.txt",
+        "encrypted/alpha.txt.encrypted.bak",
+        "/encrypted/alpha.txt.encrypted",
+        "encrypted//alpha.txt.encrypted",
+        "encrypted/./alpha.txt.encrypted",
+        "encrypted/../alpha.txt.encrypted",
+        "encrypted/sub/../../x.encrypted",
+        "encrypted/sub/..",
+        "encrypted/a\\b.txt.encrypted",
+        "encrypted/a\x1b[2Jb.encrypted",
+        "encrypted/a\nb.encrypted",
+        "encrypted/a\x00b.encrypted",
+        "encrypted/a\x7fb.encrypted",
+        "encrypted/a\x85b.encrypted",
+        "encrypted/a‮b.encrypted",
+        "encrypted/a​b.encrypted",
+        "encrypted/.encrypted",
+        "encrypted/sub/.encrypted",
+        "encrypted/...encrypted",
+        "encrypted/",
+        "encrypted",
+        "",
+        "encrypted/x.encrypted/",
+        "encrypted/" + "a" * 1100 + ".encrypted",
+    ],
+)
+def test_assert_legacy_s3_key_rejects_unsafe_keys(key: str):
+    from envault.exceptions import EnvaultError, InvalidS3KeyError
+    from envault.s3 import assert_legacy_s3_key
+
+    with pytest.raises(InvalidS3KeyError, match="legacy") as exc_info:
+        assert_legacy_s3_key(key)
+    assert isinstance(exc_info.value, EnvaultError)
+    # The message shows the key escaped, so control characters cannot reach a terminal.
+    assert "\x1b" not in str(exc_info.value)
+    assert "\n" not in str(exc_info.value)

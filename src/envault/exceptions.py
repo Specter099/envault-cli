@@ -63,3 +63,29 @@ class ConfigurationError(EnvaultError):
 
 class MigrationError(EnvaultError):
     """Raised when a migration from output.json fails."""
+
+
+class InvalidS3KeyError(EnvaultError):
+    """Raised when an S3 object key fails validation.
+
+    Keys come from DynamoDB rows, which anyone with table write access can edit.
+    A key that is not the expected shape must never be fetched or written.
+    """
+
+
+class S3ObjectExistsError(EnvaultError):
+    """Raised when a conditional upload finds an object already at its key.
+
+    envault uploads with ``If-None-Match: *`` so that no upload can replace an
+    object that a record may pin by VersionId. Seeing this means the key was
+    taken by someone else. A retry of envault's own upload (lost reply) is
+    recognised and not reported.
+    """
+
+    def __init__(self, bucket: str, s3_key: str) -> None:
+        self.bucket = bucket
+        self.s3_key = s3_key
+        super().__init__(
+            f"Refusing to overwrite S3 object {s3_key!r} in bucket {bucket!r}: an object "
+            "already exists at that key and was not written by this upload."
+        )
