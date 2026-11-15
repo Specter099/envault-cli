@@ -521,7 +521,11 @@ def encrypt(
 ) -> None:
     """Encrypt a file or directory and store state in DynamoDB.
 
-    INPUT_PATH can be a single file or a directory (processed recursively).
+    INPUT_PATH can be a single file or a directory (processed recursively;
+    symlinks are not followed). Each file is stored under its path relative to
+    INPUT_PATH (prod/db.env), a single file under its name; decrypt and exec
+    accept that name. Every upload goes to a new S3 key: no upload replaces an
+    object a record points to.
     """
     config = Config(key_id=key_id, bucket=bucket, region=region, audit_ttl_days=audit_ttl_days)
     tags = _parse_tags(tag)
