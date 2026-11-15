@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -103,3 +104,16 @@ def tmp_plaintext(tmp_path: Path) -> Path:
 @pytest.fixture
 def correlation_id() -> str:
     return str(uuid.uuid4())
+
+
+@pytest.fixture
+def no_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Skip tenacity's backoff sleeps and record each delay that was requested.
+
+    tenacity's default sleep looks up ``time.sleep`` at call time, so this also
+    reaches functions that were decorated at import. An empty list after a
+    failing call proves the failure was not retried.
+    """
+    delays: list[float] = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    return delays

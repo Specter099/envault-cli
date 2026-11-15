@@ -7,14 +7,17 @@ from dataclasses import dataclass
 from botocore.config import Config as BotoConfig
 
 # Shared boto3 client config:
-# - Explicit timeouts prevent indefinite hangs under partial network failure
-# - Retries disabled at boto3 level — tenacity handles retries at the application layer
-#   to avoid compounding (boto3 5x * tenacity 3x = 15x amplification);
-#   see envault.retry.aws_retry
+# - Explicit timeouts prevent indefinite hangs under partial network failure.
+# - Exactly one HTTP attempt per client call. tenacity handles retries at the
+#   application layer (envault.retry.aws_retry), so botocore must not add its own
+#   (boto3 5x * tenacity 3x = 15x amplification). Spelled as total_max_attempts:
+#   botocore reads a bare "max_attempts" as the number of *retries*, so
+#   {"max_attempts": 1} meant two requests per call. An explicit mode keeps
+#   AWS_RETRY_MODE=adaptive (client-side rate limiting) from changing behaviour.
 boto_config = BotoConfig(
     connect_timeout=5,
     read_timeout=30,
-    retries={"max_attempts": 1},
+    retries={"total_max_attempts": 1, "mode": "standard"},
 )
 
 

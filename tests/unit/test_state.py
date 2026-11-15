@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import contextlib
 import time
 from unittest.mock import patch
 
 import boto3
 import pytest
 from boto3.dynamodb.conditions import Key
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ReadTimeoutError
 from moto import mock_aws
 
 from envault.exceptions import StateConflictError
@@ -512,8 +511,13 @@ def test_summary_counts_exclude_events():
 
 
 @mock_aws
-def test_put_event_retry_is_idempotent():
-    """Retried put_event calls must produce the same SK (no duplicate events)."""
+def test_put_event_retry_is_idempotent(no_retry_sleep):
+    """Retried put_event calls must produce the same SK (no duplicate events).
+
+    The first write lands but its reply is lost (a read timeout, which the retry
+    policy treats as transient); the retry must re-send the identical SK and the
+    trail must hold exactly one event.
+    """
     store = _create_table()
     record = _make_record()
 
@@ -534,15 +538,35 @@ def test_put_event_retry_is_idempotent():
         call_count += 1
         if call_count == 1:
             tracking_put_item(**kwargs)
-            raise Exception("simulated network error after write")
+            raise ReadTimeoutError(endpoint_url="https://dynamodb.us-east-1.amazonaws.com")
         return tracking_put_item(**kwargs)
 
     with patch.object(store._table, "put_item", side_effect=flaky_put_item):
-        with contextlib.suppress(Exception):
-            store.put_event(record, operation="ENCRYPT", correlation_id="corr-idem")
+        store.put_event(record, operation="ENCRYPT", correlation_id="corr-idem")
 
-    if len(sks_seen) == 2:
-        assert sks_seen[0] == sks_seen[1], f"Retry used different SK: {sks_seen}"
+    assert len(sks_seen) == 2, f"expected one retry after the lost reply, saw {sks_seen}"
+    assert sks_seen[0] == sks_seen[1], f"Retry used different SK: {sks_seen}"
+    assert len(store.list_events_for_file(record.sha256_hash)) == 1
+
+
+@mock_aws
+def test_get_current_state_does_not_retry_missing_table(no_retry_sleep):
+    """A missing table is deterministic: one GetItem, no backoff (r02 (c))."""
+    store = StateStore(table_name="table-that-does-not-exist", region=REGION)
+    calls = 0
+    original_get_item = store._table.get_item
+
+    def counting_get_item(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original_get_item(**kwargs)
+
+    with patch.object(store._table, "get_item", side_effect=counting_get_item):
+        with pytest.raises(ClientError) as exc_info:
+            store.get_current_state("a" * 64)
+    assert exc_info.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert calls == 1
+    assert no_retry_sleep == []
 
 
 @mock_aws
