@@ -50,7 +50,16 @@ from envault.exceptions import (
     MigrationError,
     StateConflictError,
 )
-from envault.fileid import ID_SCHEME_SHA256
+from envault.fileid import (
+    ID_SCHEME_HMAC_SHA256,
+    ID_SCHEME_SHA256,
+    ID_SCHEMES,
+    FileIdVerifier,
+    IdKey,
+    check_id_key_arn,
+    is_file_id,
+    sha256_digest,
+)
 from envault.fileutils import best_effort_delete as _best_effort_delete
 from envault.fileutils import open_regular_nofollow
 from envault.identity import caller_arn
@@ -484,6 +493,46 @@ _audit_ttl_option = click.option(
 )
 
 
+# The HMAC key that names files (M6, see envault.fileid). encrypt and migrate
+# cannot run without it: there is no fallback to naming files by the SHA-256 of
+# their content. decrypt, exec, status and audit use it only to look a file up
+# by that SHA-256; reading a keyed record verifies it with the key the record
+# names, configured or not.
+_ID_KEY_HELP = (
+    "KMS HMAC key (HMAC_256, GENERATE_VERIFY_MAC) that names files, as an alias, key ID "
+    "or ARN, e.g. alias/envault-id from the envault stack."
+)
+_id_key_required_option = click.option(
+    "--id-key-id",
+    envvar="ENVAULT_ID_KEY_ID",
+    default=None,
+    metavar="KEY",
+    help=f"{_ID_KEY_HELP} Required.",
+)
+_id_key_lookup_option = click.option(
+    "--id-key-id",
+    envvar="ENVAULT_ID_KEY_ID",
+    default=None,
+    metavar="KEY",
+    help=f"{_ID_KEY_HELP} Optional: lets a file be looked up by the SHA-256 of its content.",
+)
+
+
+def _require_id_key(id_key_id: str | None, region: str) -> IdKey:
+    """The configured identifier key; a usage error (exit 2) if there is none."""
+    if not id_key_id:
+        raise click.UsageError(
+            "No key to name files with: pass --id-key-id or set ENVAULT_ID_KEY_ID to the KMS "
+            "HMAC key that derives file identifiers (alias/envault-id in the envault stack). "
+            "envault no longer names new files by the SHA-256 of their content."
+        )
+    return IdKey(id_key_id, region)
+
+
+def _optional_id_key(id_key_id: str | None, region: str) -> IdKey | None:
+    return IdKey(id_key_id, region) if id_key_id else None
+
+
 @contextmanager
 def _exit_on_error(headline: str = "Error") -> Iterator[None]:
     """Turn AWS and envault errors into a one-line message and exit status 1."""
@@ -510,6 +559,7 @@ def _exit_on_error(headline: str = "Error") -> Iterator[None]:
 @click.option("--tag", "-t", multiple=True, metavar="KEY=VALUE", help="File tags (repeatable).")
 @click.option("--force", is_flag=True, help="Re-encrypt even if already ENCRYPTED.")
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1", show_default=True)
+@_id_key_required_option
 @_audit_ttl_option
 def encrypt(
     input_path: Path,
@@ -519,6 +569,7 @@ def encrypt(
     tag: tuple[str, ...],
     force: bool,
     region: str,
+    id_key_id: str | None,
     audit_ttl_days: int,
 ) -> None:
     """Encrypt a file or directory and store state in DynamoDB.
@@ -528,7 +579,12 @@ def encrypt(
     INPUT_PATH (prod/db.env), a single file under its name; decrypt and exec
     accept that name. Every upload goes to a new S3 key: no upload replaces an
     object a record points to.
+
+    Each file is identified by an HMAC of its SHA-256 under the --id-key-id
+    key (ENVAULT_ID_KEY_ID), which reveals nothing about its content; the
+    SHA-256 itself is never stored, uploaded or printed.
     """
+    id_key = _require_id_key(id_key_id, region)
     config = Config(key_id=key_id, bucket=bucket, region=region, audit_ttl_days=audit_ttl_days)
     tags = _parse_tags(tag)
     store = StateStore(table_name=table, region=region)
@@ -544,7 +600,7 @@ def encrypt(
     for item in track(files, description="Encrypting..."):
         try:
             file_correlation_id = f"{correlation_id}/{uuid.uuid4()}"
-            _encrypt_one(item, config, tags, store, s3, file_correlation_id, force)
+            _encrypt_one(item, config, tags, store, s3, file_correlation_id, force, id_key)
         except AlreadyEncryptedError:
             console.print(
                 f"[yellow]⏭[/yellow] {_display(item.name)} already ENCRYPTED "
@@ -569,6 +625,7 @@ def _encrypt_one(
     s3: S3Store,
     correlation_id: str,
     force: bool,
+    id_key: IdKey,
 ) -> None:
     # One descriptor for the dedup hash and the encryption, opened without
     # following a symlink and only if it is still the inode collected: a path
@@ -576,7 +633,7 @@ def _encrypt_one(
     # nothing that is read.
     fd = open_regular_nofollow(item.path, expected=item.identity)
     try:
-        _encrypt_fd(fd, item, config, tags, store, s3, correlation_id, force)
+        _encrypt_fd(fd, item, config, tags, store, s3, correlation_id, force, id_key)
     finally:
         os.close(fd)
 
@@ -590,19 +647,27 @@ def _encrypt_fd(
     s3: S3Store,
     correlation_id: str,
     force: bool,
+    id_key: IdKey,
 ) -> None:
     name = item.name
+    # The SHA-256 never leaves this function: KMS turns its digest into the
+    # file's identifier, and only that is stored, uploaded, logged or printed.
     sha256 = sha256_fd(fd)
+    keyed = id_key.file_id(sha256_digest(sha256))
+    file_id = keyed.file_id
 
-    existing = store.get_current_state(sha256)
+    # Deduplicate on the keyed identifier only. Looking up FILE#<sha256> as
+    # well would send the content hash to DynamoDB (and to CloudTrail data
+    # events); a file known only by a legacy record gets a new, keyed one.
+    existing = store.get_current_state(file_id)
     if existing and existing.current_state == ENCRYPTED and not force:
-        raise AlreadyEncryptedError(file_id=sha256, file_name=name)
+        raise AlreadyEncryptedError(file_id=file_id, file_name=name)
 
     # Microseconds: versions of one name are ordered by this, and two files
     # encrypted within the same second must not tie.
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
-    # enc_context uses the pre-read hash; it will be validated against result.sha256_hash below
-    enc_context = config.build_encryption_context(sha256, name, legacy=True)
+    # Built from the pre-read hash; the bytes encrypted are checked against it below.
+    enc_context = config.build_encryption_context(file_id, name)
 
     with _Scratch() as scratch:
         tmp_encrypted = scratch.file(prefix="envault_enc_", suffix=".encrypted")
@@ -624,13 +689,11 @@ def _encrypt_fd(
         # A key of its own for every upload (it embeds the message id), written
         # only if nothing is there: no upload can make the version another
         # record pins noncurrent. The name part is the stored name's basename.
-        s3_key = s3.s3_key_for_file(
-            file_id=result.sha256_hash, file_name=name, message_id=result.message_id
-        )
+        s3_key = s3.s3_key_for_file(file_id=file_id, file_name=name, message_id=result.message_id)
         version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key, if_none_match=True)
 
     record = FileRecord(
-        file_id=result.sha256_hash,
+        file_id=file_id,
         file_name=name,
         current_state=ENCRYPTED,
         s3_key=s3_key,
@@ -643,7 +706,8 @@ def _encrypt_fd(
         tags=tags,
         encrypted_at=now,
         last_updated=now,
-        id_scheme=ID_SCHEME_SHA256,
+        id_scheme=ID_SCHEME_HMAC_SHA256,
+        id_key_arn=keyed.key_arn,
     )
     try:
         store.put_current_state(
@@ -657,7 +721,7 @@ def _encrypt_fd(
             "State write failed after S3 upload. The uploaded object is an orphan: no "
             "record points to it, and it can be deleted.",
             extra={
-                "sha256": sha256,
+                "file_id": file_id,
                 "s3_key": s3_key,
                 "s3_version_id": version_id,
                 "bucket": config.bucket,
@@ -723,6 +787,7 @@ def _encrypt_fd(
     is_flag=True,
     help="Allow download when the record has no S3 VersionId (migrated files).",
 )
+@_id_key_lookup_option
 @_audit_ttl_option
 def decrypt(
     identifier: str,
@@ -734,25 +799,32 @@ def decrypt(
     version: int | None,
     allowed_account_ids: str,
     latest: bool,
+    id_key_id: str | None,
     audit_ttl_days: int,
 ) -> None:
-    """Decrypt a file by SHA256 hash or stored name.
+    """Decrypt a file by identifier, SHA-256 or stored name.
 
-    IDENTIFIER is a 64-char SHA256 hash or the name the file was stored under:
-    its path relative to the directory given to encrypt (prod/db.env), or its
-    basename when that is unambiguous. When several files are stored under the
-    same name, use --version N to pick one.
+    \b
+    IDENTIFIER is one of:
+      - the file's identifier, 64 hex characters as `status` lists it;
+      - the SHA-256 of its content, with --id-key-id / ENVAULT_ID_KEY_ID set
+        (the content is then checked against that SHA-256 too);
+      - the name it was stored under: its path relative to the directory given
+        to encrypt (prod/db.env), or its basename when that is unambiguous.
+    When several files are stored under the same name, use --version N to pick one.
     """
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
     account_ids = _validate_account_ids(allowed_account_ids)
+    verifier = FileIdVerifier(region=region, allowed_account_ids=account_ids)
 
     with _exit_on_error("Decryption error"):
-        selection = _resolve_identifier(identifier, store, version=version)
+        selection = _resolve_identifier(
+            identifier, store, version=version, id_key=_optional_id_key(id_key_id, region)
+        )
         record = selection.record
-        _check_record(record)
-    sha256_hash = record.file_id
+        _check_record(record, region=region, allowed_account_ids=account_ids)
 
     if output.is_dir():
         safe_name = Path(record.file_name).name
@@ -794,7 +866,7 @@ def decrypt(
                 version_id=version_id,
                 allow_latest=latest,
             )
-            decrypt_file(
+            result = decrypt_file(
                 input_path=tmp_encrypted,
                 output_path=staging,
                 expected_sha256=selection.expected_sha256,
@@ -802,6 +874,9 @@ def decrypt(
                 allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
             )
+            # Still hidden in the staging file: a keyed identifier is verified
+            # before the read is recorded or the plaintext published.
+            _verify_identity(selection, result.sha256_hash, verifier)
 
             # Fail closed, like exec: reading a file does not change what is stored
             # in S3, so current_state is left alone and the read is recorded as an
@@ -818,7 +893,7 @@ def decrypt(
             except (ClientError, BotoCoreError, EnvaultError) as exc:
                 logger.error(
                     "Audit event write failed; decrypted plaintext discarded.",
-                    extra={"sha256": sha256_hash, "s3_key": record.s3_key},
+                    extra={"file_id": record.file_id, "s3_key": record.s3_key},
                 )
                 console.print(
                     "[bold red]Refusing to write plaintext:[/bold red] the access could not be "
@@ -833,7 +908,7 @@ def decrypt(
                 "The ciphertext metadata does not match the record in DynamoDB.\n"
                 "This could mean the encrypted file in S3 was replaced or corrupted.\n"
                 "No plaintext was written.\n"
-                f"  File: {_display(record.file_name)}  SHA256: {_id_prefix(sha256_hash)}..."
+                f"  File: {_display(record.file_name)}  ID: {_id_prefix(record.file_id)}..."
             )
             sys.exit(1)
         except ChecksumMismatchError:
@@ -842,7 +917,7 @@ def decrypt(
             console.print(
                 "[bold red]Decryption failed:[/bold red] checksum mismatch.\n"
                 "The decrypted content is not the file this record identifies "
-                f"({_id_prefix(selection.expected_sha256)}...). No plaintext was written.\n"
+                f"({_id_prefix(selection.expected_file_id)}...). No plaintext was written.\n"
                 "The encrypted data in S3 may have been corrupted or tampered with."
             )
             sys.exit(1)
@@ -899,21 +974,27 @@ def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
 
 @main.command()
 @click.option("--state", type=click.Choice(["encrypted", "decrypted", "all"]), default="all")
-@click.option("--file", "sha256_hash", default=None, help="Hash of a specific file.")
+@click.option(
+    "--file",
+    "identifier",
+    default=None,
+    help="A file's identifier, as status lists it, or the SHA-256 of its content "
+    "(with --id-key-id).",
+)
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
-def status(state: str, sha256_hash: str | None, table: str, region: str) -> None:
+@_id_key_lookup_option
+def status(
+    state: str, identifier: str | None, table: str, region: str, id_key_id: str | None
+) -> None:
     """Show current encryption state of files."""
     with _exit_on_error():
         store = StateStore(table_name=table, region=region)
 
-        if sha256_hash:
-            _validate_sha256(sha256_hash)
-            record = store.get_current_state(sha256_hash)
-            if not record:
-                console.print(f"[red]No record found for {_id_prefix(sha256_hash)}...[/red]")
-                sys.exit(1)
-            _print_records([record])
+        if identifier:
+            _validate_identifier(identifier)
+            selection = _record_by_id(identifier, store, _optional_id_key(id_key_id, region))
+            _print_records([selection.record])
             return
 
         records = []
@@ -932,7 +1013,7 @@ def _print_records(records: list[FileRecord]) -> None:
     t = Table(show_header=True, header_style="bold cyan")
     t.add_column("File", style="white")
     t.add_column("State")
-    t.add_column("SHA256 (16)")
+    t.add_column("ID (16)")
     t.add_column("Encrypted At")
     t.add_column("Tags")
     for r in sorted(records, key=lambda x: x.encrypted_at, reverse=True):
@@ -968,7 +1049,13 @@ def _utc_today() -> date:
 
 
 @main.command()
-@click.option("--file", "sha256_hash", default=None, help="Hash of a specific file.")
+@click.option(
+    "--file",
+    "identifier",
+    default=None,
+    help="A file's identifier, as status lists it, or the SHA-256 of its content "
+    "(with --id-key-id).",
+)
 @click.option(
     "--since",
     default=None,
@@ -981,8 +1068,14 @@ def _utc_today() -> date:
 )
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
+@_id_key_lookup_option
 def audit(
-    sha256_hash: str | None, since: str | None, until: str | None, table: str, region: str
+    identifier: str | None,
+    since: str | None,
+    until: str | None,
+    table: str,
+    region: str,
+    id_key_id: str | None,
 ) -> None:
     """Show the audit trail, oldest event first.
 
@@ -994,9 +1087,9 @@ def audit(
         window = _audit_window(since, until)
         store = StateStore(table_name=table, region=region)
 
-        if sha256_hash:
-            _validate_sha256(sha256_hash)
-            events = store.list_events_for_file(sha256_hash)
+        if identifier:
+            _validate_identifier(identifier)
+            events = _events_by_id(identifier, store, _optional_id_key(id_key_id, region))
             if window is not None:
                 first, last = (day.isoformat() for day in window)
                 events = [e for e in events if first <= str(e.get("date", "")) <= last]
@@ -1007,14 +1100,15 @@ def audit(
             sys.exit(1)
 
         if not events:
-            console.print("[yellow]No events found.[/yellow]")
+            hint = f" {_SHA256_LOOKUP_HINT}" if identifier and not id_key_id else ""
+            console.print(f"[yellow]No events found.{_display(hint)}[/yellow]")
             return
 
         t = Table(show_header=True, header_style="bold cyan")
         t.add_column("Timestamp")
         t.add_column("Operation")
         t.add_column("File")
-        t.add_column("SHA256 (16)")
+        t.add_column("ID (16)")
         t.add_column("Principal")
         t.add_column("Correlation ID (8)")
         for e in events:
@@ -1126,6 +1220,7 @@ _KMS_KEY_ARN_RE = re.compile(
     "VersionId is pinned, so decrypt needs no --latest.",
 )
 @click.option("--dry-run", is_flag=True, help="Parse and verify without writing to DynamoDB.")
+@_id_key_required_option
 @_audit_ttl_option
 def migrate(
     from_path: Path,
@@ -1135,20 +1230,23 @@ def migrate(
     ciphertext_root: Path | None,
     bucket: str | None,
     dry_run: bool,
+    id_key_id: str | None,
     audit_ttl_days: int,
 ) -> None:
     """Import the legacy shell workflow's metadata into DynamoDB.
 
     FROM_PATH is the file aws-encryption-cli wrote with --metadata-output
     (code/output.json): one JSON record per encrypted file, with absolute
-    paths. Each record becomes an ENCRYPTED record for its plaintext's
-    SHA-256, which is why the plaintext must still be in the plaintext root.
+    paths. Each record becomes an ENCRYPTED record named by the keyed
+    identifier of its plaintext (an HMAC of its SHA-256 under --id-key-id),
+    which is why the plaintext must still be in the plaintext root.
     It points at the object `aws s3 sync ../encrypted s3://$S3_BUCKET/encrypted`
     uploaded: encrypted/<path relative to the ciphertext root>. Paths outside
     the two roots, and symlinks inside them, are refused.
 
     Exits 1 if any record could not be migrated.
     """
+    id_key = _require_id_key(id_key_id, region)
     base = Path(os.path.abspath(from_path)).parent
     roots = _LegacyRoots(
         base=base,
@@ -1177,7 +1275,7 @@ def migrate(
                 )
                 skipped += 1
                 continue
-            record = _parse_output_json_entry(item, roots=roots)
+            record = _parse_output_json_entry(item, roots=roots, id_key=id_key)
             if record is None:  # a decrypt record, or anything else that is not an encryption
                 skipped += 1
                 continue
@@ -1311,17 +1409,21 @@ def _superseded_lines(
     return {lineno for lineno, output in outputs.items() if newest[output] != lineno}
 
 
-def _parse_output_json_entry(entry: dict[str, Any], *, roots: _LegacyRoots) -> FileRecord | None:
+def _parse_output_json_entry(
+    entry: dict[str, Any], *, roots: _LegacyRoots, id_key: IdKey
+) -> FileRecord | None:
     """Turn one aws-encryption-cli metadata record into a FileRecord.
 
     Returns None for records that are not encryptions. Everything is checked
     before the filesystem is touched: the header, then both paths lexically
     against their roots. Only then is the plaintext opened (no symlink on the
-    way, regular file only) and hashed.
+    way, regular file only) and hashed; ``id_key`` turns the hash into the
+    record's keyed identifier.
 
     Raises:
         MigrationError: The record cannot be migrated; the message says why.
         InvalidS3KeyError: The ciphertext path does not make a valid legacy key.
+        KMSError: KMS could not compute the identifier.
     """
     if entry.get("mode") != "encrypt":
         return None
@@ -1340,9 +1442,10 @@ def _parse_output_json_entry(entry: dict[str, Any], *, roots: _LegacyRoots) -> F
         size = os.fstat(fd).st_size
     finally:
         os.close(fd)
+    keyed = id_key.file_id(sha256_digest(sha256))
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     return FileRecord(
-        file_id=sha256,
+        file_id=keyed.file_id,
         file_name=plain_rel.as_posix(),
         current_state=ENCRYPTED,
         s3_key=s3_key,
@@ -1356,7 +1459,8 @@ def _parse_output_json_entry(entry: dict[str, Any], *, roots: _LegacyRoots) -> F
         encrypted_at=now,
         last_updated=now,
         s3_key_scheme=S3_KEY_LEGACY_SYNC,
-        id_scheme=ID_SCHEME_SHA256,
+        id_scheme=ID_SCHEME_HMAC_SHA256,
+        id_key_arn=keyed.key_arn,
     )
 
 
@@ -1505,7 +1609,10 @@ def rotate_key(
     """Re-encrypt all ENCRYPTED files under a new KMS key.
 
     Downloads each file, decrypts with the original key, re-encrypts with the new key,
-    uploads back to S3, and updates DynamoDB state.
+    uploads back to S3, and updates DynamoDB state. Each record keeps its
+    identifier and its identifier scheme: a keyed record is verified with the
+    key it names before it is re-encrypted; a legacy record (identified by
+    its SHA-256) stays legacy.
     """
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region, kms_key_id=new_key_id)
@@ -1585,6 +1692,7 @@ def _rotate_records(
     # Reuses the same context builder as encrypt so the two can never drift —
     # a divergent context here would make future decrypts fail verification.
     new_key_config = Config(key_id=new_key_id, bucket=bucket, region=region)
+    verifier = FileIdVerifier(region=region, allowed_account_ids=account_ids)
 
     rotated = errors = 0
     for record in track(records, description="Rotating keys..."):
@@ -1600,28 +1708,38 @@ def _rotate_records(
             )
             tmp_enc = scratch.file(prefix="envault_enc_", suffix=".encrypted")
 
-            _check_record(record)
+            _check_record(record, region=region, allowed_account_ids=account_ids)
             s3.download_file(
                 record.s3_key,
                 tmp_dl,
                 _s3_version_id(record, latest),
                 allow_latest=latest,
             )
-            decrypt_file(
+            selection = _Selection(record, expected_file_id=record.file_id)
+            decrypted = decrypt_file(
                 tmp_dl,
                 tmp_pt,
-                expected_sha256=record.file_id,
+                expected_sha256=selection.expected_sha256,
                 region=region,
                 allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
             )
             scratch.discard(tmp_dl)
+            # Before anything is re-encrypted under the record's identifier.
+            _verify_identity(selection, decrypted.sha256_hash, verifier)
 
+            # The record keeps its identifier and scheme; the context names it
+            # the way that scheme always has.
             new_ctx = new_key_config.build_encryption_context(
                 record.file_id, record.file_name, legacy=record.id_scheme == ID_SCHEME_SHA256
             )
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
             scratch.discard(tmp_pt)
+            if new_result.sha256_hash != decrypted.sha256_hash:
+                raise EnvaultError(
+                    f"The temporary plaintext of {record.file_name!r} changed between decryption "
+                    "and re-encryption; not rotating it."
+                )
 
             # The new ciphertext gets a key of its own; the object the record
             # pinned so far is left exactly as it is (and stays readable with
@@ -1654,7 +1772,7 @@ def _rotate_records(
                     "object is an orphan: the record still points to the old, intact one, "
                     "and the orphan can be deleted.",
                     extra={
-                        "sha256": record.file_id,
+                        "file_id": record.file_id,
                         "s3_key": new_s3_key,
                         "s3_version_id": new_version_id,
                         "old_s3_key": old_s3_key,
@@ -1796,6 +1914,7 @@ class _BufferSink:
     is_flag=True,
     help="Allow download when a record has no S3 VersionId (migrated files).",
 )
+@_id_key_lookup_option
 @_audit_ttl_option
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
 def exec_(
@@ -1807,6 +1926,7 @@ def exec_(
     allowed_account_ids: str,
     clean_env: bool,
     latest: bool,
+    id_key_id: str | None,
     audit_ttl_days: int,
     command: tuple[str, ...],
 ) -> None:
@@ -1819,6 +1939,9 @@ def exec_(
     envault's options go before COMMAND. Everything from COMMAND on is passed
     to it unchanged, including options such as ``--region`` or ``-f``, so the
     ``--`` separator is optional.
+
+    IDENTIFIER is what decrypt takes: a file's identifier, the SHA-256 of its
+    content (with ENVAULT_ID_KEY_ID set), or its stored name.
 
     ``--secret`` places the plaintext in the child's environment. ``--file``
     writes it to an anonymous file descriptor and puts a readable path in $VAR,
@@ -1849,6 +1972,8 @@ def exec_(
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
+    id_key = _optional_id_key(id_key_id, region)
+    verifier = FileIdVerifier(region=region, allowed_account_ids=account_ids)
 
     env_pairs = [_parse_secret_spec(spec, "--secret") for spec in env_specs]
     file_pairs = [_parse_secret_spec(spec, "--file") for spec in file_specs]
@@ -1872,22 +1997,24 @@ def exec_(
     checking: tuple[str, _Selection] | None = None
     try:
         for identifier, var in env_pairs:
-            selection = _resolve_identifier(identifier, store, newest_only=True)
+            selection = _resolve_identifier(identifier, store, newest_only=True, id_key=id_key)
             checking = (var, selection)
             sink = _BufferSink()
             sinks.append(sink)
-            _stream_secret(selection, sink, s3, region, account_ids, allow_latest=latest)
+            _stream_secret(selection, sink, s3, region, account_ids, verifier, allow_latest=latest)
             child_env[var] = _decode_secret(sink.buf, identifier)
             accessed.append(selection.record)
 
         for identifier, var in file_pairs:
-            selection = _resolve_identifier(identifier, store, newest_only=True)
+            selection = _resolve_identifier(identifier, store, newest_only=True, id_key=id_key)
             checking = (var, selection)
             cred = CredentialFd(var)
             creds.append(cred)
             with cred.writer() as out:
-                _stream_secret(selection, out, s3, region, account_ids, allow_latest=latest)
-            # Sealed only after the checksum and encryption context verified.
+                _stream_secret(
+                    selection, out, s3, region, account_ids, verifier, allow_latest=latest
+                )
+            # Sealed only after the checksum, identifier and encryption context verified.
             cred.seal()
             child_env[var] = cred.child_path
             accessed.append(selection.record)
@@ -1922,7 +2049,7 @@ def exec_(
         # was decrypted (M6).
         which = (
             f"the secret for {_display(checking[0])} is not the file its record identifies "
-            f"({_id_prefix(checking[1].expected_sha256)}...)"
+            f"({_id_prefix(checking[1].expected_file_id)}...)"
             if checking
             else "a secret is not the file its record identifies"
         )
@@ -1986,18 +2113,23 @@ def _stream_secret(
     s3: S3Store,
     region: str,
     account_ids: list[str],
+    verifier: FileIdVerifier,
     *,
     allow_latest: bool = False,
 ) -> None:
-    """Fetch a record's ciphertext and decrypt it into ``out``, verifying first."""
+    """Fetch a record's ciphertext and decrypt it into ``out``, verifying first.
+
+    ``out`` holds unverified plaintext until this returns: the caller seals,
+    decodes or hands it over only then.
+    """
     record = selection.record
-    _check_record(record)
+    _check_record(record, region=region, allowed_account_ids=account_ids)
     ciphertext = s3.download_to_memory(
         record.s3_key,
         _s3_version_id(record, allow_latest),
         allow_latest=allow_latest,
     )
-    decrypt_to_stream(
+    result = decrypt_to_stream(
         ciphertext,
         out,
         expected_sha256=selection.expected_sha256,
@@ -2005,6 +2137,7 @@ def _stream_secret(
         region=region,
         allowed_account_ids=account_ids,
     )
+    _verify_identity(selection, result.sha256_hash, verifier)
 
 
 def _decode_secret(buf: bytearray, identifier: str) -> str:
@@ -2136,31 +2269,31 @@ def _validate_date(value: str) -> str:
 # File identifiers
 #
 # Everything the CLI does with a file identifier is in this section:
-# recognising one on the command line, resolving IDENTIFIER (an identifier or
-# a stored name) to a record, checking a record against the identifier it was
-# looked up by and against its S3 key, and the short form shown to operators.
-# Today the identifier is the SHA-256 of the plaintext; another scheme changes
-# these helpers, not the commands.
+# recognising one on the command line, resolving IDENTIFIER (an identifier, the
+# SHA-256 of a file's content, or a stored name) to a record, checking a record
+# against the identifier it was looked up by, against its S3 key and its
+# identifier key, verifying decrypted plaintext against a keyed identifier, and
+# the short form shown to operators. The schemes themselves (keyed
+# hmac-sha256-v1 for new records, the raw SHA-256 for legacy ones) live in
+# envault.fileid.
 # ---------------------------------------------------------------------------
 
+#: Appended where a raw SHA-256 could have been meant but no ID key is configured.
+_SHA256_LOOKUP_HINT = (
+    "If it is the SHA-256 of a file's content, set ENVAULT_ID_KEY_ID (or pass --id-key-id) "
+    "to look the file up by it."
+)
 
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
-
-def _validate_sha256(value: str) -> str:
-    """Validate a SHA256 hash string. Exit with error if invalid."""
-    if not _is_sha256(value):
+def _validate_identifier(value: str) -> str:
+    """Validate a file identifier (or SHA-256) given as an option. Exit with error if invalid."""
+    if not is_file_id(value):
         console.print(
-            f"[red]Invalid SHA256 hash: {_display(repr(value))}. "
-            "Expected 64 lowercase hexadecimal characters.[/red]"
+            f"[red]Invalid identifier: {_display(repr(value))}. Expected a file identifier or "
+            "a SHA-256: 64 lowercase hexadecimal characters.[/red]"
         )
         sys.exit(1)
     return value
-
-
-def _is_sha256(value: str) -> bool:
-    """Return True if value looks like a full 64-char hex SHA256 hash."""
-    return bool(_SHA256_RE.fullmatch(value))
 
 
 def _id_prefix(identifier: object) -> str:
@@ -2177,29 +2310,41 @@ def _fallback_output_name(record: FileRecord) -> str:
     return f"decrypted_{record.file_id[:16]}"
 
 
-def _check_record(record: FileRecord) -> None:
-    """Refuse a row whose identifier or S3 key is not well formed.
+def _check_record(record: FileRecord, *, region: str, allowed_account_ids: Sequence[str]) -> None:
+    """Refuse a row whose identifier, identifier key or S3 key is not acceptable.
 
     Rows come from DynamoDB, which any principal with write access can edit. The
-    identifier ends up in the expected checksum and in file names, and the key
-    decides which object is fetched.
+    identifier ends up in the expected checksum and in file names, the
+    identifier key is what KMS verifies a keyed identifier with, and the S3 key
+    decides which object is fetched. Runs before any KMS call for the record.
 
     Raises:
-        _IdentifierError: The identifier is not 64 lowercase hex characters.
+        _IdentifierError: The identifier is not 64 lowercase hex characters, or
+            its scheme is unknown.
+        UntrustedIdKeyError: A keyed record's ``id_key_arn`` is not a KMS key
+            ARN in the region's partition and a trusted account.
         InvalidS3KeyError: The key is not valid for the record's key scheme: this
             identifier's content-addressed path, or (migrated records) a key in
             the legacy-sync layout.
     """
-    if not _is_sha256(record.file_id):
+    if not is_file_id(record.file_id):
         raise _IdentifierError(
             f"The record for {record.file_name!r} has a malformed identifier; refusing to use it."
         )
+    if record.id_scheme not in ID_SCHEMES:
+        raise _IdentifierError(
+            f"The record for {record.file_name!r} uses identifier scheme {record.id_scheme!r}, "
+            "which this version of envault does not know; refusing to use it."
+        )
+    if record.id_scheme == ID_SCHEME_HMAC_SHA256:
+        # The same trust anchor as discovery decryption, before KMS is asked anything.
+        check_id_key_arn(record.id_key_arn, region=region, allowed_account_ids=allowed_account_ids)
     if record.s3_key_scheme == S3_KEY_CONTENT_ADDRESSED:
         assert_s3_key_matches_hash(record.s3_key, record.file_id, message_id=record.message_id)
     elif record.s3_key_scheme == S3_KEY_LEGACY_SYNC:
         # Migrated records point where the legacy `aws s3 sync` put the object;
-        # the key carries no identifier, so the plaintext checksum and the
-        # encryption context are what bind the object to the record.
+        # the key carries no identifier, so the plaintext's identifier check and
+        # the encryption context are what bind the object to the record.
         assert_legacy_s3_key(record.s3_key)
     else:
         raise InvalidS3KeyError(
@@ -2225,10 +2370,59 @@ class _IdentifierError(EnvaultError):
 
 @dataclass(frozen=True)
 class _Selection:
-    """The record IDENTIFIER resolved to, and the identifier its plaintext must have."""
+    """The record IDENTIFIER resolved to, and what its plaintext must turn out to be."""
 
     record: FileRecord
-    expected_sha256: str
+    #: The identifier the plaintext must have under the record's scheme: the
+    #: one the operator typed (or the keyed identifier of the SHA-256 they
+    #: typed), or for a name lookup the record's own.
+    expected_file_id: str
+    #: A SHA-256 the operator typed and that was looked up through the ID
+    #: key: the plaintext must also hash to it.
+    typed_sha256: str | None = None
+
+    @property
+    def expected_sha256(self) -> str | None:
+        """What the plaintext's SHA-256 must equal (checked by the crypto layer), if anything.
+
+        For a legacy record the identifier is that SHA-256. For a keyed one it
+        is only known when the operator typed it; the keyed identifier itself
+        is checked afterwards by :func:`_verify_identity`.
+        """
+        if self.record.id_scheme == ID_SCHEME_SHA256:
+            return self.expected_file_id
+        return self.typed_sha256
+
+
+def _verify_identity(
+    selection: _Selection, plaintext_sha256: str, verifier: FileIdVerifier
+) -> None:
+    """Refuse decrypted plaintext that is not the file a keyed record identifies.
+
+    Runs after decryption into a staging file, a buffer or an unsealed memfd,
+    and before anything is published, sealed, handed to a command or
+    re-encrypted. For a keyed record KMS VerifyMac checks the expected
+    identifier against the plaintext's SHA-256 digest under the record's
+    identifier key (already found trustworthy by :func:`_check_record`). A
+    legacy record's identifier is the SHA-256 itself, which the crypto layer
+    compared with :attr:`_Selection.expected_sha256` while decrypting.
+
+    Raises:
+        FileIdMismatchError: The plaintext is not that file (an integrity failure).
+        UntrustedIdKeyError: The record's identifier key is not trusted.
+        KMSError: KMS could not answer (availability or permission).
+    """
+    record = selection.record
+    if record.id_scheme == ID_SCHEME_SHA256:
+        return
+    if record.id_scheme != ID_SCHEME_HMAC_SHA256:  # _check_record refuses these first
+        raise _IdentifierError(
+            f"The record for {record.file_name!r} uses unknown identifier scheme "
+            f"{record.id_scheme!r}; refusing to deliver it."
+        )
+    verifier.verify(
+        selection.expected_file_id, sha256_digest(plaintext_sha256), key_arn=record.id_key_arn
+    )
 
 
 def _resolve_identifier(
@@ -2237,13 +2431,15 @@ def _resolve_identifier(
     *,
     version: int | None = None,
     newest_only: bool = False,
+    id_key: IdKey | None = None,
 ) -> _Selection:
-    """Resolve IDENTIFIER (an identifier or a stored file name) to one record.
+    """Resolve IDENTIFIER (an identifier, a SHA-256 or a stored file name) to one record.
 
-    An identifier must find a row that says it is about that identifier, and
-    the plaintext is then checked against the identifier the operator typed,
-    never against what the row claims. Name lookups have no such anchor: they
-    trust every principal that can write to the table.
+    64 hex characters are looked up as described in :func:`_record_by_id`: the
+    row found must say it is about that identifier, and the plaintext is
+    checked against what the operator typed, never against what the row
+    claims. Name lookups have no such anchor: they trust every principal that
+    can write to the table.
 
     A name is matched exactly against stored names first. Only when nothing is
     stored under exactly that name, and the name has no directory part, do
@@ -2258,18 +2454,10 @@ def _resolve_identifier(
     Raises:
         _IdentifierError: Nothing matches, the match is ambiguous, or the row
             stored under an identifier describes another file.
+        KMSError: The ID key could not map a SHA-256 to an identifier.
     """
-    if _is_sha256(identifier):
-        record = store.get_current_state(identifier)
-        if record is None:
-            raise _IdentifierError(f"No record found for hash {identifier[:16]}...")
-        if record.file_id != identifier:
-            raise _IdentifierError(
-                f"The record stored under {identifier[:16]}... describes a different file "
-                f"({str(record.file_id)[:16]}...). Refusing to use it: the state table "
-                "may have been tampered with."
-            )
-        return _Selection(record, expected_sha256=identifier)
+    if is_file_id(identifier):
+        return _record_by_id(identifier, store, id_key)
 
     candidates = _records_named(identifier, store)
     if not candidates:
@@ -2303,7 +2491,64 @@ def _resolve_identifier(
             f"[dim]{len(versions)} versions found. Using {label} "
             f"({_display(selected.encrypted_at)}).{hint}[/dim]"
         )
-    return _Selection(selected, expected_sha256=selected.file_id)
+    return _Selection(selected, expected_file_id=selected.file_id)
+
+
+def _record_by_id(identifier: str, store: StateStore, id_key: IdKey | None) -> _Selection:
+    """The record for 64 hex characters: a file's identifier, or the SHA-256 of its content.
+
+    First the value is looked up as stored: a keyed identifier, or the SHA-256
+    that identifies a legacy record. Otherwise, if an ID key is configured,
+    it is taken as the SHA-256 of a file's content: KMS maps it to the keyed
+    identifier (GenerateMac) and that is looked up; the plaintext must then
+    hash to the SHA-256 typed, as well as verify against the identifier. Either
+    way the row must say it is about the identifier it is stored under (M5).
+
+    A value that is neither cannot be told apart from a SHA-256 nobody stored,
+    so the first lookup may send a typed SHA-256 to DynamoDB as a key.
+
+    Raises:
+        _IdentifierError: No record, or a row that contradicts its key.
+        KMSError: The ID key could not map the SHA-256.
+    """
+    record = store.get_current_state(identifier)
+    if record is not None:
+        _require_row_describes(record, identifier)
+        return _Selection(record, expected_file_id=identifier)
+    if id_key is None:
+        raise _IdentifierError(f"No record found for {identifier[:16]}... {_SHA256_LOOKUP_HINT}")
+    keyed = id_key.file_id(sha256_digest(identifier))
+    record = store.get_current_state(keyed.file_id)
+    if record is None:
+        raise _IdentifierError(
+            f"No record found for {identifier[:16]}..., neither as a file identifier nor as "
+            "the SHA-256 of a file's content."
+        )
+    _require_row_describes(record, keyed.file_id)
+    if record.id_scheme != ID_SCHEME_HMAC_SHA256 or record.id_key_arn != keyed.key_arn:
+        raise _IdentifierError(
+            f"The record stored under {keyed.file_id[:16]}... does not name the configured "
+            "identifier key. Refusing to use it: the state table may have been tampered with."
+        )
+    return _Selection(record, expected_file_id=keyed.file_id, typed_sha256=identifier)
+
+
+def _require_row_describes(record: FileRecord, stored_under: str) -> None:
+    """The row found under an identifier must be about that identifier (M5, either scheme)."""
+    if record.file_id != stored_under:
+        raise _IdentifierError(
+            f"The record stored under {stored_under[:16]}... describes a different file "
+            f"({str(record.file_id)[:16]}...). Refusing to use it: the state table "
+            "may have been tampered with."
+        )
+
+
+def _events_by_id(identifier: str, store: StateStore, id_key: IdKey | None) -> list[dict[str, Any]]:
+    """Audit events for 64 hex characters, read as :func:`_record_by_id` reads them."""
+    events = store.list_events_for_file(identifier)
+    if events or id_key is None:
+        return events
+    return store.list_events_for_file(id_key.file_id(sha256_digest(identifier)).file_id)
 
 
 def _records_named(name: str, store: StateStore) -> list[FileRecord]:

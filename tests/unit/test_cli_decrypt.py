@@ -24,7 +24,7 @@ from envault.cli import main
 from envault.exceptions import DecryptionError
 from envault.state import ENCRYPTED, StateStore
 
-from ._id_key import id_key_env
+from ._id_key import file_id_of, id_key_env
 
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
@@ -120,8 +120,10 @@ def test_decrypt_command_end_to_end_real_crypto(
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     sha = hashlib.sha256(SECRET).hexdigest()
+    file_id = file_id_of(SECRET)  # the record's (keyed) identifier
 
     by_name = _run(env, "decrypt", "s.txt", "-o", str(out_dir))
+    # The SHA-256 of the content still works, through the ID key.
     by_hash = _run(env, "decrypt", sha, "-o", str(tmp_path / "by-hash.txt"))
 
     assert by_name.exit_code == 0, by_name.output
@@ -133,11 +135,11 @@ def test_decrypt_command_end_to_end_real_crypto(
     assert sorted(p.name for p in out_dir.iterdir()) == ["s.txt"]  # no staging copy
     assert list(private_tempdir.iterdir()) == []  # no downloaded ciphertext
     store = StateStore(table_name=TABLE, region=REGION)
-    events = [e for e in store.list_events_for_file(sha) if e["operation"] == "DECRYPT"]
+    events = [e for e in store.list_events_for_file(file_id) if e["operation"] == "DECRYPT"]
     assert len(events) == 2
     # Reading does not consume: the record still says ENCRYPTED.
     [record] = store.list_by_state(ENCRYPTED)
-    assert record.file_id == sha
+    assert record.file_id == file_id
 
 
 def test_publish_interrupted_between_link_and_unlink_keeps_output(

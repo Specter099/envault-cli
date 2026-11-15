@@ -52,7 +52,7 @@ from envault.state import (
     StateStore,
 )
 
-from ._id_key import id_key_env
+from ._id_key import file_id_of, id_key_env
 
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
@@ -296,9 +296,28 @@ def test_migrate_imports_real_aws_encryption_cli_output(legacy: Legacy) -> None:
     assert "errors 0" in result.output
     records = legacy.records()
     assert set(records) == {"alpha.txt", "sub/beta.txt"}
-    assert records["alpha.txt"].file_id == hashlib.sha256(ALPHA).hexdigest()
+    assert records["alpha.txt"].file_id == file_id_of(ALPHA)
     assert records["sub/beta.txt"].file_size_bytes == len(BETA)
     assert records["alpha.txt"].tags == {"source": "migrated"}
+
+
+def test_migrate_creates_keyed_records(legacy: Legacy) -> None:
+    """M6: migrated records are named by the keyed identifier, never by the SHA-256."""
+    result = _migrate(legacy)
+
+    assert result.exit_code == 0, result.output
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    for content in (ALPHA, BETA):
+        sha = hashlib.sha256(content).hexdigest()
+        file_id = file_id_of(content)
+        row = table.get_item(Key={"PK": f"FILE#{file_id}", "SK": "CURRENT"})["Item"]
+        assert row["file_id"] == file_id
+        assert row["id_scheme"] == "hmac-sha256-v1"
+        assert row["id_key_arn"].startswith(f"arn:aws:kms:{REGION}:")
+        assert "sha256_hash" not in row
+        assert sha[:16] not in str(row)
+        assert "Item" not in table.get_item(Key={"PK": f"FILE#{sha}", "SK": "CURRENT"})
+        assert sha[:16] not in result.output
 
 
 def test_migrate_records_legacy_sync_s3_key(legacy: Legacy) -> None:

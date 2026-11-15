@@ -28,7 +28,7 @@ from envault.exceptions import ChecksumMismatchError, EnvaultError
 from envault.fileid import ID_SCHEME_SHA256
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
-from ._id_key import ID_KEY_ALIAS, create_id_key
+from ._id_key import ID_KEY_ALIAS, create_id_key, file_id_of
 
 TABLE_NAME = "envault-test-state"
 BUCKET_NAME = "envault-test-bucket"
@@ -357,7 +357,6 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
 
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"sensitive data")
-    sha = hashlib.sha256(b"sensitive data").hexdigest()
 
     runner = CliRunner()
     with patch("envault.cli.encrypt_fd", side_effect=_mock_encrypt_fd):
@@ -380,7 +379,7 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     store = StateStore(table_name=TABLE_NAME, region=REGION)
-    record = store.get_current_state(sha)
+    record = store.get_current_state(file_id_of(b"sensitive data"))
     assert record is not None
     assert record.current_state == ENCRYPTED
 
@@ -415,7 +414,8 @@ def _make_mock_decrypt(header_context: dict[str, str], content: bytes = b"decryp
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(content)
         return DecryptResult(
-            sha256_hash=FAKE_SHA,
+            # What the real function reports: the digest of the bytes it wrote.
+            sha256_hash=hashlib.sha256(content).hexdigest(),
             file_size_bytes=len(content),
             output_path=output_path,
             encryption_context=header_context,

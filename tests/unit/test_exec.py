@@ -295,7 +295,7 @@ def test_exec_refuses_on_checksum_mismatch() -> None:
         table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
         table.update_item(
             Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
-            UpdateExpression="SET sha256_hash = :h, s3_key = :k, s3_version_id = :v",
+            UpdateExpression="SET file_id = :h, s3_key = :k, s3_version_id = :v",
             ExpressionAttributeValues={
                 ":h": new_hash,
                 ":k": new_key,

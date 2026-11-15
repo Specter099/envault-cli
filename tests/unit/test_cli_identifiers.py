@@ -1,8 +1,11 @@
 """How decrypt and exec turn IDENTIFIER into a record (M5, M8).
 
-Hash identifiers: the row stored under a hash must describe that hash, and the
-plaintext must hash to what the operator typed (M5). A table writer can copy
-another file's attributes under any key; that must not deliver the other file.
+Identifiers: the row stored under an identifier must describe that identifier,
+and the plaintext must have the identifier the operator typed (M5). A table
+writer can copy another file's attributes under any key; that must not deliver
+the other file. Files encrypted here get keyed identifiers (M6), checked with
+KMS VerifyMac; tests/unit/test_cli_file_ids.py covers the same checks for
+records identified by the raw SHA-256 (legacy).
 
 Names: encrypt stores each file's path relative to the encrypted directory, so
 two files with the same basename stay distinguishable. A name that matches more
@@ -15,7 +18,6 @@ live in the interaction with the Encryption SDK.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import pathlib
 from collections.abc import Iterator
@@ -30,7 +32,7 @@ from envault import identity
 from envault.cli import main
 from envault.state import ENCRYPTED, StateStore
 
-from ._id_key import id_key_env
+from ._id_key import file_id_of, id_key_env
 
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
@@ -39,8 +41,6 @@ REGION = "us-east-1"
 
 A = b"DATABASE_URL=postgres://prod-db.internal/app\n"
 B = b"DATABASE_URL=postgres://attacker.example/app\n"
-HA = hashlib.sha256(A).hexdigest()
-HB = hashlib.sha256(B).hexdigest()
 PROD = b"postgres://PROD\n"
 STAGING = b"postgres://STAGING\n"
 
@@ -149,7 +149,7 @@ def _encrypt_pair(env: dict[str, str], tmp_path: pathlib.Path) -> None:
 
 def _copy_row_b_onto_a() -> None:
     """r03: a plain PutItem copying row B's attributes under row A's key."""
-    _table().put_item(Item={**_current(HB), "PK": f"FILE#{HA}"})  # type: ignore[attr-defined]
+    _table().put_item(Item={**_current(file_id_of(B)), "PK": f"FILE#{file_id_of(A)}"})  # type: ignore[attr-defined]
 
 
 def test_decrypt_by_hash_rejects_row_with_different_sha256(
@@ -159,7 +159,7 @@ def test_decrypt_by_hash_rejects_row_with_different_sha256(
     _copy_row_b_onto_a()
     out = tmp_path / "out.env"
 
-    result = _run(env, "decrypt", HA, "-o", str(out))
+    result = _run(env, "decrypt", file_id_of(A), "-o", str(out))
 
     assert result.exit_code == 1, result.output
     assert not out.exists()
@@ -173,7 +173,7 @@ def test_exec_by_hash_rejects_row_with_different_sha256(
     _encrypt_pair(env, tmp_path)
     _copy_row_b_onto_a()
 
-    result, rec = _exec(env, HA)
+    result, rec = _exec(env, file_id_of(A))
 
     assert result.exit_code == 1, result.output
     assert rec.env is None, "the command must not run"
@@ -183,17 +183,19 @@ def test_exec_by_hash_rejects_row_with_different_sha256(
 def test_decrypt_by_hash_checks_plaintext_against_the_typed_hash(
     env: dict[str, str], tmp_path: pathlib.Path
 ) -> None:
-    """Row A, with its own hash kept, pointed at B's ciphertext copied to an A-shaped key.
+    """Row A, with its own identifier kept, pointed at B's ciphertext copied to an A-shaped key.
 
-    Every attribute check passes (the key embeds A's hash, the context is B's
-    real context), so only hashing the plaintext against what the operator
-    typed stops B being delivered as A.
+    Every attribute check passes (the key embeds A's identifier, the context is
+    B's real context), so only checking the plaintext against the identifier
+    the operator typed (KMS VerifyMac for a keyed identifier) stops B being
+    delivered as A.
     """
     _encrypt_pair(env, tmp_path)
-    row_a, row_b = _current(HA), _current(HB)
+    ha, hb = file_id_of(A), file_id_of(B)
+    row_a, row_b = _current(ha), _current(hb)
     s3 = boto3.client("s3", region_name=REGION)
     body = s3.get_object(Bucket=BUCKET, Key=row_b["s3_key"], VersionId=row_b["s3_version_id"])
-    forged_key = str(row_b["s3_key"]).replace(HB[:2] + "/" + HB, HA[:2] + "/" + HA)
+    forged_key = str(row_b["s3_key"]).replace(hb[:2] + "/" + hb, ha[:2] + "/" + ha)
     put = s3.put_object(Bucket=BUCKET, Key=forged_key, Body=body["Body"].read())
     _table().put_item(  # type: ignore[attr-defined]
         Item={
@@ -206,8 +208,8 @@ def test_decrypt_by_hash_checks_plaintext_against_the_typed_hash(
     )
     out = tmp_path / "out.env"
 
-    result = _run(env, "decrypt", HA, "-o", str(out))
-    exec_result, rec = _exec(env, HA)
+    result = _run(env, "decrypt", ha, "-o", str(out))
+    exec_result, rec = _exec(env, ha)
 
     assert result.exit_code == 1, result.output
     assert "checksum mismatch" in result.output.lower()
@@ -219,11 +221,11 @@ def test_decrypt_by_hash_checks_plaintext_against_the_typed_hash(
 def test_decrypt_refuses_record_whose_identifier_is_malformed(
     env: dict[str, str], tmp_path: pathlib.Path
 ) -> None:
-    """A name lookup returns whatever the row says its hash is; it must be a hash."""
+    """A name lookup returns whatever the row says its identifier is; it must be one."""
     _encrypt_pair(env, tmp_path)
     _table().update_item(  # type: ignore[attr-defined]
-        Key={"PK": f"FILE#{HA}", "SK": "CURRENT"},
-        UpdateExpression="SET sha256_hash = :h",
+        Key={"PK": f"FILE#{file_id_of(A)}", "SK": "CURRENT"},
+        UpdateExpression="SET file_id = :h",
         ExpressionAttributeValues={":h": "../../../tmp/evil"},
     )
     out_dir = tmp_path / "out"
@@ -304,7 +306,7 @@ def test_decrypt_ambiguous_basename_lists_candidates(
     assert "ambiguous" in result.output.lower()
     for name, content in (("prod/db.env", PROD), ("staging/db.env", STAGING)):
         line = next(line for line in result.output.splitlines() if name in line)
-        assert hashlib.sha256(content).hexdigest()[:16] in line
+        assert file_id_of(content)[:16] in line
     assert list(out_dir.iterdir()) == []
 
 
@@ -399,12 +401,12 @@ def test_versions_are_ordered_by_time_not_by_string(
 ) -> None:
     """12:00+02:00 is 10:00 UTC: earlier than 11:00 UTC although it sorts later as text."""
     _table().update_item(  # type: ignore[attr-defined]
-        Key={"PK": f"FILE#{HA}", "SK": "CURRENT"},
+        Key={"PK": f"FILE#{file_id_of(A)}", "SK": "CURRENT"},
         UpdateExpression="SET encrypted_at = :t",
         ExpressionAttributeValues={":t": "2026-11-15T11:00:00+00:00"},
     )
     _table().update_item(  # type: ignore[attr-defined]
-        Key={"PK": f"FILE#{HB}", "SK": "CURRENT"},
+        Key={"PK": f"FILE#{file_id_of(B)}", "SK": "CURRENT"},
         UpdateExpression="SET encrypted_at = :t",
         ExpressionAttributeValues={":t": "2026-11-15T12:00:00+02:00"},
     )
@@ -416,9 +418,9 @@ def test_versions_are_ordered_by_time_not_by_string(
 
 
 def _tie(seconds: str = "2026-11-01T09:00:00+00:00") -> None:
-    for sha in (HA, HB):
+    for content in (A, B):
         _table().update_item(  # type: ignore[attr-defined]
-            Key={"PK": f"FILE#{sha}", "SK": "CURRENT"},
+            Key={"PK": f"FILE#{file_id_of(content)}", "SK": "CURRENT"},
             UpdateExpression="SET encrypted_at = :t",
             ExpressionAttributeValues={":t": seconds},
         )

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import pathlib
 import tempfile
@@ -19,7 +18,7 @@ from envault import identity
 from envault.cli import main
 from envault.state import ENCRYPTED, StateStore
 
-from ._id_key import id_key_env
+from ._id_key import file_id_of, id_key_env
 
 TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
@@ -190,7 +189,7 @@ def test_encrypt_hashes_and_encrypts_one_open_file(env: dict[str, str], tree: pa
 
     assert result.exit_code == 0, result.output
     [record] = _records()
-    assert record.file_id == hashlib.sha256(HARMLESS).hexdigest()  # type: ignore[attr-defined]
+    assert record.file_id == file_id_of(HARMLESS)  # type: ignore[attr-defined]
     out = tree.parent / "out.txt"
     decrypted = _run(env, "decrypt", "notes.txt", "-o", str(out))
     assert decrypted.exit_code == 0, decrypted.output
