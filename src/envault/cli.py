@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -41,8 +42,61 @@ from envault.isolation import CredentialFd, harden_process, wipe
 from envault.s3 import S3Store, assert_s3_key_matches_hash
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
-console = Console()
+# emoji=False: a stored name like ":skull:" must print as typed.
+console = Console(emoji=False)
 logger = logging.getLogger(__name__)
+
+
+# Characters a terminal acts on or renders invisibly: C0/C1 controls and DEL
+# (Cc), format characters such as bidi overrides and zero-width spaces (Cf),
+# lone surrogates from undecodable file names (Cs), line/paragraph separators.
+_UNSAFE_DISPLAY_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _visible_escape(ch: str) -> str:
+    named = _NAMED_ESCAPES.get(ch)
+    if named:
+        return named
+    code = ord(ch)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
+
+
+def _has_unsafe_characters(text: str) -> bool:
+    return any(unicodedata.category(ch) in _UNSAFE_DISPLAY_CATEGORIES for ch in text)
+
+
+def _display(value: object) -> str:
+    """Render an untrusted value for console markup: visible escapes, no markup.
+
+    File names, tags, timestamps, principals and S3 keys come from DynamoDB
+    (anyone with table write access can edit them), from the filesystem, or from
+    error messages that embed those. Printed raw, an ESC sequence among them can
+    retitle the terminal, clear it or forge output, and a bidi override can make
+    one name read as another. Such characters are shown as Python-style escapes
+    (``\\x1b``, ``\\u202e``), then Rich markup is escaped. Use this for every
+    value envault did not write itself.
+    """
+    text = str(value)
+    if _has_unsafe_characters(text):
+        text = "".join(
+            _visible_escape(ch) if unicodedata.category(ch) in _UNSAFE_DISPLAY_CATEGORIES else ch
+            for ch in text
+        )
+    return escape(text)
+
+
+def _id_prefix(identifier: object) -> str:
+    """Short form of a file identifier for messages and tables (first 16 characters).
+
+    The one place that decides how identifiers are shown to the operator.
+    Identifiers read from DynamoDB are untrusted, so the prefix is escaped.
+    """
+    return _display(str(identifier)[:16])
 
 
 def _is_logger(name: str, family: str) -> bool:
@@ -158,8 +212,8 @@ def cli() -> None:
     except click.UsageError as e:
         hint = ""
         if e.ctx:
-            hint = f"\n  Run '{e.ctx.command_path} --help' for usage info."
-        console.print(f"{escape(_friendly_message(e))}{escape(hint)}")
+            hint = f"\n  Run '{_display(e.ctx.command_path)} --help' for usage info."
+        console.print(f"{_display(_friendly_message(e))}{hint}")
         sys.exit(2)
     except click.Abort:
         console.print("[yellow]Aborted.[/yellow]")
@@ -185,10 +239,10 @@ def _exit_on_error() -> Iterator[None]:
         yield
     except (ClientError, BotoCoreError) as exc:
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {escape(str(msg))}")
+        console.print(f"[bold red]AWS error:[/bold red] {_display(msg)}")
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+        console.print(f"[bold red]Error:[/bold red] {_display(exc)}")
         sys.exit(1)
 
 
@@ -228,7 +282,7 @@ def encrypt(
 
     files = _collect_files(input_path)
     if not files:
-        console.print(f"[yellow]No files found in {escape(str(input_path))}[/yellow]")
+        console.print(f"[yellow]No files found in {_display(str(input_path))}[/yellow]")
         return
 
     errors = 0
@@ -238,11 +292,11 @@ def encrypt(
             _encrypt_one(file_path, config, tags, store, s3, file_correlation_id, force)
         except AlreadyEncryptedError:
             console.print(
-                f"[yellow]⏭[/yellow] {escape(file_path.name)} already ENCRYPTED "
+                f"[yellow]⏭[/yellow] {_display(file_path.name)} already ENCRYPTED "
                 "(use --force to re-encrypt)"
             )
         except (EnvaultError, ClientError, BotoCoreError) as exc:
-            console.print(f"[red]✗[/red] {escape(file_path.name)}: {escape(str(exc))}")
+            console.print(f"[red]✗[/red] {_display(file_path.name)}: {_display(exc)}")
             # The ✗ line is the report; the traceback is for -v only.
             logger.debug("Failed to encrypt %s", file_path, exc_info=True)
             errors += 1
@@ -286,7 +340,8 @@ def _encrypt_one(
         if sha256 != result.sha256_hash:
             raise EnvaultError(
                 f"File {file_path.name!r} was modified during encryption "
-                f"(pre-read hash {sha256[:16]}… != encrypted hash {result.sha256_hash[:16]}…). "
+                f"(pre-read hash {_id_prefix(sha256)}… != encrypted hash "
+                f"{_id_prefix(result.sha256_hash)}…). "
                 "Aborting to avoid storing mismatched metadata."
             )
 
@@ -335,7 +390,7 @@ def _encrypt_one(
         )
         raise
     console.print(
-        f"[green]✓[/green] {escape(file_path.name)} → s3://{escape(config.bucket)}/{escape(s3_key)}"
+        f"[green]✓[/green] {_display(file_path.name)} → s3://{_display(config.bucket)}/{_display(s3_key)}"
     )
 
 
@@ -405,12 +460,14 @@ def decrypt(
     try:
         assert_s3_key_matches_hash(record.s3_key, sha256_hash)
     except EnvaultError as exc:
-        console.print(f"[bold red]Decryption error:[/bold red] {escape(str(exc))}")
+        console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
         sys.exit(1)
 
     if output.is_dir():
         safe_name = Path(record.file_name).name
-        if not safe_name or safe_name.startswith("."):
+        # The name comes from DynamoDB: no hidden files, no control or
+        # invisible characters in a name the operator's tools will print.
+        if not safe_name or safe_name.startswith(".") or _has_unsafe_characters(safe_name):
             safe_name = f"decrypted_{sha256_hash[:16]}"
         output_path = output / safe_name
     else:
@@ -419,7 +476,7 @@ def decrypt(
     # Refuse before creating temps so a no-op collision leaves no residue.
     if output_path.exists() and not force:
         console.print(
-            f"[red]Refusing to overwrite {escape(str(output_path))}. "
+            f"[red]Refusing to overwrite {_display(str(output_path))}. "
             "Pass --force to replace the existing file.[/red]"
         )
         sys.exit(1)
@@ -427,7 +484,7 @@ def decrypt(
     try:
         version_id = _s3_version_id(record, latest)
     except EnvaultError as exc:
-        console.print(f"[bold red]Decryption error:[/bold red] {escape(str(exc))}")
+        console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
         sys.exit(1)
 
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
@@ -471,7 +528,7 @@ def decrypt(
             )
             console.print(
                 "[bold red]Refusing to write plaintext:[/bold red] the access could not be "
-                f"recorded in the audit trail: {escape(str(exc))}"
+                f"recorded in the audit trail: {_display(exc)}"
             )
             sys.exit(1)
 
@@ -482,38 +539,38 @@ def decrypt(
             "The ciphertext metadata does not match the record in DynamoDB.\n"
             "This could mean the encrypted file in S3 was replaced or corrupted.\n"
             "No plaintext was written.\n"
-            f"  File: {escape(record.file_name)}  SHA256: {sha256_hash[:16]}..."
+            f"  File: {_display(record.file_name)}  SHA256: {_id_prefix(sha256_hash)}..."
         )
         sys.exit(1)
     except ChecksumMismatchError as exc:
         console.print(
             "[bold red]Decryption failed:[/bold red] checksum mismatch.\n"
-            f"Expected SHA256 {exc.expected[:16]}... but got {exc.actual[:16]}...\n"
+            f"Expected SHA256 {_id_prefix(exc.expected)}... but got {_id_prefix(exc.actual)}...\n"
             "The decrypted content does not match the original file.\n"
             "The encrypted data in S3 may have been corrupted or tampered with."
         )
         sys.exit(1)
     except ConfigurationError as exc:
-        console.print(f"[bold red]Configuration error:[/bold red] {escape(str(exc))}")
+        console.print(f"[bold red]Configuration error:[/bold red] {_display(exc)}")
         sys.exit(1)
     except (ClientError, BotoCoreError) as exc:
         error_msg = str(exc)
         if isinstance(exc, ClientError):
             error_msg = exc.response.get("Error", {}).get("Message", str(exc))
         console.print(
-            f"[bold red]AWS error during decryption:[/bold red] {escape(error_msg)}\n"
-            f"  File: {escape(record.file_name)}  S3: {escape(record.s3_key)}"
+            f"[bold red]AWS error during decryption:[/bold red] {_display(error_msg)}\n"
+            f"  File: {_display(record.file_name)}  S3: {_display(record.s3_key)}"
         )
         sys.exit(1)
     except (EnvaultError, OSError) as exc:
-        console.print(f"[bold red]Decryption error:[/bold red] {escape(str(exc))}")
+        console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
         sys.exit(1)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
         # No-op once published; otherwise zero-overwrites verified plaintext.
         _best_effort_delete(staging)
 
-    console.print(f"[green]✓[/green] Decrypted → {escape(str(output_path))}")
+    console.print(f"[green]✓[/green] Decrypted → {_display(str(output_path))}")
 
 
 def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
@@ -558,7 +615,7 @@ def status(state: str, sha256_hash: str | None, table: str, region: str) -> None
             _validate_sha256(sha256_hash)
             record = store.get_current_state(sha256_hash)
             if not record:
-                console.print(f"[red]No record found for {sha256_hash[:16]}...[/red]")
+                console.print(f"[red]No record found for {_id_prefix(sha256_hash)}...[/red]")
                 sys.exit(1)
             _print_records([record])
             return
@@ -589,11 +646,11 @@ def _print_records(records: list[FileRecord]) -> None:
         # square brackets would otherwise be interpreted as Rich markup, which
         # both misrepresents the name and can raise MarkupError mid-table.
         t.add_row(
-            escape(r.file_name),
-            f"[{state_color}]{escape(r.current_state)}[/{state_color}]",
-            escape(r.sha256_hash[:16]),
-            escape(r.encrypted_at),
-            escape(tags_str),
+            _display(r.file_name),
+            f"[{state_color}]{_display(r.current_state)}[/{state_color}]",
+            _id_prefix(r.sha256_hash),
+            _display(r.encrypted_at),
+            _display(tags_str),
         )
     console.print(t)
 
@@ -640,12 +697,12 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
             ts = parts[1] if len(parts) > 1 else ""
             op = parts[2] if len(parts) > 2 else e.get("operation", "")
             t.add_row(
-                escape(ts),
-                escape(op),
-                escape(str(e.get("file_name", ""))),
-                escape(str(e.get("sha256_hash", ""))[:16]),
-                escape(_short_principal(str(e.get("principal_arn", "")))),
-                escape(str(e.get("correlation_id", ""))[:8]),
+                _display(ts),
+                _display(op),
+                _display(str(e.get("file_name", ""))),
+                _id_prefix(e.get("sha256_hash", "")),
+                _display(_short_principal(str(e.get("principal_arn", "")))),
+                _display(str(e.get("correlation_id", ""))[:8]),
             )
         console.print(t)
 
@@ -674,7 +731,7 @@ def dashboard(table: str, region: str) -> None:
         t.add_row("Total tracked files:", str(summary["total"]))
         t.add_row("Currently encrypted:", f"[green]{summary['encrypted']}[/green]")
         t.add_row("Currently decrypted:", f"[yellow]{summary['decrypted']}[/yellow]")
-        t.add_row("Last activity:", summary["last_activity"])
+        t.add_row("Last activity:", _display(summary["last_activity"]))
         console.print(t)
         console.print()
 
@@ -884,7 +941,9 @@ def rotate_key(
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]")
         for r in records:
-            console.print(f"  Would rotate: {escape(r.file_name)} ({r.sha256_hash[:16]}...)")
+            console.print(
+                f"  Would rotate: {_display(r.file_name)} ({_id_prefix(r.sha256_hash)}...)"
+            )
         return
 
     shm_dir = _private_ram_dir()
@@ -979,7 +1038,7 @@ def rotate_key(
             rotated += 1
         except (EnvaultError, ClientError, BotoCoreError, OSError) as exc:
             console.print(
-                f"[red]Error rotating {escape(record.file_name)}: {escape(str(exc))}[/red]"
+                f"[red]Error rotating {_display(record.file_name)}: {_display(exc)}[/red]"
             )
             errors += 1
         finally:
@@ -1215,7 +1274,7 @@ def exec_(
         _close_all(creds, sinks)
         console.print(
             "[bold red]Refusing to run:[/bold red] checksum mismatch "
-            f"(expected {exc.expected[:16]}..., got {exc.actual[:16]}...).\n"
+            f"(expected {_id_prefix(exc.expected)}..., got {_id_prefix(exc.actual)}...).\n"
             "The encrypted data may have been corrupted or tampered with."
         )
         sys.exit(1)
@@ -1223,7 +1282,7 @@ def exec_(
         _close_all(creds, sinks)
         msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
         console.print(
-            f"[bold red]Refusing to run:[/bold red] {escape(str(msg))}\n"
+            f"[bold red]Refusing to run:[/bold red] {_display(msg)}\n"
             "No command was started and no secrets were delivered."
         )
         sys.exit(1)
@@ -1251,7 +1310,7 @@ def exec_(
         os.execvpe(argv[0], argv, child_env)  # noqa: S606
     except OSError as exc:
         _close_all(creds, [])
-        console.print(f"[bold red]Could not run {escape(argv[0])}:[/bold red] {escape(str(exc))}")
+        console.print(f"[bold red]Could not run {_display(argv[0])}:[/bold red] {_display(exc)}")
         sys.exit(127)
 
 
@@ -1387,7 +1446,7 @@ def _preflight_kms_key(key_id: str, region: str) -> None:
     except ClientError as exc:
         msg = exc.response.get("Error", {}).get("Message", str(exc))
         console.print(
-            f"[bold red]Cannot use KMS key {escape(key_id)}:[/bold red] {escape(msg)}\n"
+            f"[bold red]Cannot use KMS key {_display(key_id)}:[/bold red] {_display(msg)}\n"
             "Rotation did not download or decrypt any files. Grant kms:DescribeKey "
             "(and GenerateDataKey) on the target key, or pass a key this principal can use."
         )
@@ -1395,8 +1454,8 @@ def _preflight_kms_key(key_id: str, region: str) -> None:
     state = str(metadata.get("KeyState", ""))
     if state != "Enabled":
         console.print(
-            f"[bold red]Cannot use KMS key {escape(key_id)}:[/bold red] "
-            f"key state is {escape(state) or 'unknown'}, not Enabled.\n"
+            f"[bold red]Cannot use KMS key {_display(key_id)}:[/bold red] "
+            f"key state is {_display(state) or 'unknown'}, not Enabled.\n"
             "Rotation did not download or decrypt any files."
         )
         sys.exit(1)
@@ -1467,7 +1526,7 @@ def _validate_sha256(value: str) -> str:
     """Validate a SHA256 hash string. Exit with error if invalid."""
     if not _is_sha256(value):
         console.print(
-            f"[red]Invalid SHA256 hash: {escape(repr(value))}. "
+            f"[red]Invalid SHA256 hash: {_display(repr(value))}. "
             "Expected 64 lowercase hexadecimal characters.[/red]"
         )
         sys.exit(1)
@@ -1485,7 +1544,7 @@ def _validate_date(value: str) -> str:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
         console.print(
-            f"[red]Invalid date: {escape(repr(value))}. Expected format: YYYY-MM-DD.[/red]"
+            f"[red]Invalid date: {_display(repr(value))}. Expected format: YYYY-MM-DD.[/red]"
         )
         sys.exit(1)
     return value
@@ -1505,21 +1564,23 @@ def _resolve_identifier(
     if _is_sha256(identifier):
         record = store.get_current_state(identifier)
         if not record:
-            console.print(f"[red]No record found for hash {escape(identifier[:16])}...[/red]")
+            console.print(f"[red]No record found for hash {_id_prefix(identifier)}...[/red]")
             sys.exit(1)
         return record
 
     # Filename lookup
     records = store.list_by_file_name(identifier, ENCRYPTED)
     if not records:
-        console.print(f"[red]No encrypted files found with name {escape(repr(identifier))}.[/red]")
+        console.print(
+            f"[red]No encrypted files found with name {_display(repr(identifier))}.[/red]"
+        )
         sys.exit(1)
 
     if version < 1 or version > len(records):
         console.print(
             f"[red]Version {version} out of range. "
             f"Found {len(records)} version(s) of"
-            f" {escape(repr(identifier))}.[/red]"
+            f" {_display(repr(identifier))}.[/red]"
         )
         sys.exit(1)
 
@@ -1529,7 +1590,7 @@ def _resolve_identifier(
         console.print(
             f"[dim]{len(records)} versions found. "
             f"Decrypting {label} "
-            f"({selected.encrypted_at}). "
+            f"({_display(selected.encrypted_at)}). "
             f"Use --version N to pick another.[/dim]"
         )
 
@@ -1551,7 +1612,8 @@ def _validate_account_ids(raw: str) -> list[str]:
     for account_id in account_ids:
         if not _ACCOUNT_ID_RE.fullmatch(account_id):
             console.print(
-                f"[red]Invalid AWS account ID: {escape(repr(account_id))}. Must be 12 digits.[/red]"
+                f"[red]Invalid AWS account ID: {_display(repr(account_id))}. "
+                "Must be 12 digits.[/red]"
             )
             sys.exit(1)
     return account_ids
@@ -1580,7 +1642,7 @@ def _parse_tags(tag_strs: tuple[str, ...]) -> dict[str, str]:
     for t in tag_strs:
         if "=" not in t:
             console.print(
-                f"[yellow]Ignoring invalid tag '{escape(t)}' (expected KEY=VALUE)[/yellow]"
+                f"[yellow]Ignoring invalid tag '{_display(t)}' (expected KEY=VALUE)[/yellow]"
             )
             continue
         k, _, v = t.partition("=")
