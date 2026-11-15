@@ -3,6 +3,8 @@ from __future__ import annotations
 import glob
 import hashlib
 import json
+import sys
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,6 +40,14 @@ _CLI_ENV = {
     "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
     "AWS_DEFAULT_REGION": REGION,
 }
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_hooks() -> Iterator[None]:
+    """cli() is the process entry point and installs process-wide hooks; undo them."""
+    unraisablehook = sys.unraisablehook
+    yield
+    sys.unraisablehook = unraisablehook
 
 
 def _ensure_kms_alias(alias: str = "alias/new-key") -> None:

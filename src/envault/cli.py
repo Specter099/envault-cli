@@ -10,7 +10,7 @@ import shutil
 import sys
 import tempfile
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,14 +45,78 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
+def _is_logger(name: str, family: str) -> bool:
+    return name == family or name.startswith(family + ".")
+
+
+class _StderrLogPolicy(logging.Filter):
+    """Decide which log records envault's stderr handler writes.
+
+    envault's own loggers pass at whatever level they are set to (DEBUG under
+    ``-v``). Every other logger passes at WARNING and above only, whatever
+    level it was given: botocore logs signed request headers (the session
+    token) and response bodies (the plaintext data key KMS returns) at DEBUG,
+    so ``-v`` must never reach them. The Encryption SDK's records are dropped
+    unless ``-v`` is set: it logs a traceback at ERROR for every KMS failure
+    and "Error on closing" for every abandoned decrypt, and envault reports
+    those failures itself, in one line.
+    """
+
+    def __init__(self, verbose: bool) -> None:
+        super().__init__()
+        self.verbose = verbose
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _is_logger(record.name, "envault"):
+            return True
+        if record.levelno < logging.WARNING:
+            return False
+        if _is_logger(record.name, "aws_encryption_sdk"):
+            return self.verbose
+        return True
+
+
 def _setup_logging(verbose: bool) -> None:
     from pythonjsonlogger.json import JsonFormatter
 
     handler = logging.StreamHandler(sys.stderr)
     fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")  # type: ignore[no-untyped-call,unused-ignore]
     handler.setFormatter(fmt)
-    level = logging.DEBUG if verbose else logging.WARNING
-    logging.basicConfig(level=level, handlers=[handler])
+    handler.addFilter(_StderrLogPolicy(verbose))
+    # The root logger stays at WARNING under -v: only envault's own loggers
+    # become verbose. The handler's filter enforces the same rule for loggers
+    # that set their own level.
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
+    logging.getLogger("envault").setLevel(logging.DEBUG if verbose else logging.NOTSET)
+
+
+def _sdk_finalizer_noise_filter(
+    previous: Callable[[Any], object],
+) -> Callable[[Any], None]:
+    """Wrap a ``sys.unraisablehook`` so it drops the Encryption SDK's finalizer errors.
+
+    An SDK stream abandoned mid-message (any failed decrypt) raises again from
+    its finalizer ("Footer not read"), which Python prints to stderr as
+    "Exception ignored in ..." with a traceback, at garbage collection or at
+    interpreter exit. The SDK itself treats errors from closing as safe to
+    ignore, and envault has already reported the failure. Everything else goes
+    to ``previous``.
+    """
+    from aws_encryption_sdk.exceptions import AWSEncryptionSDKClientError
+
+    def hook(unraisable: Any) -> None:
+        source = type(unraisable.object).__module__
+        if isinstance(unraisable.exc_value, AWSEncryptionSDKClientError) and _is_logger(
+            source, "aws_encryption_sdk"
+        ):
+            logger.debug(
+                "Discarded an Encryption SDK error raised while finalizing an abandoned stream: %s",
+                unraisable.exc_value,
+            )
+            return
+        previous(unraisable)
+
+    return hook
 
 
 @click.group(invoke_without_command=True)
@@ -88,6 +152,7 @@ def _friendly_message(e: click.UsageError) -> str:
 
 def cli() -> None:
     """Entrypoint that wraps Click with human-readable error formatting."""
+    sys.unraisablehook = _sdk_finalizer_noise_filter(sys.unraisablehook)
     try:
         main(standalone_mode=False)
     except click.UsageError as e:
@@ -178,7 +243,8 @@ def encrypt(
             )
         except (EnvaultError, ClientError, BotoCoreError) as exc:
             console.print(f"[red]✗[/red] {escape(file_path.name)}: {escape(str(exc))}")
-            logger.exception("Failed to encrypt %s", file_path)
+            # The ✗ line is the report; the traceback is for -v only.
+            logger.debug("Failed to encrypt %s", file_path, exc_info=True)
             errors += 1
 
     if errors:
