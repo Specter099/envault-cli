@@ -447,3 +447,48 @@ def test_exec_warns_when_inheriting_aws_credentials() -> None:
             )
         assert rec.called, result.output
         assert "inherit AWS credentials" in result.output
+
+
+@mock_aws
+def test_exec_passes_child_options_without_double_dash() -> None:
+    """Everything from the command name on belongs to the child, `--` or not (L6).
+
+    Interspersed parsing read `--region` in `aws s3 ls --region eu-west-1` as
+    envault's own option (looking the secret up in the wrong region), and
+    `psql -f schema.sql` as envault's `--file`.
+    """
+    account = _provision()
+    env = _env(account)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        _seed_secret(runner, env)
+        for child in (
+            ["aws", "s3", "ls", "--region", "eu-west-1"],
+            ["psql", "-f", "schema.sql"],
+            ["env", "-s", "x=Y", "--table", "other"],
+        ):
+            rec = _ExecRecorder()
+            with patch("os.execvpe", rec):
+                result = runner.invoke(main, ["exec", "-s", "db.env=V", *child], env=env)
+            assert result.exit_code == 0, result.output
+            assert rec.called, result.output
+            assert rec.argv == child
+            assert rec.env["V"] == SECRET_VALUE.decode().rstrip("\n")
+
+
+@mock_aws
+def test_exec_rejects_unknown_option_before_command() -> None:
+    """A mistyped envault option must not become the program to run."""
+    account = _provision()
+    env = _env(account)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        _seed_secret(runner, env)
+        rec = _ExecRecorder()
+        with patch("os.execvpe", rec):
+            result = runner.invoke(
+                main, ["exec", "--clean-envv", "-s", "db.env=V", "--", "/bin/true"], env=env
+            )
+        assert not rec.called
+        assert result.exit_code == 2
+        assert "--clean-envv" in result.output

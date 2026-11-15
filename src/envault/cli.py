@@ -1053,7 +1053,13 @@ class _BufferSink:
         return len(data)
 
 
-@main.command("exec", context_settings={"ignore_unknown_options": True})
+# Option parsing stops at the first argument that is not an envault option:
+# everything from COMMAND on belongs to the child, so `aws s3 ls --region x`
+# or `psql -f schema.sql` reach it intact with or without `--`.
+@main.command(
+    "exec",
+    context_settings={"ignore_unknown_options": True, "allow_interspersed_args": False},
+)
 @click.option(
     "--secret",
     "-s",
@@ -1109,6 +1115,10 @@ def exec_(
       envault exec -s db.env=DATABASE_URL -- ./server
       envault exec -f server.pem=TLS_CERT -- curl --cert {TLS_CERT} https://api
 
+    envault's options go before COMMAND. Everything from COMMAND on is passed
+    to it unchanged, including options such as ``--region`` or ``-f``, so the
+    ``--`` separator is optional.
+
     ``--secret`` places the plaintext in the child's environment. ``--file``
     writes it to an anonymous file descriptor and puts a readable path in $VAR,
     for programs that insist on a file — certificates, keystores, kubeconfigs.
@@ -1126,6 +1136,11 @@ def exec_(
 
     if not command:
         raise click.UsageError("No command given. Usage: envault exec -s NAME=VAR -- COMMAND")
+    if command[0].startswith("-"):
+        # An unknown option before COMMAND would otherwise become the program.
+        raise click.UsageError(
+            f"No such option: {command[0]}. envault's options go before COMMAND."
+        )
     if not env_specs and not file_specs:
         raise click.UsageError("Provide at least one --secret or --file.")
 
