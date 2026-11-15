@@ -314,7 +314,10 @@ def _install_signal_handlers() -> Callable[[], None]:
         default = signal.default_int_handler if name == "SIGINT" else signal.SIG_DFL
         if signal.getsignal(signum) != default:
             continue
-        previous[signum] = signal.signal(signum, _on_stop_signal)
+        try:
+            previous[signum] = signal.signal(signum, _on_stop_signal)
+        except ValueError:  # not the main thread: leave signal handling alone
+            break
 
     def restore() -> None:
         for signum, handler in previous.items():
@@ -608,8 +611,8 @@ def _encrypt_fd(
         if sha256 != result.sha256_hash:
             raise EnvaultError(
                 f"File {name!r} was modified during encryption "
-                f"(pre-read hash {_id_prefix(sha256)}… != encrypted hash "
-                f"{_id_prefix(result.sha256_hash)}…). "
+                f"(pre-read hash {sha256[:16]}… != encrypted hash "
+                f"{result.sha256_hash[:16]}…). "
                 "Aborting to avoid storing mismatched metadata."
             )
 
