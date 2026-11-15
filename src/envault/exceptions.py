@@ -35,10 +35,62 @@ class ChecksumMismatchError(EnvaultError):
 
 
 class DecryptionError(EnvaultError):
-    """Raised when the AWS Encryption SDK fails to decrypt a ciphertext.
+    """Raised when a ciphertext fails integrity or trust checks on decryption.
 
-    Typically indicates the ciphertext is corrupted, truncated, or was
-    tampered with — not a transient AWS error, so it is never retried.
+    The ciphertext is corrupted, truncated or tampered with, uses a
+    non-committing algorithm suite, carries more than one encrypted data key,
+    names a KMS key outside the trusted accounts, or KMS itself rejected its
+    encrypted data key (InvalidCiphertextException and similar). Deterministic,
+    so it is never retried.
+
+    KMS being throttled, unreachable, or refusing access is *not* reported this
+    way: see :class:`KMSError`.
+    """
+
+
+class KMSError(EnvaultError):
+    """KMS did not complete a data-key request: GenerateDataKey on encrypt, Decrypt on decrypt.
+
+    Throttling, KMS internal errors and unreachable endpoints are transient. Access
+    denied, a disabled key or one pending deletion are not. In neither case
+    does it say anything about the integrity of a ciphertext: KMS answers that
+    implicate the ciphertext itself are raised as :class:`DecryptionError`.
+    Messages carry the AWS error code and message and the key identifier, never
+    plaintext or key material.
+
+    Attributes:
+        operation: KMS API operation that failed: "GenerateDataKey", "Encrypt"
+            or "Decrypt".
+        error_code: AWS error code (e.g. "AccessDeniedException"), or the
+            botocore exception class name for a network failure.
+        transient: True if a later attempt may succeed (throttling, 5xx,
+            network). The original error stays chained as ``__cause__``, which
+            is what :func:`envault.retry.is_transient_aws_error` inspects.
+        key_id: Key id, alias or ARN the request named ("" if unknown).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str = "",
+        error_code: str = "",
+        transient: bool = False,
+        key_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.error_code = error_code
+        self.transient = transient
+        self.key_id = key_id
+
+
+class EncryptionError(EnvaultError):
+    """The Encryption SDK could not encrypt a file, for a reason other than KMS.
+
+    For example, an invalid key identifier or encryption context. Deterministic,
+    never retried. KMS failures while generating the data key raise
+    :class:`KMSError` instead.
     """
 
 
