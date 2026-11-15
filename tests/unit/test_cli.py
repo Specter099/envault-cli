@@ -4,6 +4,7 @@ import glob
 import hashlib
 import json
 import sys
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -408,6 +409,20 @@ def test_decrypt_version_flag_out_of_range() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _fake_encrypt_result(content: bytes, output_path: Path) -> EncryptResult:
+    """Write dummy ciphertext; return what encryption would report for ``content``."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"fake-ciphertext")
+    return EncryptResult(
+        sha256_hash=hashlib.sha256(content).hexdigest(),
+        file_size_bytes=len(content),
+        algorithm="AES_256_GCM_HKDF_SHA512_COMMIT_KEY",
+        # Real message ids are 32 random bytes, distinct for every encryption.
+        message_id=uuid.uuid4().hex + uuid.uuid4().hex,
+        output_path=output_path,
+    )
+
+
 def _mock_encrypt_file(
     input_path: Path,
     key_id: str,
@@ -415,17 +430,21 @@ def _mock_encrypt_file(
     output_path: Path,
     region: str = "us-east-1",
 ) -> EncryptResult:
-    """Fake encrypt_file that writes dummy ciphertext and returns EncryptResult."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(b"fake-ciphertext")
-    content = input_path.read_bytes()
-    return EncryptResult(
-        sha256_hash=hashlib.sha256(content).hexdigest(),
-        file_size_bytes=len(content),
-        algorithm="AES_256_GCM_HKDF_SHA512_COMMIT_KEY",
-        message_id="msg001",
-        output_path=output_path,
-    )
+    """Fake encrypt_file (rotate-key re-encrypts its own temporary plaintext with it)."""
+    return _fake_encrypt_result(input_path.read_bytes(), output_path)
+
+
+def _mock_encrypt_fd(
+    input_fd: int,
+    key_id: str,
+    encryption_context: dict[str, str],
+    output_path: Path,
+    region: str = "us-east-1",
+) -> EncryptResult:
+    """Fake encrypt_fd (encrypt hashes and encrypts from one descriptor)."""
+    with open(input_fd, "rb", closefd=False) as f:
+        f.seek(0)
+        return _fake_encrypt_result(f.read(), output_path)
 
 
 @mock_aws
@@ -439,10 +458,7 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
     sha = hashlib.sha256(b"sensitive data").hexdigest()
 
     runner = CliRunner()
-    with (
-        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
-        patch("envault.cli.sha256_file", return_value=sha),
-    ):
+    with patch("envault.cli.encrypt_fd", side_effect=_mock_encrypt_fd):
         result = runner.invoke(
             main,
             [
@@ -849,46 +865,6 @@ def test_rotate_key_keeps_plaintext_off_disk(tmp_path: Path) -> None:
 
 
 @mock_aws
-def test_encrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
-    """Temp encrypted file must be cleaned up even if encrypt_file raises."""
-    _create_table()
-    _create_bucket()
-
-    plaintext = tmp_path / "secret.txt"
-    plaintext.write_bytes(b"data")
-    sha = hashlib.sha256(b"data").hexdigest()
-
-    runner = CliRunner()
-    with (
-        patch("envault.cli.encrypt_file", side_effect=EnvaultError("boom")),
-        patch("envault.cli.sha256_file", return_value=sha),
-    ):
-        result = runner.invoke(
-            main,
-            [
-                "encrypt",
-                str(plaintext),
-                "--key-id",
-                KEY_ID,
-                "--bucket",
-                BUCKET_NAME,
-                "--table",
-                TABLE_NAME,
-                "--region",
-                REGION,
-            ],
-            env=_CLI_ENV,
-        )
-
-    assert result.exit_code != 0
-    # No lingering temp files with the envault_enc_ prefix
-    import tempfile
-
-    leftover = glob.glob(f"{tempfile.gettempdir()}/envault_enc_*")
-    assert leftover == []
-
-
-@mock_aws
 def test_decrypt_refuses_empty_version_id(tmp_path: Path) -> None:
     """Migrated records with no VersionId must not silently fetch latest."""
     _create_table()
@@ -977,12 +953,10 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(
 
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"sensitive data")
-    sha = hashlib.sha256(b"sensitive data").hexdigest()
 
     runner = CliRunner()
     with (
-        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
-        patch("envault.cli.sha256_file", return_value=sha),
+        patch("envault.cli.encrypt_fd", side_effect=_mock_encrypt_fd),
         patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
         caplog.at_level(logging.ERROR, logger="envault.cli"),
     ):

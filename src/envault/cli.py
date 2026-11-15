@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import unicodedata
@@ -27,7 +28,14 @@ from rich.progress import track
 from rich.table import Table
 
 from envault.config import Config, boto_config
-from envault.crypto import decrypt_file, decrypt_to_stream, encrypt_file, sha256_file
+from envault.crypto import (
+    decrypt_file,
+    decrypt_to_stream,
+    encrypt_fd,
+    encrypt_file,
+    sha256_fd,
+    sha256_file,
+)
 from envault.exceptions import (
     AlreadyEncryptedError,
     ChecksumMismatchError,
@@ -38,6 +46,7 @@ from envault.exceptions import (
     StateConflictError,
 )
 from envault.fileutils import best_effort_delete as _best_effort_delete
+from envault.fileutils import open_regular_nofollow
 from envault.identity import caller_arn
 from envault.isolation import CredentialFd, harden_process, wipe
 from envault.s3 import S3Store, assert_s3_key_matches_hash
@@ -306,8 +315,29 @@ def _encrypt_one(
     correlation_id: str,
     force: bool,
 ) -> None:
-    file_path, name = item.path, item.name
-    sha256 = sha256_file(file_path)
+    # One descriptor for the dedup hash and the encryption, opened without
+    # following a symlink and only if it is still the inode collected: a path
+    # swapped since the walk is refused, and a swap after this open changes
+    # nothing that is read.
+    fd = open_regular_nofollow(item.path, expected=item.identity)
+    try:
+        _encrypt_fd(fd, item, config, tags, store, s3, correlation_id, force)
+    finally:
+        os.close(fd)
+
+
+def _encrypt_fd(
+    fd: int,
+    item: _CollectedFile,
+    config: Config,
+    tags: dict[str, str],
+    store: StateStore,
+    s3: S3Store,
+    correlation_id: str,
+    force: bool,
+) -> None:
+    name = item.name
+    sha256 = sha256_fd(fd)
 
     existing = store.get_current_state(sha256)
     if existing and existing.current_state == ENCRYPTED and not force:
@@ -323,8 +353,8 @@ def _encrypt_one(
     enc_context = config.build_encryption_context(sha256, name)
 
     try:
-        result = encrypt_file(
-            input_path=file_path,
+        result = encrypt_fd(
+            fd,
             key_id=config.key_id,
             encryption_context=enc_context,
             output_path=tmp_encrypted,
@@ -1820,14 +1850,21 @@ class _CollectedFile:
     #: separators (its basename when a single file was given). Two files with
     #: the same basename in different directories stay distinguishable.
     name: str
+    #: ``(st_dev, st_ino)`` from ``lstat`` at collection time. Encryption opens
+    #: the path only if it is still this inode.
+    identity: tuple[int, int]
 
 
 def _collect_files(path: Path) -> list[_CollectedFile]:
     """Regular files under ``path``, never following directory or file symlinks."""
-    if path.is_symlink():
+    try:
+        top = os.lstat(path)
+    except OSError:
         return []
-    if path.is_file():
-        return [_CollectedFile(path=path, name=path.name)]
+    if stat.S_ISREG(top.st_mode):
+        return [_CollectedFile(path=path, name=path.name, identity=(top.st_dev, top.st_ino))]
+    if not stat.S_ISDIR(top.st_mode):  # a symlink, FIFO, socket or device
+        return []
     files: list[_CollectedFile] = []
     for root, dirnames, filenames in os.walk(path, followlinks=False):
         # os.walk(followlinks=False) still lists symlink directories; drop them
@@ -1835,9 +1872,18 @@ def _collect_files(path: Path) -> list[_CollectedFile]:
         dirnames[:] = sorted(d for d in dirnames if not Path(root, d).is_symlink())
         for filename in sorted(filenames):
             candidate = Path(root) / filename
-            if candidate.is_file() and not candidate.is_symlink():
-                name = candidate.relative_to(path).as_posix()
-                files.append(_CollectedFile(path=candidate, name=name))
+            try:
+                st = os.lstat(candidate)
+            except OSError:
+                continue  # vanished during the walk
+            if stat.S_ISREG(st.st_mode):
+                files.append(
+                    _CollectedFile(
+                        path=candidate,
+                        name=candidate.relative_to(path).as_posix(),
+                        identity=(st.st_dev, st.st_ino),
+                    )
+                )
     return files
 
 
