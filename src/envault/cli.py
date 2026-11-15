@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import stat
 import sys
 import tempfile
@@ -17,7 +19,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from types import FrameType
+from typing import Any, ClassVar
 
 import boto3
 import click
@@ -206,9 +209,232 @@ def _friendly_message(e: click.UsageError) -> str:
     return msg
 
 
+# ---------------------------------------------------------------------------
+# Signals and temporary files
+#
+# SIGTERM and SIGHUP end a process without running Python's cleanup, which
+# left decrypted plaintext in the output directory (decrypt) and in /dev/shm
+# (rotate-key). The console entry point turns them into SystemExit(128 +
+# signum), and SIGINT into KeyboardInterrupt as usual, so every ``finally``
+# runs. After the first of these signals, the next one is ignored: the process
+# is already on its way out, and a second Ctrl-C must not cut the overwrite of
+# plaintext short. A third ends the process at once, in case something holds
+# it up. Signals are deferred (held, then acted on), never blocked with a
+# signal mask, which the command `exec` starts would inherit.
+# ---------------------------------------------------------------------------
+
+#: Stop signals ignored during shutdown before the next one ends the process.
+_SIGNALS_IGNORED_WHILE_STOPPING = 1
+
+
+class _SignalState:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.stopping: int | None = None  # the signal being acted on
+        self.pending: int | None = None  # received inside a deferred section
+        self.deferring = 0
+        self.ignored = 0
+
+
+_signals = _SignalState()
+
+
+def _stop_exception(signum: int) -> BaseException:
+    if signum == signal.SIGINT:
+        return KeyboardInterrupt()
+    return SystemExit(128 + signum)
+
+
+def _on_stop_signal(signum: int, frame: FrameType | None) -> None:
+    """Handler for SIGTERM, SIGHUP and SIGINT once the entry point installed it."""
+    if _signals.stopping is not None:
+        _signals.ignored += 1
+        if _signals.ignored > _SIGNALS_IGNORED_WHILE_STOPPING:
+            # The operator insists: end now, cleanup or not.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        return
+    if _signals.deferring:
+        if _signals.pending is None:
+            _signals.pending = signum
+        return
+    _signals.stopping = signum
+    raise _stop_exception(signum)
+
+
+@contextmanager
+def _signals_deferred() -> Iterator[None]:
+    """Hold stop signals until the block ends, then act on the first one received.
+
+    For short critical sections: creating a temporary file and recording it,
+    and destroying temporary files.
+    """
+    _signals.deferring += 1
+    try:
+        yield
+    finally:
+        _signals.deferring -= 1
+        signum = _signals.pending
+        if not _signals.deferring and signum is not None:
+            _signals.pending = None
+            if _signals.stopping is None:
+                _signals.stopping = signum
+                raise _stop_exception(signum)
+
+
+def _install_signal_handlers() -> Callable[[], None]:
+    """Route SIGTERM, SIGHUP and SIGINT to :func:`_on_stop_signal`; return an undo.
+
+    Only signals at their default disposition are taken over. One the parent
+    chose to ignore (``nohup`` ignores SIGHUP) stays ignored, for envault and
+    for the command ``exec`` starts. Call from the main thread.
+    """
+    _signals.reset()
+    previous: dict[int, Any] = {}
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        default = signal.default_int_handler if name == "SIGINT" else signal.SIG_DFL
+        if signal.getsignal(signum) != default:
+            continue
+        previous[signum] = signal.signal(signum, _on_stop_signal)
+
+    def restore() -> None:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        _signals.reset()
+
+    return restore
+
+
+def _default_signals_for_child() -> dict[int, Any]:
+    """Reset SIGPIPE and SIGXFSZ, which Python ignores, before exec (as subprocess does).
+
+    Ignored dispositions survive execve: without this, the command `exec`
+    starts would see EPIPE instead of being stopped by SIGPIPE. Returns the
+    previous handlers, to put back if the exec fails.
+    """
+    previous: dict[int, Any] = {}
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            previous[signum] = signal.signal(signum, signal.SIG_DFL)
+    return previous
+
+
+def _destroy(path: Path, plaintext: bool) -> None:
+    """Remove a temporary file, and the files other code derives from its name."""
+    try:
+        if plaintext:
+            _best_effort_delete(path)
+            # decrypt_file streams into a hidden sibling and renames it over
+            # ``path`` only once verified.
+            for part in path.parent.glob(f".{glob.escape(path.name)}.*.part"):
+                _best_effort_delete(part)
+        else:
+            path.unlink(missing_ok=True)
+            # s3transfer downloads into a sibling named after the destination.
+            for partial in path.parent.glob(f"{glob.escape(path.name)}.*"):
+                partial.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove temporary file %s: %s", path, exc)
+
+
+def _destroy_dir(directory: Path) -> None:
+    """Overwrite and remove every file in a private scratch directory, then the directory."""
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        _best_effort_delete(entry)
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+class _Scratch:
+    """Temporary files a command creates, destroyed when it ends, however it ends.
+
+    A path is recorded inside the same signal-deferred section that creates it,
+    so no signal can strand a file between the two, and destruction cannot be
+    interrupted. Plaintext files are zero-overwritten before removal (best
+    effort; see :func:`envault.fileutils.best_effort_delete`), as are the
+    hidden ``.<name>.*.part`` files decrypt_file writes next to them. Whatever
+    a command's own cleanup did not reach is swept by the console entry point
+    on its way out (:meth:`cleanup_all`).
+    """
+
+    _live: ClassVar[list[_Scratch]] = []
+
+    def __init__(self) -> None:
+        self._files: list[tuple[Path, bool]] = []
+        self._dirs: list[Path] = []
+
+    def __enter__(self) -> _Scratch:
+        _Scratch._live.append(self)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.cleanup()
+
+    def file(
+        self,
+        *,
+        prefix: str,
+        suffix: str = "",
+        directory: Path | None = None,
+        plaintext: bool = False,
+    ) -> Path:
+        """Create an empty 0600 temporary file that is destroyed with the scratch."""
+        with _signals_deferred():
+            fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
+            path = Path(name)
+            self._files.append((path, plaintext))
+            os.close(fd)
+        return path
+
+    def adopt(self, path: Path, *, plaintext: bool) -> None:
+        """Destroy ``path`` with the scratch if it exists then (other code creates it)."""
+        with _signals_deferred():
+            self._files.append((path, plaintext))
+
+    def ram_dir(self) -> Path | None:
+        """A private RAM-backed directory destroyed with the scratch, if there is one."""
+        with _signals_deferred():
+            path = _private_ram_dir()
+            if path is not None:
+                self._dirs.append(path)
+        return path
+
+    def discard(self, *paths: Path | None) -> None:
+        """Destroy these files now rather than when the command ends."""
+        with _signals_deferred():
+            for entry in [e for e in self._files if e[0] in paths]:
+                self._files.remove(entry)
+                _destroy(*entry)
+
+    def cleanup(self) -> None:
+        with _signals_deferred():
+            while self._files:
+                _destroy(*self._files.pop())
+            while self._dirs:
+                _destroy_dir(self._dirs.pop())
+            if self in _Scratch._live:
+                _Scratch._live.remove(self)
+
+    @classmethod
+    def cleanup_all(cls) -> None:
+        with _signals_deferred():
+            for scratch in list(cls._live):
+                scratch.cleanup()
+
+
 def cli() -> None:
     """Entrypoint that wraps Click with human-readable error formatting."""
     sys.unraisablehook = _sdk_finalizer_noise_filter(sys.unraisablehook)
+    restore_signals = _install_signal_handlers()
     try:
         main(standalone_mode=False)
     except click.UsageError as e:
@@ -220,6 +446,11 @@ def cli() -> None:
     except click.Abort:
         console.print("[yellow]Aborted.[/yellow]")
         sys.exit(1)
+    finally:
+        try:
+            _Scratch.cleanup_all()
+        finally:
+            restore_signals()
 
 
 # Every command that writes an audit event takes this, so ENVAULT_AUDIT_TTL_DAYS
@@ -344,16 +575,14 @@ def _encrypt_fd(
     if existing and existing.current_state == ENCRYPTED and not force:
         raise AlreadyEncryptedError(sha256_hash=sha256, file_name=name)
 
-    _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
-    os.close(_fd)
-    tmp_encrypted = Path(_tmp)
     # Microseconds: versions of one name are ordered by this, and two files
     # encrypted within the same second must not tie.
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     # enc_context uses the pre-read hash; it will be validated against result.sha256_hash below
     enc_context = config.build_encryption_context(sha256, name)
 
-    try:
+    with _Scratch() as scratch:
+        tmp_encrypted = scratch.file(prefix="envault_enc_", suffix=".encrypted")
         result = encrypt_fd(
             fd,
             key_id=config.key_id,
@@ -377,8 +606,6 @@ def _encrypt_fd(
             sha256_hash=result.sha256_hash, file_name=name, message_id=result.message_id
         )
         version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key, if_none_match=True)
-    finally:
-        tmp_encrypted.unlink(missing_ok=True)
 
     record = FileRecord(
         sha256_hash=result.sha256_hash,
@@ -528,94 +755,92 @@ def decrypt(
         console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
         sys.exit(1)
 
-    tmp_encrypted: Path | None = None
     # Verified plaintext waits here, hidden, until the read is on the audit trail.
     staging = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex[:8]}.verified")
 
-    try:
-        _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
-        tmp_encrypted = Path(_tmp)
-        os.close(_fd)
-        s3.download_file(
-            s3_key=record.s3_key,
-            local_path=tmp_encrypted,
-            version_id=version_id,
-            allow_latest=latest,
-        )
-        decrypt_file(
-            input_path=tmp_encrypted,
-            output_path=staging,
-            expected_sha256=selection.expected_sha256,
-            region=region,
-            allowed_account_ids=account_ids,
-            expected_context=record.encryption_context,
-        )
-
-        # Fail closed, like exec: reading a file does not change what is stored
-        # in S3, so current_state is left alone and the read is recorded as an
-        # event — before the plaintext becomes visible at its final path. If the
-        # event cannot be written the plaintext is destroyed, never delivered.
+    # The scratch destroys the downloaded ciphertext, any partial or verified
+    # plaintext (not the published file: a hard link, it is only unlinked) and
+    # their derivatives, on every exit: errors, exits and signals alike.
+    with _Scratch() as scratch:
         try:
-            store.put_event(
-                record,
-                operation="DECRYPT",
-                correlation_id=correlation_id,
-                audit_ttl_days=audit_ttl_days,
-                principal_arn=caller_arn(region),
+            scratch.adopt(staging, plaintext=True)
+            tmp_encrypted = scratch.file(prefix="envault_dl_", suffix=".encrypted")
+            s3.download_file(
+                s3_key=record.s3_key,
+                local_path=tmp_encrypted,
+                version_id=version_id,
+                allow_latest=latest,
             )
-        except (ClientError, BotoCoreError, EnvaultError) as exc:
-            logger.error(
-                "Audit event write failed; decrypted plaintext discarded.",
-                extra={"sha256": sha256_hash, "s3_key": record.s3_key},
+            decrypt_file(
+                input_path=tmp_encrypted,
+                output_path=staging,
+                expected_sha256=selection.expected_sha256,
+                region=region,
+                allowed_account_ids=account_ids,
+                expected_context=record.encryption_context,
             )
+
+            # Fail closed, like exec: reading a file does not change what is stored
+            # in S3, so current_state is left alone and the read is recorded as an
+            # event — before the plaintext becomes visible at its final path. If the
+            # event cannot be written the plaintext is destroyed, never delivered.
+            try:
+                store.put_event(
+                    record,
+                    operation="DECRYPT",
+                    correlation_id=correlation_id,
+                    audit_ttl_days=audit_ttl_days,
+                    principal_arn=caller_arn(region),
+                )
+            except (ClientError, BotoCoreError, EnvaultError) as exc:
+                logger.error(
+                    "Audit event write failed; decrypted plaintext discarded.",
+                    extra={"sha256": sha256_hash, "s3_key": record.s3_key},
+                )
+                console.print(
+                    "[bold red]Refusing to write plaintext:[/bold red] the access could not be "
+                    f"recorded in the audit trail: {_display(exc)}"
+                )
+                sys.exit(1)
+
+            _publish(staging, output_path, overwrite=force)
+        except EncryptionContextMismatchError:
             console.print(
-                "[bold red]Refusing to write plaintext:[/bold red] the access could not be "
-                f"recorded in the audit trail: {_display(exc)}"
+                "[bold red]Decryption failed:[/bold red] encryption context mismatch.\n"
+                "The ciphertext metadata does not match the record in DynamoDB.\n"
+                "This could mean the encrypted file in S3 was replaced or corrupted.\n"
+                "No plaintext was written.\n"
+                f"  File: {_display(record.file_name)}  SHA256: {_id_prefix(sha256_hash)}..."
             )
             sys.exit(1)
-
-        _publish(staging, output_path, overwrite=force)
-    except EncryptionContextMismatchError:
-        console.print(
-            "[bold red]Decryption failed:[/bold red] encryption context mismatch.\n"
-            "The ciphertext metadata does not match the record in DynamoDB.\n"
-            "This could mean the encrypted file in S3 was replaced or corrupted.\n"
-            "No plaintext was written.\n"
-            f"  File: {_display(record.file_name)}  SHA256: {_id_prefix(sha256_hash)}..."
-        )
-        sys.exit(1)
-    except ChecksumMismatchError as exc:
-        console.print(
-            "[bold red]Decryption failed:[/bold red] checksum mismatch.\n"
-            f"Expected SHA256 {_id_prefix(exc.expected)}... but got {_id_prefix(exc.actual)}...\n"
-            "The decrypted content does not match the original file.\n"
-            "The encrypted data in S3 may have been corrupted or tampered with."
-        )
-        sys.exit(1)
-    except ConfigurationError as exc:
-        console.print(f"[bold red]Configuration error:[/bold red] {_display(exc)}")
-        sys.exit(1)
-    except KMSError as exc:
-        # Availability or permission, never a statement about the ciphertext.
-        _report_error("KMS error", exc)
-        sys.exit(1)
-    except (ClientError, BotoCoreError) as exc:
-        error_msg = str(exc)
-        if isinstance(exc, ClientError):
-            error_msg = exc.response.get("Error", {}).get("Message", str(exc))
-        console.print(
-            f"[bold red]AWS error during decryption:[/bold red] {_display(error_msg)}\n"
-            f"  File: {_display(record.file_name)}  S3: {_display(record.s3_key)}"
-        )
-        sys.exit(1)
-    except (EnvaultError, OSError) as exc:
-        console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
-        sys.exit(1)
-    finally:
-        if tmp_encrypted is not None:
-            tmp_encrypted.unlink(missing_ok=True)
-        # No-op once published; otherwise zero-overwrites verified plaintext.
-        _best_effort_delete(staging)
+        except ChecksumMismatchError as exc:
+            console.print(
+                "[bold red]Decryption failed:[/bold red] checksum mismatch.\n"
+                f"Expected SHA256 {_id_prefix(exc.expected)}... "
+                f"but got {_id_prefix(exc.actual)}...\n"
+                "The decrypted content does not match the original file.\n"
+                "The encrypted data in S3 may have been corrupted or tampered with."
+            )
+            sys.exit(1)
+        except ConfigurationError as exc:
+            console.print(f"[bold red]Configuration error:[/bold red] {_display(exc)}")
+            sys.exit(1)
+        except KMSError as exc:
+            # Availability or permission, never a statement about the ciphertext.
+            _report_error("KMS error", exc)
+            sys.exit(1)
+        except (ClientError, BotoCoreError) as exc:
+            error_msg = str(exc)
+            if isinstance(exc, ClientError):
+                error_msg = exc.response.get("Error", {}).get("Message", str(exc))
+            console.print(
+                f"[bold red]AWS error during decryption:[/bold red] {_display(error_msg)}\n"
+                f"  File: {_display(record.file_name)}  S3: {_display(record.s3_key)}"
+            )
+            sys.exit(1)
+        except (EnvaultError, OSError) as exc:
+            console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
+            sys.exit(1)
 
     console.print(f"[green]✓[/green] Decrypted → {_display(str(output_path))}")
 
@@ -1049,7 +1274,39 @@ def rotate_key(
             )
         return
 
-    shm_dir = _private_ram_dir()
+    # Plaintext copies live in a private RAM directory where there is one; the
+    # scratch destroys them, and the directory, however rotation ends.
+    with _Scratch() as scratch:
+        _rotate_records(
+            records,
+            scratch,
+            store=store,
+            s3=s3,
+            new_key_id=new_key_id,
+            bucket=bucket,
+            region=region,
+            account_ids=account_ids,
+            latest=latest,
+            audit_ttl_days=audit_ttl_days,
+            correlation_id=correlation_id,
+        )
+
+
+def _rotate_records(
+    records: list[FileRecord],
+    scratch: _Scratch,
+    *,
+    store: StateStore,
+    s3: S3Store,
+    new_key_id: str,
+    bucket: str,
+    region: str,
+    account_ids: list[str],
+    latest: bool,
+    audit_ttl_days: int,
+    correlation_id: str,
+) -> None:
+    shm_dir = scratch.ram_dir()
     if shm_dir is None:
         console.print(
             "[dim yellow]Note: no RAM-backed filesystem available; temporary plaintext is "
@@ -1068,18 +1325,13 @@ def rotate_key(
         tmp_pt: Path | None = None
         tmp_enc: Path | None = None
         try:
-            _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
-            os.close(_fd_dl)
-            tmp_dl = Path(_tmp_dl)
-            _fd_pt, _tmp_pt = tempfile.mkstemp(
-                prefix="envault_pt_", dir=_plaintext_dir(shm_dir, record.file_size_bytes)
+            tmp_dl = scratch.file(prefix="envault_dl_", suffix=".encrypted")
+            tmp_pt = scratch.file(
+                prefix="envault_pt_",
+                directory=_plaintext_dir(shm_dir, record.file_size_bytes),
+                plaintext=True,
             )
-            os.fchmod(_fd_pt, 0o600)
-            os.close(_fd_pt)
-            tmp_pt = Path(_tmp_pt)
-            _fd_enc, _tmp_enc = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
-            os.close(_fd_enc)
-            tmp_enc = Path(_tmp_enc)
+            tmp_enc = scratch.file(prefix="envault_enc_", suffix=".encrypted")
 
             _check_record(record)
             s3.download_file(
@@ -1096,11 +1348,11 @@ def rotate_key(
                 allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
             )
-            tmp_dl.unlink(missing_ok=True)
+            scratch.discard(tmp_dl)
 
             new_ctx = new_key_config.build_encryption_context(record.sha256_hash, record.file_name)
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
-            _best_effort_delete(tmp_pt)
+            scratch.discard(tmp_pt)
 
             # The new ciphertext gets a key of its own; the object the record
             # pinned so far is left exactly as it is (and stays readable with
@@ -1169,15 +1421,8 @@ def rotate_key(
             )
             errors += 1
         finally:
-            if tmp_dl is not None:
-                tmp_dl.unlink(missing_ok=True)
-            if tmp_pt is not None:
-                _best_effort_delete(tmp_pt)
-            if tmp_enc is not None:
-                tmp_enc.unlink(missing_ok=True)
+            scratch.discard(tmp_dl, tmp_pt, tmp_enc)
 
-    if shm_dir is not None:
-        shutil.rmtree(shm_dir, ignore_errors=True)
     console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
     if errors:
         # A partially-rotated corpus means some files are still readable with the
@@ -1414,6 +1659,10 @@ def exec_(
         # Non-UTF-8 / NUL secrets raise here after plaintext is already in sinks.
         _close_all(creds, sinks)
         raise
+    except BaseException:
+        # Interrupted (a signal): nothing is handed over; wipe what we hold.
+        _close_all(creds, sinks)
+        raise
 
     argv = _substitute_paths(list(command), child_env, [var for _, var in file_pairs])
 
@@ -1426,6 +1675,9 @@ def exec_(
     sys.stdout.flush()
     sys.stderr.flush()
 
+    # execve resets envault's own signal handlers to their defaults in the child
+    # (and keeps a SIGHUP the parent ignored, ignored); nothing is blocked.
+    previous_handlers = _default_signals_for_child()
     try:
         # No shell, deliberately: argv is passed through untouched so a secret or
         # filename can never be reinterpreted as shell syntax. execve (rather
@@ -1433,6 +1685,8 @@ def exec_(
         # copy CPython made while decrypting.
         os.execvpe(argv[0], argv, child_env)  # noqa: S606
     except OSError as exc:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         _close_all(creds, [])
         console.print(f"[bold red]Could not run {_display(argv[0])}:[/bold red] {_display(exc)}")
         sys.exit(127)
