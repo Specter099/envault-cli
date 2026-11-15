@@ -11,11 +11,44 @@ updates:
     commit-message:
       prefix: "chore"
 
-  # Keep Python dependencies up to date
+  # Python package: the ranges in pyproject.toml and the hashed lock
+  # requirements/dev.txt that CI installs. Dependabot bumps pins and hashes in
+  # place without re-resolving, so minor and patch updates arrive as one grouped
+  # PR. If CI's locked install fails on such a PR (a transitive conflict, or a
+  # release that dropped Python 3.10), regenerate the lock on the PR branch with
+  # the uv command in pyproject.toml.
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    labels:
+      - "dependencies"
+      - "chore"
+    commit-message:
+      prefix: "chore"
+
+  # CDK app: requirements.txt (deploy-time pins), requirements-dev.txt and the
+  # hashed CI lock requirements-ci.txt (regenerate it with the uv command in
+  # requirements-dev.txt). The aws-cdk CLI is pinned in ci.yml and has to be
+  # raised by hand when a newer aws-cdk-lib needs a newer CLI.
+  - package-ecosystem: "pip"
+    directory: "/infra/cdk"
+    schedule:
+      interval: "weekly"
+    groups:
+      cdk-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     labels:
       - "dependencies"
       - "chore"
