@@ -932,3 +932,49 @@ def test_status_and_audit_label_the_identifier_column_id(
         assert "ID (16)" in result.output
         assert "SHA256" not in result.output
         assert file_id[:16] in result.output
+
+
+# ---------------------------------------------------------------------------
+# Reading verifies with the key the record names, not the configured one
+# ---------------------------------------------------------------------------
+
+
+def test_reading_a_keyed_record_needs_no_configured_id_key(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    file_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+    reader = _without_id_key(env)
+
+    by_name = _run(reader, "decrypt", "pin.txt", "-o", str(tmp_path / "a.txt"))
+    by_id = _run(reader, "decrypt", file_id, "-o", str(tmp_path / "b.txt"))
+    result, rec = _exec(reader, "pin.txt")
+
+    for run in (by_name, by_id, result):
+        assert run.exit_code == 0, run.output
+    assert (tmp_path / "a.txt").read_bytes() == (tmp_path / "b.txt").read_bytes() == PIN
+    assert rec.env is not None and rec.env["SECRET"] == PIN.decode().rstrip("\n")
+
+
+def test_records_keep_verifying_with_their_own_key_after_the_id_key_changes(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """A new ID key names new files differently; older records still name theirs."""
+    old_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+    new_key_arn = create_id_key(alias="alias/envault-id-2")
+    switched = {**env, "ENVAULT_ID_KEY_ID": "alias/envault-id-2"}
+
+    old = _run(switched, "decrypt", "pin.txt", "-o", str(tmp_path / "old.txt"))
+    (tmp_path / "db.env").write_bytes(OTHER)
+    new = _run(switched, "encrypt", str(tmp_path / "db.env"))
+    by_sha = _run(switched, "decrypt", _sha256(PIN), "-o", str(tmp_path / "x.txt"))
+
+    assert old.exit_code == 0, old.output
+    assert (tmp_path / "old.txt").read_bytes() == PIN
+    assert new.exit_code == 0, new.output
+    new_row = _current(file_id_of(OTHER, alias="alias/envault-id-2"))
+    assert new_row["id_key_arn"] == new_key_arn
+    assert _current(old_id)["id_key_arn"] != new_key_arn
+    # A SHA-256 is mapped with the configured key only: older files are found
+    # by name or by their identifier.
+    assert by_sha.exit_code == 1
+    assert "No record found" in by_sha.output
