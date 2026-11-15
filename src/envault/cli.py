@@ -11,10 +11,11 @@ import sys
 import tempfile
 import unicodedata
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import boto3
@@ -88,15 +89,6 @@ def _display(value: object) -> str:
             for ch in text
         )
     return escape(text)
-
-
-def _id_prefix(identifier: object) -> str:
-    """Short form of a file identifier for messages and tables (first 16 characters).
-
-    The one place that decides how identifiers are shown to the operator.
-    Identifiers read from DynamoDB are untrusted, so the prefix is escaped.
-    """
-    return _display(str(identifier)[:16])
 
 
 def _is_logger(name: str, family: str) -> bool:
@@ -233,16 +225,15 @@ _audit_ttl_option = click.option(
 
 
 @contextmanager
-def _exit_on_error() -> Iterator[None]:
+def _exit_on_error(headline: str = "Error") -> Iterator[None]:
     """Turn AWS and envault errors into a one-line message and exit status 1."""
     try:
         yield
     except (ClientError, BotoCoreError) as exc:
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(f"[bold red]AWS error:[/bold red] {_display(msg)}")
+        _report_error("AWS error", exc)
         sys.exit(1)
     except EnvaultError as exc:
-        console.print(f"[bold red]Error:[/bold red] {_display(exc)}")
+        _report_error(headline, exc)
         sys.exit(1)
 
 
@@ -286,19 +277,19 @@ def encrypt(
         return
 
     errors = 0
-    for file_path in track(files, description="Encrypting..."):
+    for item in track(files, description="Encrypting..."):
         try:
             file_correlation_id = f"{correlation_id}/{uuid.uuid4()}"
-            _encrypt_one(file_path, config, tags, store, s3, file_correlation_id, force)
+            _encrypt_one(item, config, tags, store, s3, file_correlation_id, force)
         except AlreadyEncryptedError:
             console.print(
-                f"[yellow]⏭[/yellow] {_display(file_path.name)} already ENCRYPTED "
+                f"[yellow]⏭[/yellow] {_display(item.name)} already ENCRYPTED "
                 "(use --force to re-encrypt)"
             )
         except (EnvaultError, ClientError, BotoCoreError) as exc:
-            console.print(f"[red]✗[/red] {_display(file_path.name)}: {_display(exc)}")
+            console.print(f"[red]✗[/red] {_display(item.name)}: {_display(exc)}")
             # The ✗ line is the report; the traceback is for -v only.
-            logger.debug("Failed to encrypt %s", file_path, exc_info=True)
+            logger.debug("Failed to encrypt %s", item.path, exc_info=True)
             errors += 1
 
     if errors:
@@ -307,7 +298,7 @@ def encrypt(
 
 
 def _encrypt_one(
-    file_path: Path,
+    item: _CollectedFile,
     config: Config,
     tags: dict[str, str],
     store: StateStore,
@@ -315,18 +306,21 @@ def _encrypt_one(
     correlation_id: str,
     force: bool,
 ) -> None:
+    file_path, name = item.path, item.name
     sha256 = sha256_file(file_path)
 
     existing = store.get_current_state(sha256)
     if existing and existing.current_state == ENCRYPTED and not force:
-        raise AlreadyEncryptedError(sha256_hash=sha256, file_name=file_path.name)
+        raise AlreadyEncryptedError(sha256_hash=sha256, file_name=name)
 
     _fd, _tmp = tempfile.mkstemp(suffix=".encrypted", prefix="envault_enc_")
     os.close(_fd)
     tmp_encrypted = Path(_tmp)
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Microseconds: versions of one name are ordered by this, and two files
+    # encrypted within the same second must not tie.
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     # enc_context uses the pre-read hash; it will be validated against result.sha256_hash below
-    enc_context = config.build_encryption_context(sha256, file_path.name)
+    enc_context = config.build_encryption_context(sha256, name)
 
     try:
         result = encrypt_file(
@@ -339,20 +333,21 @@ def _encrypt_one(
 
         if sha256 != result.sha256_hash:
             raise EnvaultError(
-                f"File {file_path.name!r} was modified during encryption "
+                f"File {name!r} was modified during encryption "
                 f"(pre-read hash {_id_prefix(sha256)}… != encrypted hash "
                 f"{_id_prefix(result.sha256_hash)}…). "
                 "Aborting to avoid storing mismatched metadata."
             )
 
-        s3_key = s3.s3_key_for_file(sha256_hash=result.sha256_hash, file_name=file_path.name)
+        # The key's name part is the sanitized basename of the stored name.
+        s3_key = s3.s3_key_for_file(sha256_hash=result.sha256_hash, file_name=name)
         version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
 
     record = FileRecord(
         sha256_hash=result.sha256_hash,
-        file_name=file_path.name,
+        file_name=name,
         current_state=ENCRYPTED,
         s3_key=s3_key,
         s3_version_id=version_id,
@@ -385,12 +380,12 @@ def _encrypt_one(
                 "s3_key": s3_key,
                 "s3_version_id": version_id,
                 "bucket": config.bucket,
-                "file_name": file_path.name,
+                "file_name": name,
             },
         )
         raise
     console.print(
-        f"[green]✓[/green] {_display(file_path.name)} → s3://{_display(config.bucket)}/{_display(s3_key)}"
+        f"[green]✓[/green] {_display(name)} → s3://{_display(config.bucket)}/{_display(s3_key)}"
     )
 
 
@@ -416,10 +411,10 @@ def _encrypt_one(
 @click.option(
     "--version",
     "version",
-    type=int,
-    default=1,
-    show_default=True,
-    help="Which version to decrypt when multiple exist (1=most recent).",
+    type=click.IntRange(min=1),
+    default=None,
+    help="When several files are stored under the same name, which one: "
+    "1 = most recent (the default), 2 = the one before, and so on.",
 )
 @click.option(
     "--allowed-account-ids",
@@ -440,35 +435,35 @@ def decrypt(
     table: str,
     bucket: str,
     region: str,
-    version: int,
+    version: int | None,
     allowed_account_ids: str,
     latest: bool,
     audit_ttl_days: int,
 ) -> None:
-    """Decrypt a file by SHA256 hash or filename.
+    """Decrypt a file by SHA256 hash or stored name.
 
-    IDENTIFIER is a 64-char SHA256 hash or the original filename.
-    When a filename matches multiple versions, use --version N to pick one.
+    IDENTIFIER is a 64-char SHA256 hash or the name the file was stored under:
+    its path relative to the directory given to encrypt (prod/db.env), or its
+    basename when that is unambiguous. When several files are stored under the
+    same name, use --version N to pick one.
     """
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
     account_ids = _validate_account_ids(allowed_account_ids)
 
-    record = _resolve_identifier(identifier, version, store)
+    with _exit_on_error("Decryption error"):
+        selection = _resolve_identifier(identifier, store, version=version)
+        record = selection.record
+        _check_record(record)
     sha256_hash = record.sha256_hash
-    try:
-        assert_s3_key_matches_hash(record.s3_key, sha256_hash)
-    except EnvaultError as exc:
-        console.print(f"[bold red]Decryption error:[/bold red] {_display(exc)}")
-        sys.exit(1)
 
     if output.is_dir():
         safe_name = Path(record.file_name).name
         # The name comes from DynamoDB: no hidden files, no control or
         # invisible characters in a name the operator's tools will print.
         if not safe_name or safe_name.startswith(".") or _has_unsafe_characters(safe_name):
-            safe_name = f"decrypted_{sha256_hash[:16]}"
+            safe_name = _fallback_output_name(record)
         output_path = output / safe_name
     else:
         output_path = output
@@ -503,7 +498,7 @@ def decrypt(
         decrypt_file(
             input_path=tmp_encrypted,
             output_path=staging,
-            expected_sha256=sha256_hash,
+            expected_sha256=selection.expected_sha256,
             region=region,
             allowed_account_ids=account_ids,
             expected_context=record.encryption_context,
@@ -1033,7 +1028,7 @@ def rotate_key(
             os.close(_fd_enc)
             tmp_enc = Path(_tmp_enc)
 
-            assert_s3_key_matches_hash(record.s3_key, record.sha256_hash)
+            _check_record(record)
             s3.download_file(
                 record.s3_key,
                 tmp_dl,
@@ -1283,23 +1278,23 @@ def exec_(
     accessed: list[FileRecord] = []
     try:
         for identifier, var in env_pairs:
-            record = _resolve_identifier(identifier, 1, store)
+            selection = _resolve_identifier(identifier, store, newest_only=True)
             sink = _BufferSink()
             sinks.append(sink)
-            _stream_secret(record, sink, s3, region, account_ids, allow_latest=latest)
+            _stream_secret(selection, sink, s3, region, account_ids, allow_latest=latest)
             child_env[var] = _decode_secret(sink.buf, identifier)
-            accessed.append(record)
+            accessed.append(selection.record)
 
         for identifier, var in file_pairs:
-            record = _resolve_identifier(identifier, 1, store)
+            selection = _resolve_identifier(identifier, store, newest_only=True)
             cred = CredentialFd(var)
             creds.append(cred)
             with cred.writer() as out:
-                _stream_secret(record, out, s3, region, account_ids, allow_latest=latest)
+                _stream_secret(selection, out, s3, region, account_ids, allow_latest=latest)
             # Sealed only after the checksum and encryption context verified.
             cred.seal()
             child_env[var] = cred.child_path
-            accessed.append(record)
+            accessed.append(selection.record)
             if cred.backing != "memfd":
                 console.print(
                     "[yellow]Note:[/yellow] anonymous memory files are unavailable on this "
@@ -1335,11 +1330,8 @@ def exec_(
         sys.exit(1)
     except (EnvaultError, ClientError, BotoCoreError) as exc:
         _close_all(creds, sinks)
-        msg = exc.response["Error"]["Message"] if isinstance(exc, ClientError) else str(exc)
-        console.print(
-            f"[bold red]Refusing to run:[/bold red] {_display(msg)}\n"
-            "No command was started and no secrets were delivered."
-        )
+        _report_error("Refusing to run", exc)
+        console.print("No command was started and no secrets were delivered.")
         sys.exit(1)
     except click.UsageError:
         # Non-UTF-8 / NUL secrets raise here after plaintext is already in sinks.
@@ -1377,7 +1369,7 @@ def _close_all(creds: list[CredentialFd], sinks: list[_BufferSink]) -> None:
 
 
 def _stream_secret(
-    record: FileRecord,
+    selection: _Selection,
     out: Any,
     s3: S3Store,
     region: str,
@@ -1386,7 +1378,8 @@ def _stream_secret(
     allow_latest: bool = False,
 ) -> None:
     """Fetch a record's ciphertext and decrypt it into ``out``, verifying first."""
-    assert_s3_key_matches_hash(record.s3_key, record.sha256_hash)
+    record = selection.record
+    _check_record(record)
     ciphertext = s3.download_to_memory(
         record.s3_key,
         _s3_version_id(record, allow_latest),
@@ -1395,7 +1388,7 @@ def _stream_secret(
     decrypt_to_stream(
         ciphertext,
         out,
-        expected_sha256=record.sha256_hash,
+        expected_sha256=selection.expected_sha256,
         expected_context=record.encryption_context,
         region=region,
         allowed_account_ids=account_ids,
@@ -1470,7 +1463,6 @@ def _short_principal(arn: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TAG_KEY_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 _TAG_VALUE_MAX_LEN = 256
 
@@ -1577,6 +1569,33 @@ def _confine_migration_path(input_path: str, import_root: Path | None) -> Path:
     return resolved
 
 
+def _validate_date(value: str) -> str:
+    """Validate a YYYY-MM-DD date string."""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        console.print(
+            f"[red]Invalid date: {_display(repr(value))}. Expected format: YYYY-MM-DD.[/red]"
+        )
+        sys.exit(1)
+    return value
+
+
+# ---------------------------------------------------------------------------
+# File identifiers
+#
+# Everything the CLI does with a file identifier is in this section:
+# recognising one on the command line, resolving IDENTIFIER (an identifier or
+# a stored name) to a record, checking a record against the identifier it was
+# looked up by and against its S3 key, and the short form shown to operators.
+# Today the identifier is the SHA-256 of the plaintext; another scheme changes
+# these helpers, not the commands.
+# ---------------------------------------------------------------------------
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def _validate_sha256(value: str) -> str:
     """Validate a SHA256 hash string. Exit with error if invalid."""
     if not _is_sha256(value):
@@ -1593,63 +1612,181 @@ def _is_sha256(value: str) -> bool:
     return bool(_SHA256_RE.fullmatch(value))
 
 
-def _validate_date(value: str) -> str:
-    """Validate a YYYY-MM-DD date string."""
-    try:
-        datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        console.print(
-            f"[red]Invalid date: {_display(repr(value))}. Expected format: YYYY-MM-DD.[/red]"
+def _id_prefix(identifier: object) -> str:
+    """Short form of a file identifier for messages and tables (first 16 characters).
+
+    The one place that decides how identifiers are shown to the operator.
+    Identifiers read from DynamoDB are untrusted, so the prefix is escaped.
+    """
+    return _display(str(identifier)[:16])
+
+
+def _fallback_output_name(record: FileRecord) -> str:
+    """Output file name when a record's stored name cannot be used as one."""
+    return f"decrypted_{record.sha256_hash[:16]}"
+
+
+def _check_record(record: FileRecord) -> None:
+    """Refuse a row whose identifier or S3 key is not well formed.
+
+    Rows come from DynamoDB, which any principal with write access can edit. The
+    identifier ends up in the expected checksum and in file names, and the key
+    decides which object is fetched.
+
+    Raises:
+        _IdentifierError: The identifier is not 64 lowercase hex characters.
+        InvalidS3KeyError: The key is not this identifier's content-addressed path.
+    """
+    if not _is_sha256(record.sha256_hash):
+        raise _IdentifierError(
+            f"The record for {record.file_name!r} has a malformed identifier; refusing to use it."
         )
-        sys.exit(1)
-    return value
+    assert_s3_key_matches_hash(record.s3_key, record.sha256_hash, message_id=record.message_id)
+
+
+class _IdentifierError(EnvaultError):
+    """IDENTIFIER matched no record, several, or a row that contradicts it.
+
+    ``candidates`` are the records an operator can choose between, listed under
+    the message; ``numbered`` lists them with their --version numbers.
+    """
+
+    def __init__(
+        self, message: str, candidates: Sequence[FileRecord] = (), *, numbered: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.candidates = tuple(candidates)
+        self.numbered = numbered
+
+
+@dataclass(frozen=True)
+class _Selection:
+    """The record IDENTIFIER resolved to, and the identifier its plaintext must have."""
+
+    record: FileRecord
+    expected_sha256: str
 
 
 def _resolve_identifier(
     identifier: str,
-    version: int,
     store: StateStore,
-) -> FileRecord:
-    """Resolve an identifier (SHA256 or filename) to a FileRecord.
+    *,
+    version: int | None = None,
+    newest_only: bool = False,
+) -> _Selection:
+    """Resolve IDENTIFIER (an identifier or a stored file name) to one record.
 
-    For SHA256: direct lookup via get_current_state().
-    For filename: query by file_name, return Nth most recent version.
-    Exits with error if not found or version out of range.
+    An identifier must find a row that says it is about that identifier, and
+    the plaintext is then checked against the identifier the operator typed,
+    never against what the row claims. Name lookups have no such anchor: they
+    trust every principal that can write to the table.
+
+    A name is matched exactly against stored names first. Only when nothing is
+    stored under exactly that name, and the name has no directory part, do
+    stored paths with that basename match (rows written before stored names
+    became relative paths hold a bare basename). Matches spanning more than one
+    stored name are ambiguous and refused. Several records under one exact name
+    are versions, newest first by ``encrypted_at`` read as a time: --version
+    picks one (default: the newest). If the newest two have the same
+    timestamp, which one is newest is unknown: with ``newest_only`` (exec) or
+    without an explicit ``version`` the lookup is refused.
+
+    Raises:
+        _IdentifierError: Nothing matches, the match is ambiguous, or the row
+            stored under an identifier describes another file.
     """
     if _is_sha256(identifier):
         record = store.get_current_state(identifier)
-        if not record:
-            console.print(f"[red]No record found for hash {_id_prefix(identifier)}...[/red]")
-            sys.exit(1)
-        return record
+        if record is None:
+            raise _IdentifierError(f"No record found for hash {identifier[:16]}...")
+        if record.sha256_hash != identifier:
+            raise _IdentifierError(
+                f"The record stored under {identifier[:16]}... describes a different file "
+                f"({str(record.sha256_hash)[:16]}...). Refusing to use it: the state table "
+                "may have been tampered with."
+            )
+        return _Selection(record, expected_sha256=identifier)
 
-    # Filename lookup
-    records = store.list_by_file_name(identifier, ENCRYPTED)
-    if not records:
-        console.print(
-            f"[red]No encrypted files found with name {_display(repr(identifier))}.[/red]"
+    candidates = _records_named(identifier, store)
+    if not candidates:
+        raise _IdentifierError(f"No encrypted files found with name {identifier!r}.")
+    versions = _newest_first(candidates)
+    if len({r.file_name for r in candidates}) > 1:
+        raise _IdentifierError(
+            f"The name {identifier!r} is ambiguous: it matches {len(versions)} files stored "
+            "under different names. Use the full stored name or the identifier:",
+            versions,
         )
-        sys.exit(1)
-
-    if version < 1 or version > len(records):
-        console.print(
-            f"[red]Version {version} out of range. "
-            f"Found {len(records)} version(s) of"
-            f" {_display(repr(identifier))}.[/red]"
+    tie = len(versions) > 1 and _encrypted_at(versions[0]) == _encrypted_at(versions[1])
+    if tie and (newest_only or version is None):
+        how = "Use the identifier" if newest_only else "Pass --version N to choose one"
+        raise _IdentifierError(
+            f"The newest versions of {identifier!r} were encrypted at the same time, so "
+            f"which one is current is unknown. {how}:",
+            versions,
+            numbered=not newest_only,
         )
-        sys.exit(1)
-
-    if len(records) > 1:
-        selected = records[version - 1]
-        label = "most recent" if version == 1 else f"version {version}"
-        console.print(
-            f"[dim]{len(records)} versions found. "
-            f"Decrypting {label} "
-            f"({_display(selected.encrypted_at)}). "
-            f"Use --version N to pick another.[/dim]"
+    index = 1 if newest_only or version is None else version
+    if index > len(versions):
+        raise _IdentifierError(
+            f"Version {index} out of range. Found {len(versions)} version(s) of {identifier!r}."
         )
+    selected = versions[index - 1]
+    if len(versions) > 1:
+        label = "most recent" if index == 1 else f"version {index}"
+        hint = "" if newest_only else " Use --version N to pick another."
+        console.print(
+            f"[dim]{len(versions)} versions found. Using {label} "
+            f"({_display(selected.encrypted_at)}).{hint}[/dim]"
+        )
+    return _Selection(selected, expected_sha256=selected.sha256_hash)
 
-    return records[version - 1]
+
+def _records_named(name: str, store: StateStore) -> list[FileRecord]:
+    """ENCRYPTED records stored under ``name``, else (bare names only) under that basename."""
+    exact = store.list_by_file_name(name, ENCRYPTED)
+    if exact or "/" in name:
+        return exact
+    return [r for r in store.list_by_state(ENCRYPTED) if PurePosixPath(r.file_name).name == name]
+
+
+_UNKNOWN_TIME = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _encrypted_at(record: FileRecord) -> datetime:
+    """``encrypted_at`` as a time; rows predating microsecond timestamps compare correctly."""
+    value = record.encrypted_at
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return _UNKNOWN_TIME
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _newest_first(records: Iterable[FileRecord]) -> list[FileRecord]:
+    """Newest first by ``encrypted_at``; ties ordered by identifier, so --version N is stable."""
+    return sorted(records, key=lambda r: (_encrypted_at(r), r.sha256_hash), reverse=True)
+
+
+def _error_message(exc: BaseException) -> str:
+    """One line for an error: AWS's own message for a ClientError, else the text."""
+    if isinstance(exc, ClientError):
+        return str(exc.response.get("Error", {}).get("Message") or exc)
+    return str(exc)
+
+
+def _report_error(headline: str, exc: BaseException) -> None:
+    """Print ``headline: message``, plus the records to choose from for an identifier error."""
+    console.print(f"[bold red]{headline}:[/bold red] {_display(_error_message(exc))}")
+    if isinstance(exc, _IdentifierError):
+        for number, record in enumerate(exc.candidates, start=1):
+            label = f"--version {number}  " if exc.numbered else ""
+            console.print(
+                f"  {label}{_id_prefix(record.sha256_hash)}  {_display(record.file_name)}"
+                f"  {_display(record.encrypted_at)}"
+            )
 
 
 _ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
@@ -1674,21 +1811,33 @@ def _validate_account_ids(raw: str) -> list[str]:
     return account_ids
 
 
-def _collect_files(path: Path) -> list[Path]:
-    """Return regular files under ``path``, never following directory or file symlinks."""
+@dataclass(frozen=True)
+class _CollectedFile:
+    """A regular file selected for encryption, and the name it is stored under."""
+
+    path: Path
+    #: The file's path relative to the directory given to encrypt, with "/"
+    #: separators (its basename when a single file was given). Two files with
+    #: the same basename in different directories stay distinguishable.
+    name: str
+
+
+def _collect_files(path: Path) -> list[_CollectedFile]:
+    """Regular files under ``path``, never following directory or file symlinks."""
     if path.is_symlink():
         return []
     if path.is_file():
-        return [path]
-    files: list[Path] = []
+        return [_CollectedFile(path=path, name=path.name)]
+    files: list[_CollectedFile] = []
     for root, dirnames, filenames in os.walk(path, followlinks=False):
         # os.walk(followlinks=False) still lists symlink directories; drop them
         # so we never encrypt a tree the operator did not intend to include.
-        dirnames[:] = [d for d in dirnames if not Path(root, d).is_symlink()]
-        for name in filenames:
-            candidate = Path(root) / name
+        dirnames[:] = sorted(d for d in dirnames if not Path(root, d).is_symlink())
+        for filename in sorted(filenames):
+            candidate = Path(root) / filename
             if candidate.is_file() and not candidate.is_symlink():
-                files.append(candidate)
+                name = candidate.relative_to(path).as_posix()
+                files.append(_CollectedFile(path=candidate, name=name))
     return files
 
 
