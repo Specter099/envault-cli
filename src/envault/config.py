@@ -21,6 +21,19 @@ boto_config = BotoConfig(
 )
 
 
+def partition_for_region(region: str) -> str:
+    """The AWS partition of ``region``, so GovCloud and China are not excluded.
+
+    Decryption trusts KMS keys only in this partition (and in the allowed
+    accounts), for data keys and identifier keys alike.
+    """
+    if region.startswith("us-gov-"):
+        return "aws-us-gov"
+    if region.startswith("cn-"):
+        return "aws-cn"
+    return "aws"
+
+
 @dataclass
 class Config:
     """Settings needed to encrypt a file, resolved from CLI options / ENVAULT_* vars."""

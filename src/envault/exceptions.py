@@ -45,6 +45,36 @@ class ChecksumMismatchError(EnvaultError):
         )
 
 
+class FileIdMismatchError(ChecksumMismatchError):
+    """The decrypted plaintext does not have the record's keyed identifier.
+
+    KMS VerifyMac says ``file_id`` is not the HMAC of the plaintext's SHA-256
+    under the record's identifier key: the ciphertext was substituted or the
+    record altered. An integrity failure, like any checksum mismatch; the
+    plaintext is never published, sealed or re-encrypted. The message names
+    the expected identifier (a keyed value, safe to show), never the
+    plaintext's hash.
+    """
+
+    def __init__(self, file_id: str) -> None:
+        super().__init__(
+            expected=file_id,
+            message=(
+                f"Checksum mismatch: the decrypted content is not file {file_id[:16]}...; "
+                "its keyed identifier does not verify."
+            ),
+        )
+
+
+class UntrustedIdKeyError(EnvaultError):
+    """A record names an identifier key envault does not trust.
+
+    The record's ``id_key_arn`` is not a KMS key ARN, or names a key outside
+    the partition or the trusted accounts (``ENVAULT_ALLOWED_ACCOUNT_IDS``).
+    Raised before any KMS call is made with it.
+    """
+
+
 class DecryptionError(EnvaultError):
     """Raised when a ciphertext fails integrity or trust checks on decryption.
 
@@ -60,7 +90,10 @@ class DecryptionError(EnvaultError):
 
 
 class KMSError(EnvaultError):
-    """KMS did not complete a data-key request: GenerateDataKey on encrypt, Decrypt on decrypt.
+    """KMS did not complete a request: a data-key request or a file-identifier MAC.
+
+    Data keys: GenerateDataKey on encrypt, Decrypt on decrypt. File
+    identifiers (:mod:`envault.fileid`): GenerateMac, VerifyMac.
 
     Throttling, KMS internal errors and unreachable endpoints are transient. Access
     denied, a disabled key or one pending deletion are not. In neither case
@@ -70,8 +103,8 @@ class KMSError(EnvaultError):
     plaintext or key material.
 
     Attributes:
-        operation: KMS API operation that failed: "GenerateDataKey", "Encrypt"
-            or "Decrypt".
+        operation: KMS API operation that failed: "GenerateDataKey", "Encrypt",
+            "Decrypt", "GenerateMac" or "VerifyMac".
         error_code: AWS error code (e.g. "AccessDeniedException"), or the
             botocore exception class name for a network failure.
         transient: True if a later attempt may succeed (throttling, 5xx,

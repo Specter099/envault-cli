@@ -28,7 +28,7 @@ from aws_encryption_sdk.exceptions import (
 from botocore.exceptions import ClientError
 from cryptography.exceptions import InvalidTag
 
-from envault.config import boto_config
+from envault.config import boto_config, partition_for_region
 from envault.exceptions import (
     ChecksumMismatchError,
     ConfigurationError,
@@ -252,7 +252,7 @@ def _decrypt_failure(
                 DecryptionError(
                     "Failed to decrypt: no encrypted data key in the message belongs to a KMS "
                     f"key in the trusted account(s) {', '.join(allowed_account_ids)} "
-                    f"({_partition_for_region(region)} partition), so KMS was never asked "
+                    f"({partition_for_region(region)} partition), so KMS was never asked "
                     f"({detail}). The ciphertext may have been substituted or tampered with, "
                     "or ENVAULT_ALLOWED_ACCOUNT_IDS lacks the account that encrypted it."
                 ),
@@ -562,20 +562,16 @@ def _discovery_key_provider(
     return DiscoveryAwsKmsMasterKeyProvider(
         discovery_filter=DiscoveryFilter(
             account_ids=tuple(allowed_account_ids),
-            partition=_partition_for_region(region),
+            partition=partition_for_region(region),
         ),
         region_names=[region],
         botocore_session=_kms_session(recorder),
     )
 
 
-def _partition_for_region(region: str) -> str:
-    """Map an AWS region to its partition so GovCloud and China aren't excluded."""
-    if region.startswith("us-gov-"):
-        return "aws-us-gov"
-    if region.startswith("cn-"):
-        return "aws-cn"
-    return "aws"
+#: Kept under its earlier private name; the function lives in envault.config,
+#: shared with the identifier-key checks in envault.fileid.
+_partition_for_region = partition_for_region
 
 
 def _rewind_point(source: BinaryIO) -> int | None:
