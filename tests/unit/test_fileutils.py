@@ -219,3 +219,73 @@ def test_open_regular_nofollow_message_escapes_control_characters(tmp_path: Path
     with pytest.raises(UnsafeFileError) as exc_info:
         open_regular_nofollow(evil)
     assert "\x1b" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Swap races: the checks after lstat() must hold on their own
+# ---------------------------------------------------------------------------
+
+
+def _stat_as_seen_before_the_swap(target: Path):
+    """An os.lstat stand-in that reports ``target``'s stat, as if called pre-swap."""
+    real_lstat = os.lstat
+    snapshot = real_lstat(target)
+
+    def lstat(path, *args, **kwargs):
+        return snapshot if os.fspath(path) != os.fspath(target) else real_lstat(path)
+
+    return lstat
+
+
+def test_open_regular_nofollow_refuses_a_symlink_swapped_in_after_lstat(tmp_path: Path) -> None:
+    """O_NOFOLLOW, not the lstat pre-check, is what stops a late swap."""
+    from unittest.mock import patch
+
+    from envault.exceptions import UnsafeFileError
+    from envault.fileutils import open_regular_nofollow
+
+    private = tmp_path / "victim_private_key"
+    private.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    entry = tmp_path / "notes.txt"
+    entry.symlink_to(private)
+
+    with patch("envault.fileutils.os.lstat", _stat_as_seen_before_the_swap(private)):
+        with pytest.raises(UnsafeFileError, match="symbolic link"):
+            open_regular_nofollow(entry)
+
+
+def test_best_effort_delete_never_writes_through_a_symlink_swapped_in_after_lstat(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import patch
+
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious, not ours")
+    staging = tmp_path / "staging"
+    staging.symlink_to(victim)
+
+    with patch("envault.fileutils.os.lstat", _stat_as_seen_before_the_swap(victim)):
+        best_effort_delete(staging)
+
+    assert victim.read_bytes() == b"precious, not ours"
+    assert not staging.is_symlink()
+
+
+def test_best_effort_delete_checks_the_inode_it_writes_to(tmp_path: Path) -> None:
+    """A different file behind the write handle (swap after the probe) is never zeroed."""
+    import io
+    from unittest.mock import patch
+
+    staging = tmp_path / "staging"
+    staging.write_bytes(SECRET)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious, not ours")
+
+    def open_the_victim_instead(self, *args, **kwargs):
+        return io.open(victim, *args, **kwargs)  # noqa: UP020 - Path.open stand-in
+
+    with patch.object(Path, "open", open_the_victim_instead):
+        best_effort_delete(staging)
+
+    assert victim.read_bytes() == b"precious, not ours"
+    assert not staging.exists()
