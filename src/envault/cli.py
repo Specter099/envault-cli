@@ -13,7 +13,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -660,22 +660,52 @@ def _print_records(records: list[FileRecord]) -> None:
 # ---------------------------------------------------------------------------
 
 
+# One date-index query per day: a range is bounded so a typo cannot turn one
+# command into thousands of queries. Audit events expire after
+# ENVAULT_AUDIT_TTL_DAYS (365 by default) anyway.
+_AUDIT_MAX_DAYS = 366
+
+
+def _utc_today() -> date:
+    """Today's date in UTC, the calendar the audit trail's ``date`` attribute uses."""
+    return datetime.now(timezone.utc).date()
+
+
 @main.command()
 @click.option("--file", "sha256_hash", default=None, help="Hash of a specific file.")
-@click.option("--since", default=None, help="Date filter YYYY-MM-DD (uses date-index GSI).")
+@click.option(
+    "--since",
+    default=None,
+    help="First day to show, YYYY-MM-DD (UTC, inclusive).",
+)
+@click.option(
+    "--until",
+    default=None,
+    help="Last day to show, YYYY-MM-DD (UTC, inclusive). Default: today. Needs --since.",
+)
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
-def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -> None:
-    """Show the full event history."""
+def audit(
+    sha256_hash: str | None, since: str | None, until: str | None, table: str, region: str
+) -> None:
+    """Show the audit trail, oldest event first.
+
+    --file shows one file's events; --since/--until limit them to a range of
+    UTC days. Without --file, every event in the range is shown (--since is
+    then required). A range may span at most 366 days.
+    """
     with _exit_on_error():
+        window = _audit_window(since, until)
         store = StateStore(table_name=table, region=region)
 
         if sha256_hash:
             _validate_sha256(sha256_hash)
             events = store.list_events_for_file(sha256_hash)
-        elif since:
-            _validate_date(since)
-            events = store.list_events_by_date(since)
+            if window is not None:
+                first, last = (day.isoformat() for day in window)
+                events = [e for e in events if first <= str(e.get("date", "")) <= last]
+        elif window is not None:
+            events = store.list_events_between(*window, max_days=_AUDIT_MAX_DAYS)
         else:
             console.print("[yellow]Provide --file or --since.[/yellow]")
             sys.exit(1)
@@ -705,6 +735,31 @@ def audit(sha256_hash: str | None, since: str | None, table: str, region: str) -
                 _display(str(e.get("correlation_id", ""))[:8]),
             )
         console.print(t)
+
+
+def _audit_window(since: str | None, until: str | None) -> tuple[date, date] | None:
+    """Validate --since/--until into an inclusive range of UTC days, or None."""
+    if since is None:
+        if until is not None:
+            raise click.UsageError("--until needs --since.")
+        return None
+    first = _parse_day(since)
+    last = _parse_day(until) if until is not None else _utc_today()
+    if first > last:
+        bound = f"--until {last.isoformat()}" + (" (today, UTC)" if until is None else "")
+        raise click.UsageError(f"--since {first.isoformat()} is after {bound}.")
+    span = (last - first).days + 1
+    if span > _AUDIT_MAX_DAYS:
+        raise click.UsageError(
+            f"--since/--until span {span} days; audit reads one day at a time and "
+            f"accepts at most {_AUDIT_MAX_DAYS}. Narrow the range."
+        )
+    return first, last
+
+
+def _parse_day(value: str) -> date:
+    """Parse a YYYY-MM-DD option value (exits with a message if malformed)."""
+    return datetime.strptime(_validate_date(value), "%Y-%m-%d").date()
 
 
 # ---------------------------------------------------------------------------
