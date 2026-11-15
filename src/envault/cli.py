@@ -369,9 +369,13 @@ def _encrypt_fd(
                 "Aborting to avoid storing mismatched metadata."
             )
 
-        # The key's name part is the sanitized basename of the stored name.
-        s3_key = s3.s3_key_for_file(sha256_hash=result.sha256_hash, file_name=name)
-        version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key)
+        # A key of its own for every upload (it embeds the message id), written
+        # only if nothing is there: no upload can make the version another
+        # record pins noncurrent. The name part is the stored name's basename.
+        s3_key = s3.s3_key_for_file(
+            sha256_hash=result.sha256_hash, file_name=name, message_id=result.message_id
+        )
+        version_id = s3.upload_file(local_path=tmp_encrypted, s3_key=s3_key, if_none_match=True)
     finally:
         tmp_encrypted.unlink(missing_ok=True)
 
@@ -395,6 +399,22 @@ def _encrypt_fd(
             record,
             expected_last_updated=existing.last_updated if existing else None,
         )
+    except Exception:
+        # Typically a concurrent encrypt of the same content won the
+        # conditional write. Its record pins its own key, untouched by ours.
+        logger.error(
+            "State write failed after S3 upload. The uploaded object is an orphan: no "
+            "record points to it, and it can be deleted.",
+            extra={
+                "sha256": sha256,
+                "s3_key": s3_key,
+                "s3_version_id": version_id,
+                "bucket": config.bucket,
+                "file_name": name,
+            },
+        )
+        raise
+    try:
         store.put_event(
             record,
             operation="ENCRYPT",
@@ -404,14 +424,9 @@ def _encrypt_fd(
         )
     except Exception:
         logger.error(
-            "State write failed after S3 upload. Manual recovery may be needed.",
-            extra={
-                "sha256": sha256,
-                "s3_key": s3_key,
-                "s3_version_id": version_id,
-                "bucket": config.bucket,
-                "file_name": name,
-            },
+            "The file was encrypted and its record written, but its ENCRYPT audit event "
+            "could not be recorded.",
+            extra={"s3_key": s3_key, "bucket": config.bucket, "file_name": name},
         )
         raise
     console.print(
@@ -1079,15 +1094,23 @@ def rotate_key(
             new_result = encrypt_file(tmp_pt, new_key_id, new_ctx, tmp_enc, region)
             _best_effort_delete(tmp_pt)
 
-            new_version_id = s3.upload_file(tmp_enc, record.s3_key)
+            # The new ciphertext gets a key of its own; the object the record
+            # pinned so far is left exactly as it is (and stays readable with
+            # the old key until that key is disabled).
+            new_s3_key = s3.s3_key_for_file(
+                record.sha256_hash, record.file_name, message_id=new_result.message_id
+            )
+            new_version_id = s3.upload_file(tmp_enc, new_s3_key, if_none_match=True)
 
             original_last_updated = record.last_updated
             old_kms_key = record.kms_key_id
-            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            old_s3_key = record.s3_key
+            now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
             record.kms_key_id = new_key_id
             record.encryption_context = new_ctx
             record.algorithm = new_result.algorithm
             record.message_id = new_result.message_id
+            record.s3_key = new_s3_key
             record.s3_version_id = new_version_id
             record.last_updated = now
             # Legacy records land back in ENCRYPTED: the ciphertext is present,
@@ -1095,6 +1118,23 @@ def rotate_key(
             record.current_state = ENCRYPTED
             try:
                 store.put_current_state(record, expected_last_updated=original_last_updated)
+            except Exception:
+                logger.error(
+                    "State write failed after S3 re-upload during key rotation. The new "
+                    "object is an orphan: the record still points to the old, intact one, "
+                    "and the orphan can be deleted.",
+                    extra={
+                        "sha256": record.sha256_hash,
+                        "s3_key": new_s3_key,
+                        "s3_version_id": new_version_id,
+                        "old_s3_key": old_s3_key,
+                        "old_kms_key": old_kms_key,
+                        "new_kms_key": new_key_id,
+                        "correlation_id": correlation_id,
+                    },
+                )
+                raise
+            try:
                 store.put_event(
                     record,
                     operation="ROTATE_KEY",
@@ -1104,11 +1144,10 @@ def rotate_key(
                 )
             except Exception:
                 logger.error(
-                    "State write failed after S3 re-upload during key rotation.",
+                    "The file was rotated and its record updated, but its ROTATE_KEY audit "
+                    "event could not be recorded.",
                     extra={
-                        "sha256": record.sha256_hash,
-                        "s3_key": record.s3_key,
-                        "s3_version_id": new_version_id,
+                        "s3_key": new_s3_key,
                         "old_kms_key": old_kms_key,
                         "new_kms_key": new_key_id,
                         "correlation_id": correlation_id,

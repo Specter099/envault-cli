@@ -242,3 +242,81 @@ def test_encrypt_temp_file_cleanup_on_success(
 
     assert result.exit_code == 0, result.output
     assert list(private_tempdir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# M7: one never-reused key per upload, written with If-None-Match
+# ---------------------------------------------------------------------------
+
+
+def _versions_at(key: str) -> list[dict[str, object]]:
+    return [v for v in _objects() if v["Key"] == key]
+
+
+def test_encrypt_uploads_to_a_per_upload_key(env: dict[str, str], tree: pathlib.Path) -> None:
+    calls: list[dict[str, object]] = []
+    real_upload = cli_mod.S3Store.upload_file
+
+    def spy(self, local_path, s3_key, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"s3_key": s3_key, **kwargs})
+        return real_upload(self, local_path, s3_key, **kwargs)
+
+    with patch.object(cli_mod.S3Store, "upload_file", spy):
+        result = _run(env, "encrypt", str(tree))
+
+    assert result.exit_code == 0, result.output
+    [record] = _records()
+    sha, message_id = record.sha256_hash, record.message_id  # type: ignore[attr-defined]
+    assert record.s3_key == f"encrypted/{sha[:2]}/{sha}/{message_id}/notes.txt.encrypted"  # type: ignore[attr-defined]
+    assert calls == [{"s3_key": record.s3_key, "if_none_match": True}]  # type: ignore[attr-defined]
+
+
+def test_lost_encrypt_race_does_not_pin_noncurrent_version(
+    env: dict[str, str], tree: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """r09 R10: two pipelines encrypt the same file at once.
+
+    The second read "no record" before the first wrote one. It still uploads
+    (to its own key) and then loses the conditional state write. The record
+    must keep pinning a version that is the current one at its key.
+    """
+    import logging
+
+    first = _run(env, "encrypt", str(tree))
+    assert first.exit_code == 0, first.output
+    with (
+        patch.object(StateStore, "get_current_state", return_value=None),
+        caplog.at_level(logging.ERROR, logger="envault.cli"),
+    ):
+        second = _run(env, "encrypt", str(tree))
+
+    assert second.exit_code == 1
+    assert "✗ notes.txt" in second.output
+    [record] = _records()
+    [pinned] = _versions_at(record.s3_key)  # type: ignore[attr-defined]
+    assert pinned["VersionId"] == record.s3_version_id  # type: ignore[attr-defined]
+    assert pinned["IsLatest"] is True
+    # The loser's object went to its own key: an orphan, logged for clean-up.
+    [orphan_key] = {str(v["Key"]) for v in _objects()} - {record.s3_key}  # type: ignore[attr-defined]
+    logged = [r for r in caplog.records if "orphan" in r.getMessage()]
+    assert logged and logged[0].__dict__["s3_key"] == orphan_key
+
+
+def test_encrypt_force_writes_a_new_key_and_keeps_the_old_object(
+    env: dict[str, str], tree: pathlib.Path
+) -> None:
+    assert _run(env, "encrypt", str(tree)).exit_code == 0
+    [before] = _records()
+    [old_version] = _versions_at(before.s3_key)  # type: ignore[attr-defined]
+
+    result = _run(env, "encrypt", "--force", str(tree))
+
+    assert result.exit_code == 0, result.output
+    [after] = _records()
+    assert after.s3_key != before.s3_key  # type: ignore[attr-defined]
+    assert _versions_at(before.s3_key) == [old_version]  # type: ignore[attr-defined]
+    [new_version] = _versions_at(after.s3_key)  # type: ignore[attr-defined]
+    assert new_version["VersionId"] == after.s3_version_id  # type: ignore[attr-defined]
+    out = tree.parent / "out.txt"
+    assert _run(env, "decrypt", "notes.txt", "-o", str(out)).exit_code == 0
+    assert out.read_bytes() == HARMLESS
