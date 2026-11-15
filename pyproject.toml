@@ -23,7 +23,10 @@ classifiers = [
 ]
 dependencies = [
     "aws-encryption-sdk>=3.1.1,<5",
-    "boto3>=1.26.0,<2",
+    # >=1.35.2: uploads send PutObject IfNoneMatch="*" (never overwrite a key a
+    # record pins), and botocore 1.35.2 is the first release whose S3 model has
+    # it. boto3 1.35.2 requires botocore>=1.35.2,<1.36.
+    "boto3>=1.35.2,<2",
     "click>=8.1.0,<9",
     "rich>=13.0.0,<16",
     "tenacity>=8.2.0,<10",
@@ -45,7 +48,7 @@ dev = [
     "moto[dynamodb,s3,kms]>=4.2.0,<6",
     "ruff>=0.1.0,<1",
     "mypy>=1.5.0,<3",
-    "boto3-stubs[dynamodb,s3,kms]>=1.26.0,<2",
+    "boto3-stubs[dynamodb,s3,kms]>=1.35.2,<2",
     # CI tooling, locked with everything else: dependency audit, and the
     # build frontend/backend used to build the release (with --no-isolation).
     "pip-audit>=2.10.0,<3",
