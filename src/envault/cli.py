@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import glob
 import json
 import logging
@@ -37,7 +38,6 @@ from envault.crypto import (
     encrypt_fd,
     encrypt_file,
     sha256_fd,
-    sha256_file,
 )
 from envault.exceptions import (
     AlreadyEncryptedError,
@@ -45,6 +45,7 @@ from envault.exceptions import (
     ConfigurationError,
     EncryptionContextMismatchError,
     EnvaultError,
+    InvalidS3KeyError,
     KMSError,
     MigrationError,
     StateConflictError,
@@ -53,8 +54,21 @@ from envault.fileutils import best_effort_delete as _best_effort_delete
 from envault.fileutils import open_regular_nofollow
 from envault.identity import caller_arn
 from envault.isolation import CredentialFd, harden_process, wipe
-from envault.s3 import S3Store, assert_s3_key_matches_hash
-from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
+from envault.retry import aws_retry
+from envault.s3 import (
+    LEGACY_S3_PREFIX,
+    S3Store,
+    assert_legacy_s3_key,
+    assert_s3_key_matches_hash,
+)
+from envault.state import (
+    DECRYPTED,
+    ENCRYPTED,
+    S3_KEY_CONTENT_ADDRESSED,
+    S3_KEY_LEGACY_SYNC,
+    FileRecord,
+    StateStore,
+)
 
 # emoji=False: a stored name like ":skull:" must print as typed.
 console = Console(emoji=False)
@@ -1068,36 +1082,104 @@ def dashboard(table: str, region: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# KMS key ARNs as the Encryption SDK records them for a KMS data key.
+_KMS_KEY_ARN_RE = re.compile(
+    r"arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/"
+    r"(?:mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
+
 @main.command()
-@click.argument("from_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("from_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
-@click.option("--dry-run", is_flag=True, help="Parse without writing to DynamoDB.")
+@click.option(
+    "--plaintext-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory the legacy workflow encrypted (its INPUT_DIR). "
+    "Default: the encrypt/ directory next to FROM_PATH's directory.",
+)
+@click.option(
+    "--ciphertext-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory aws-encryption-cli wrote ciphertext to, which `aws s3 sync` uploaded "
+    "under encrypted/ (its OUTPUT_DIR). Default: the encrypted/ directory next to "
+    "FROM_PATH's directory.",
+)
+@click.option(
+    "--bucket",
+    envvar="ENVAULT_BUCKET",
+    default=None,
+    help="Bucket the legacy workflow synced to. Each object must exist there; its current "
+    "VersionId is pinned, so decrypt needs no --latest.",
+)
+@click.option("--dry-run", is_flag=True, help="Parse and verify without writing to DynamoDB.")
 @_audit_ttl_option
-def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_days: int) -> None:
-    """Import existing output.json metadata into DynamoDB.
+def migrate(
+    from_path: Path,
+    table: str,
+    region: str,
+    plaintext_root: Path | None,
+    ciphertext_root: Path | None,
+    bucket: str | None,
+    dry_run: bool,
+    audit_ttl_days: int,
+) -> None:
+    """Import the legacy shell workflow's metadata into DynamoDB.
 
-    FROM_PATH is the path to code/output.json (NDJSON format).
+    FROM_PATH is the file aws-encryption-cli wrote with --metadata-output
+    (code/output.json): one JSON record per encrypted file, with absolute
+    paths. Each record becomes an ENCRYPTED record for its plaintext's
+    SHA-256, which is why the plaintext must still be in the plaintext root.
+    It points at the object `aws s3 sync ../encrypted s3://$S3_BUCKET/encrypted`
+    uploaded: encrypted/<path relative to the ciphertext root>. Paths outside
+    the two roots, and symlinks inside them, are refused.
+
+    Exits 1 if any record could not be migrated.
     """
-    store = StateStore(table_name=table, region=region)
-    imported = skipped = errors = 0
-    import_root = from_path.parent.resolve()
-
-    lines = from_path.read_text().splitlines()
-    for i, line in enumerate(track(lines, description="Migrating records..."), start=1):
-        line = line.strip()
-        if not line:
-            continue
+    base = Path(os.path.abspath(from_path)).parent
+    roots = _LegacyRoots(
+        base=base,
+        plaintext=_LegacyRoot.of("plaintext", plaintext_root or base.parent / "encrypt"),
+        ciphertext=_LegacyRoot.of("ciphertext", ciphertext_root or base.parent / "encrypted"),
+    )
+    with _exit_on_error("Migration error"):
         try:
-            entry = json.loads(line)
-            if not isinstance(entry, dict):
-                raise MigrationError(
-                    f"Expected a JSON object at line {i}, got {type(entry).__name__}"
+            text = from_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise MigrationError(f"Cannot read {str(from_path)!r} as UTF-8 text: {exc}") from None
+    store = StateStore(table_name=table, region=region)
+    pin = _pinned_version_lookup(bucket, region) if bucket else None
+    entries = list(_metadata_lines(text))
+    superseded = _superseded_lines(entries, base)
+
+    imported = skipped = errors = 0
+    imported_from: dict[str, int] = {}  # identifier -> line it was imported from
+    for lineno, item in track(entries, description="Migrating records..."):
+        try:
+            if isinstance(item, MigrationError):
+                raise item
+            if lineno in superseded:
+                console.print(
+                    f"[dim]line {lineno}: skipped, a later record describes the same file[/dim]"
                 )
-            record = _parse_output_json_entry(entry, import_root=import_root)
-            if record is None:
                 skipped += 1
                 continue
+            record = _parse_output_json_entry(item, roots=roots)
+            if record is None:  # a decrypt record, or anything else that is not an encryption
+                skipped += 1
+                continue
+            if record.sha256_hash in imported_from:
+                console.print(
+                    f"[dim]line {lineno}: skipped, same content as line "
+                    f"{imported_from[record.sha256_hash]}[/dim]"
+                )
+                skipped += 1
+                continue
+            if pin is not None:
+                record.s3_version_id = pin(record.s3_key)
             if not dry_run:
                 store.put_current_state(record)
                 store.put_event(
@@ -1107,97 +1189,273 @@ def migrate(from_path: Path, table: str, region: str, dry_run: bool, audit_ttl_d
                     audit_ttl_days=audit_ttl_days,
                     principal_arn=caller_arn(region),
                 )
+            imported_from[record.sha256_hash] = lineno
             imported += 1
+            console.print(
+                f"[green]✓[/green] {_display(record.file_name)} → {_display(record.s3_key)}"
+            )
         except StateConflictError:
-            logger.info("Record already exists, skipping migration for line %d", i)
+            console.print(f"[dim]line {lineno}: skipped, already in the state table[/dim]")
             skipped += 1
-        except (
-            json.JSONDecodeError,
-            KeyError,
-            ValueError,
-            TypeError,
-            AttributeError,
-            MigrationError,
-        ) as exc:
-            logger.warning("Failed to migrate record at line %d: %s", i, exc)
+        except (EnvaultError, ClientError, BotoCoreError, OSError) as exc:
+            console.print(f"[red]✗[/red] line {lineno}: {_display(_error_message(exc))}")
+            logger.debug("Failed to migrate line %d", lineno, exc_info=True)
             errors += 1
 
     mode = "[dim](dry run)[/dim]" if dry_run else ""
     console.print(
         f"\n[green]Migrated {imported} records[/green], skipped {skipped}, errors {errors} {mode}"
     )
+    if errors:
+        sys.exit(1)
 
 
-def _parse_output_json_entry(
-    entry: dict[str, Any], *, import_root: Path | None = None
-) -> FileRecord | None:
-    """Convert an output.json record to a FileRecord. Returns None if not an encrypt record."""
+@dataclass(frozen=True)
+class _LegacyRoot:
+    """A directory of the legacy workflow, in both spellings a recorded path may use.
+
+    aws-encryption-cli records ``os.path.abspath`` of each path: lexical, on top
+    of the physical working directory. The root as given (made absolute) and
+    its realpath cover both, without touching any recorded path.
+    """
+
+    label: str
+    path: Path
+    real: Path
+
+    @classmethod
+    def of(cls, label: str, path: Path) -> _LegacyRoot:
+        absolute = Path(os.path.abspath(path))
+        return cls(label=label, path=absolute, real=Path(os.path.realpath(absolute)))
+
+    def relative(self, raw: object, *, field: str, base: Path) -> PurePosixPath:
+        """``raw`` as a path strictly inside this root, decided lexically (no filesystem access).
+
+        A relative path is taken relative to ``base`` (the metadata file's
+        directory, the legacy scripts' working directory).
+        """
+        if not isinstance(raw, str) or not raw:
+            raise MigrationError(f"the record has no {field!r} path")
+        if "\x00" in raw:
+            raise MigrationError(f"{field!r} contains a NUL character")
+        candidate = Path(raw)
+        traversal = ".." in candidate.parts
+        if candidate.is_absolute():
+            if traversal:
+                raise MigrationError(f"Path traversal not allowed in {field!r}: {raw!r}")
+            lexical = Path(os.path.normpath(candidate))
+        else:
+            lexical = Path(os.path.normpath(base / candidate))
+        for root in (self.path, self.real):
+            try:
+                inside = lexical.relative_to(root)
+            except ValueError:
+                continue
+            if inside.parts:
+                return PurePosixPath(*inside.parts)
+        prefix = "Path traversal not allowed: " if traversal else ""
+        raise MigrationError(
+            f"{prefix}{field} {raw!r} is outside the {self.label} root {str(self.path)!r}"
+        )
+
+
+@dataclass(frozen=True)
+class _LegacyRoots:
+    base: Path  # the metadata file's directory: the legacy scripts ran from here
+    plaintext: _LegacyRoot
+    ciphertext: _LegacyRoot
+
+
+def _metadata_lines(text: str) -> Iterator[tuple[int, dict[str, Any] | MigrationError]]:
+    """Each non-empty line as a JSON object, or the reason it is not one."""
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            yield lineno, MigrationError(f"not valid JSON ({exc.msg})")
+            continue
+        if isinstance(entry, dict):
+            yield lineno, entry
+        else:
+            yield lineno, MigrationError(f"expected a JSON object, got {type(entry).__name__}")
+
+
+def _superseded_lines(
+    entries: list[tuple[int, dict[str, Any] | MigrationError]], base: Path
+) -> set[int]:
+    """Encrypt records followed by a later record for the same ciphertext file.
+
+    aws-encryption-cli appends to its metadata file, and each run's `aws s3
+    sync` replaced the object: only the newest record describes it.
+    """
+    outputs: dict[int, str] = {}
+    for lineno, entry in entries:
+        if isinstance(entry, dict) and entry.get("mode") == "encrypt":
+            output = entry.get("output")
+            if isinstance(output, str) and output and "\x00" not in output:
+                outputs[lineno] = os.path.normpath(os.path.join(base, output))
+    newest = {output: lineno for lineno, output in outputs.items()}
+    return {lineno for lineno, output in outputs.items() if newest[output] != lineno}
+
+
+def _parse_output_json_entry(entry: dict[str, Any], *, roots: _LegacyRoots) -> FileRecord | None:
+    """Turn one aws-encryption-cli metadata record into a FileRecord.
+
+    Returns None for records that are not encryptions. Everything is checked
+    before the filesystem is touched: the header, then both paths lexically
+    against their roots. Only then is the plaintext opened (no symlink on the
+    way, regular file only) and hashed.
+
+    Raises:
+        MigrationError: The record cannot be migrated; the message says why.
+        InvalidS3KeyError: The ciphertext path does not make a valid legacy key.
+    """
     if entry.get("mode") != "encrypt":
         return None
-
-    header = entry.get("header", {}) or {}
+    header = entry.get("header")
     if not isinstance(header, dict):
-        raise MigrationError("header must be a JSON object")
-    input_path = entry.get("input", "")
-    if not input_path:
-        return None
+        raise MigrationError("the record has no header object")
+    algorithm, message_id, key_arn, context = _legacy_header(header)
+    plain_rel = roots.plaintext.relative(entry.get("input"), field="input", base=roots.base)
+    cipher_rel = roots.ciphertext.relative(entry.get("output"), field="output", base=roots.base)
+    s3_key = LEGACY_S3_PREFIX + cipher_rel.as_posix()
+    assert_legacy_s3_key(s3_key)
 
-    plaintext_path = _confine_migration_path(input_path, import_root)
-
-    file_name = S3Store._sanitize_filename(plaintext_path.name)
-    algorithm = _extract_algorithm(header)
-    message_id = _extract_message_id(header)
-    kms_key_id = _extract_kms_key_id(header)
-    enc_context = header.get("encryption_context", {}) or {}
-    if not isinstance(enc_context, dict):
-        raise MigrationError("encryption_context must be a JSON object")
-
-    if not plaintext_path.exists():
-        logger.warning("Plaintext file not found for migration, skipping: %s", input_path)
-        return None
-
-    sha256_hash = sha256_file(plaintext_path)
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
+    fd = _open_legacy_plaintext(roots.plaintext, plain_rel, str(entry.get("input")))
+    try:
+        sha256 = sha256_fd(fd)
+        size = os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     return FileRecord(
-        sha256_hash=sha256_hash,
-        file_name=file_name,
+        sha256_hash=sha256,
+        file_name=plain_rel.as_posix(),
         current_state=ENCRYPTED,
-        s3_key=f"encrypted/{sha256_hash[:2]}/{sha256_hash}/{file_name}.encrypted",
+        s3_key=s3_key,
         s3_version_id="",
-        kms_key_id=kms_key_id or "alias/s3_key",
-        encryption_context=enc_context,
+        kms_key_id=key_arn,
+        encryption_context=context,
         algorithm=algorithm,
         message_id=message_id,
-        file_size_bytes=plaintext_path.stat().st_size,
+        file_size_bytes=size,
         tags={"source": "migrated"},
         encrypted_at=now,
         last_updated=now,
+        s3_key_scheme=S3_KEY_LEGACY_SYNC,
     )
 
 
-def _extract_algorithm(header: dict[str, Any]) -> str:
-    return str(header.get("algorithm", ""))
+def _legacy_header(header: dict[str, Any]) -> tuple[str, str, str, dict[str, str]]:
+    """(algorithm, message id as hex, KMS key ARN, encryption context) of a metadata header.
 
-
-def _extract_message_id(header: dict[str, Any]) -> str:
-    mid = header.get("message_id", "")
-    if isinstance(mid, bytes):
-        return mid.hex()
-    return str(mid)
-
-
-def _extract_kms_key_id(header: dict[str, Any]) -> str:
-    edks = header.get("encrypted_data_keys", [])
-    if not isinstance(edks, list) or not edks:
-        return ""
-    first = edks[0]
-    if not isinstance(first, dict):
-        return ""
-    provider = first.get("key_provider", {})
+    aws-encryption-cli base64-encodes the message id and the key provider's id
+    and info. Messages envault would refuse to decrypt (non-committing suites,
+    several encrypted data keys, non-KMS keys) are refused here already.
+    """
+    algorithm = header.get("algorithm")
+    if not isinstance(algorithm, str) or not algorithm:
+        raise MigrationError("the header names no algorithm suite")
+    if "COMMIT_KEY" not in algorithm:
+        raise MigrationError(
+            f"algorithm suite {algorithm} is not key-committing, and envault refuses to "
+            "decrypt such messages; re-encrypt the file with `envault encrypt`"
+        )
+    edks = header.get("encrypted_data_keys")
+    if not isinstance(edks, list) or len(edks) != 1 or not isinstance(edks[0], dict):
+        count = len(edks) if isinstance(edks, list) else 0
+        raise MigrationError(
+            f"the message has {count} encrypted data keys; envault decrypts messages with "
+            "exactly one"
+        )
+    provider = edks[0].get("key_provider")
     if not isinstance(provider, dict):
+        raise MigrationError("the encrypted data key names no key provider")
+    provider_id = _decoded_text(provider.get("provider_id"), plain=lambda v: v == "aws-kms")
+    if provider_id != "aws-kms":
+        raise MigrationError(f"the data key's provider is {provider_id!r}, not aws-kms")
+    key_arn = _decoded_text(
+        provider.get("key_info"), plain=lambda v: bool(_KMS_KEY_ARN_RE.fullmatch(v))
+    )
+    if not _KMS_KEY_ARN_RE.fullmatch(key_arn):
+        raise MigrationError(f"key_info is not a KMS key ARN: {key_arn!r}")
+    raw_id = header.get("message_id")
+    try:
+        message_id = base64.b64decode(str(raw_id), validate=True).hex()
+    except ValueError:
+        message_id = ""
+    if not raw_id or not message_id:
+        raise MigrationError("the header's message_id is missing or not base64")
+    context = header.get("encryption_context") or {}
+    if not isinstance(context, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in context.items()
+    ):
+        raise MigrationError("encryption_context must be a JSON object of strings")
+    # aws-crypto-* keys are the SDK's own (the message's signing key); envault
+    # verifies the application's context.
+    return (
+        algorithm,
+        message_id,
+        key_arn,
+        {k: v for k, v in context.items() if not k.startswith("aws-crypto-")},
+    )
+
+
+def _decoded_text(value: object, *, plain: Callable[[str], bool]) -> str:
+    """A header field aws-encryption-cli stores base64-encoded ("" if it is neither form).
+
+    A value that already passes ``plain`` is taken as is, for metadata written
+    by other tools.
+    """
+    if not isinstance(value, str):
         return ""
-    return str(provider.get("key_info", ""))
+    if plain(value):
+        return value
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return ""
+
+
+def _open_legacy_plaintext(root: _LegacyRoot, rel: PurePosixPath, raw: str) -> int:
+    """Open the plaintext ``rel`` below ``root`` for hashing, refusing any symlink on the way."""
+    current = root.real
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            raise MigrationError(f"Symlink not allowed in migration input: {raw!r}")
+    if not current.resolve().is_relative_to(root.real):
+        raise MigrationError(f"input {raw!r} resolves outside the plaintext root")
+    try:
+        return open_regular_nofollow(current)
+    except FileNotFoundError:
+        raise MigrationError(
+            f"plaintext {raw!r} not found: its checksum cannot be computed, so the record "
+            "cannot be migrated"
+        ) from None
+
+
+def _pinned_version_lookup(bucket: str, region: str) -> Callable[[str], str]:
+    """A function returning the current VersionId of a legacy object ("" if unversioned)."""
+    client = boto3.client("s3", region_name=region, config=boto_config)
+
+    @aws_retry(never=(EnvaultError,))
+    def current_version(s3_key: str) -> str:
+        try:
+            response = client.head_object(Bucket=bucket, Key=s3_key)
+        except ClientError as exc:
+            if str(exc.response.get("Error", {}).get("Code", "")) in {"404", "NoSuchKey"}:
+                raise MigrationError(
+                    f"s3://{bucket}/{s3_key} does not exist: the legacy sync never uploaded "
+                    "it, or it was removed"
+                ) from None
+            raise
+        return str(response.get("VersionId") or "")
+
+    return current_version
 
 
 # ---------------------------------------------------------------------------
@@ -1371,6 +1629,7 @@ def _rotate_records(
             record.algorithm = new_result.algorithm
             record.message_id = new_result.message_id
             record.s3_key = new_s3_key
+            record.s3_key_scheme = S3_KEY_CONTENT_ADDRESSED
             record.s3_version_id = new_version_id
             record.last_updated = now
             # Legacy records land back in ENCRYPTED: the ciphertext is present,
@@ -1839,67 +2098,6 @@ def _preflight_kms_key(key_id: str, region: str) -> None:
         sys.exit(1)
 
 
-def _path_has_symlink_component(path: Path) -> bool:
-    """True if any existing component of ``path`` is a symlink."""
-    parts = path.parts
-    if not parts:
-        return False
-    if path.is_absolute():
-        current = Path(parts[0])
-        rest = parts[1:]
-    else:
-        current = Path()
-        rest = parts
-    for part in rest:
-        current = current / part
-        try:
-            if current.is_symlink():
-                return True
-        except OSError:
-            return True
-    return False
-
-
-def _confine_migration_path(input_path: str, import_root: Path | None) -> Path:
-    """Resolve a migration input path, rejecting traversal and per-component symlinks.
-
-    ``import_root`` is required. Absolute paths are checked for lexical
-    containment *before* any ``lstat``, so a poisoned output.json cannot
-    cause the importer to touch files outside the import directory.
-    """
-    candidate = Path(input_path)
-    if ".." in candidate.parts:
-        raise MigrationError(f"Path traversal not allowed in migration input: {input_path!r}")
-    if import_root is None:
-        raise MigrationError(
-            "import_root is required; refusing to hash an unconstrained migration path"
-        )
-
-    root = import_root.resolve()
-    if candidate.is_absolute():
-        try:
-            candidate.relative_to(root)
-        except ValueError as exc:
-            raise MigrationError(
-                f"Path {input_path!r} is outside the import directory {str(root)!r}"
-            ) from exc
-        joined = candidate
-    else:
-        joined = root / candidate
-
-    if _path_has_symlink_component(joined):
-        raise MigrationError(f"Symlink not allowed in migration input: {input_path!r}")
-
-    resolved = joined.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise MigrationError(
-            f"Path {input_path!r} is outside the import directory {str(root)!r}"
-        ) from exc
-    return resolved
-
-
 def _validate_date(value: str) -> str:
     """Validate a YYYY-MM-DD date string."""
     try:
@@ -1966,13 +2164,26 @@ def _check_record(record: FileRecord) -> None:
 
     Raises:
         _IdentifierError: The identifier is not 64 lowercase hex characters.
-        InvalidS3KeyError: The key is not this identifier's content-addressed path.
+        InvalidS3KeyError: The key is not valid for the record's key scheme: this
+            identifier's content-addressed path, or (migrated records) a key in
+            the legacy-sync layout.
     """
     if not _is_sha256(record.sha256_hash):
         raise _IdentifierError(
             f"The record for {record.file_name!r} has a malformed identifier; refusing to use it."
         )
-    assert_s3_key_matches_hash(record.s3_key, record.sha256_hash, message_id=record.message_id)
+    if record.s3_key_scheme == S3_KEY_CONTENT_ADDRESSED:
+        assert_s3_key_matches_hash(record.s3_key, record.sha256_hash, message_id=record.message_id)
+    elif record.s3_key_scheme == S3_KEY_LEGACY_SYNC:
+        # Migrated records point where the legacy `aws s3 sync` put the object;
+        # the key carries no identifier, so the plaintext checksum and the
+        # encryption context are what bind the object to the record.
+        assert_legacy_s3_key(record.s3_key)
+    else:
+        raise InvalidS3KeyError(
+            f"Refusing to use S3 key {record.s3_key!r}: unknown key scheme "
+            f"{record.s3_key_scheme!r}."
+        )
 
 
 class _IdentifierError(EnvaultError):

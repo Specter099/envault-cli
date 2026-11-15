@@ -41,6 +41,13 @@ FILE_PREFIX = "FILE#"
 ENCRYPTED = "ENCRYPTED"
 DECRYPTED = "DECRYPTED"
 
+# How a record's S3 key was chosen, which decides how the key is validated.
+#: envault's own keys, which embed the file identifier.
+S3_KEY_CONTENT_ADDRESSED = "content-addressed"
+#: Keys written by the legacy shell workflow's ``aws s3 sync`` (records
+#: imported by ``envault migrate``), validated by their layout instead.
+S3_KEY_LEGACY_SYNC = "legacy-sync"
+
 
 @dataclass
 class FileRecord:
@@ -59,6 +66,9 @@ class FileRecord:
     s3_version_id: str = ""
     encrypted_at: str = ""
     last_updated: str = ""
+    #: :data:`S3_KEY_CONTENT_ADDRESSED` or :data:`S3_KEY_LEGACY_SYNC`. Rows
+    #: written before this attribute existed are content-addressed.
+    s3_key_scheme: str = S3_KEY_CONTENT_ADDRESSED
 
     def to_dynamo_item(self, sk: str) -> dict[str, Any]:
         """Serialize to a DynamoDB item dict."""
@@ -435,4 +445,5 @@ def _item_to_record(item: dict[str, Any]) -> FileRecord:
         s3_version_id=item.get("s3_version_id", ""),
         encrypted_at=item.get("encrypted_at", ""),
         last_updated=item.get("last_updated", ""),
+        s3_key_scheme=item.get("s3_key_scheme", S3_KEY_CONTENT_ADDRESSED),
     )

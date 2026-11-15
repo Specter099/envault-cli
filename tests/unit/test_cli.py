@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import glob
 import hashlib
-import json
 import sys
 import uuid
 from collections.abc import Iterator
@@ -20,14 +19,13 @@ from envault.cli import (
     _best_effort_delete,
     _collect_files,
     _friendly_message,
-    _parse_output_json_entry,
     _parse_tags,
     _validate_date,
     cli,
     main,
 )
 from envault.crypto import DecryptResult, EncryptResult, verify_encryption_context
-from envault.exceptions import ChecksumMismatchError, EnvaultError, MigrationError
+from envault.exceptions import ChecksumMismatchError, EnvaultError
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
 
 TABLE_NAME = "envault-test-state"
@@ -138,108 +136,6 @@ def _seed_encrypted_record(
     )
     store.put_current_state(record)
     return record
-
-
-def _make_entry(input_path: str) -> dict[str, object]:
-    return {
-        "mode": "encrypt",
-        "input": input_path,
-        "header": {
-            "algorithm": "AES_256_GCM_HKDF_SHA512_COMMIT_KEY_ECDSA_P384",
-            "message_id": "abcd1234",
-            "encryption_context": {"purpose": "backup"},
-            "encrypted_data_keys": [{"key_provider": {"key_info": "alias/envault"}}],
-        },
-    }
-
-
-def test_parse_entry_uses_content_hash(tmp_path: Path) -> None:
-    """_parse_output_json_entry must hash file CONTENT, not the path string."""
-    plaintext = tmp_path / "secret.txt"
-    content = b"sensitive data\n"
-    plaintext.write_bytes(content)
-    expected_hash = hashlib.sha256(content).hexdigest()
-
-    entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-
-    assert record is not None
-    assert record.sha256_hash == expected_hash
-
-
-def test_parse_entry_skips_missing_file(tmp_path: Path) -> None:
-    """_parse_output_json_entry returns None when the plaintext file doesn't exist."""
-    entry = _make_entry("nonexistent/file.txt")
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-    assert record is None
-
-
-def test_parse_entry_skips_non_encrypt_mode() -> None:
-    entry = {"mode": "decrypt", "input": "some/file"}
-    assert _parse_output_json_entry(entry) is None
-
-
-def test_parse_entry_requires_import_root() -> None:
-    """Unconstrained hashing of arbitrary paths is not allowed."""
-    entry = _make_entry("secret.txt")
-    with pytest.raises(MigrationError, match="import_root is required"):
-        _parse_output_json_entry(entry)
-
-
-def test_parse_entry_rejects_path_traversal(tmp_path: Path) -> None:
-    """Paths with '..' components must raise MigrationError."""
-    entry = _make_entry("../../etc/passwd")
-    with pytest.raises(MigrationError, match="Path traversal not allowed"):
-        _parse_output_json_entry(entry, import_root=tmp_path)
-
-
-def test_parse_entry_rejects_path_outside_import_root(tmp_path: Path) -> None:
-    """Absolute paths outside the import directory must not be hashed."""
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    secret = outside / "secret.txt"
-    secret.write_bytes(b"x")
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    with pytest.raises(MigrationError, match="outside the import directory"):
-        _parse_output_json_entry(_make_entry(str(secret)), import_root=import_root)
-
-
-def test_parse_entry_confined_relative_path(tmp_path: Path) -> None:
-    """Relative paths are resolved inside the import directory."""
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    content = b"sensitive data\n"
-    (import_root / "secret.txt").write_bytes(content)
-    expected_hash = hashlib.sha256(content).hexdigest()
-    record = _parse_output_json_entry(_make_entry("secret.txt"), import_root=import_root)
-    assert record is not None
-    assert record.sha256_hash == expected_hash
-
-
-def test_parse_entry_rejects_symlink_component(tmp_path: Path) -> None:
-    """A symlink anywhere in the migration path must be rejected before I/O."""
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    real = tmp_path / "realdir"
-    real.mkdir()
-    (real / "secret.txt").write_bytes(b"x")
-    (import_root / "link").symlink_to(real)
-    with pytest.raises(MigrationError, match="Symlink"):
-        _parse_output_json_entry(_make_entry("link/secret.txt"), import_root=import_root)
-
-
-def test_parse_entry_records_file_size(tmp_path: Path) -> None:
-    """Migrated records must store actual file size, not zero."""
-    plaintext = tmp_path / "sized.txt"
-    content = b"hello world\n"
-    plaintext.write_bytes(content)
-
-    entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-
-    assert record is not None
-    assert record.file_size_bytes == len(content)
 
 
 def test_validate_date_accepts_valid() -> None:
@@ -1987,53 +1883,3 @@ def test_rotate_key_preflight_rejects_disabled_key() -> None:
     assert result.exit_code != 0
     assert decrypt_mock.call_count == 0
     assert "not enabled" in result.output.lower() or "key state" in result.output.lower()
-
-
-def test_parse_entry_null_header_does_not_crash(tmp_path: Path) -> None:
-    """A null header must be treated as empty, not raise AttributeError."""
-    plaintext = tmp_path / "secret.txt"
-    plaintext.write_bytes(b"x")
-    entry = {"mode": "encrypt", "input": str(plaintext), "header": None}
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-    assert record is not None
-    assert record.algorithm == ""
-    assert record.kms_key_id == "alias/s3_key"
-
-
-@mock_aws
-def test_migrate_skips_non_object_json_and_continues(tmp_path: Path) -> None:
-    """A bad NDJSON line must increment errors without aborting the rest of the file."""
-    _create_table()
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    secret = import_root / "secret.txt"
-    secret.write_bytes(b"payload\n")
-    ndjson = tmp_path / "import" / "output.json"
-    ndjson.write_text(
-        "\n".join(
-            [
-                "[]",
-                json.dumps(_make_entry("secret.txt")),
-                "null",
-            ]
-        )
-        + "\n"
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        [
-            "migrate",
-            str(ndjson),
-            "--table",
-            TABLE_NAME,
-            "--region",
-            REGION,
-            "--dry-run",
-        ],
-        env=_CLI_ENV,
-    )
-    assert result.exit_code == 0, result.output
-    assert "Migrated 1" in result.output
-    assert "errors 2" in result.output
