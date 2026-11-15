@@ -1,0 +1,11 @@
+# Development and CI requirements for the CDK app: the deploy-time pins in
+# requirements.txt plus the runner for the assertion tests in tests/.
+#
+# CI installs the hashed lock requirements-ci.txt, which is generated from this
+# file for the cdk-synth job's interpreter (Python 3.12 on Linux). After
+# changing this file or requirements.txt, regenerate the lock by running this
+# command from infra/cdk/ (uv 0.13 or later):
+#
+#   uv pip compile requirements-dev.txt --python-version 3.12 --python-platform linux --generate-hashes --output-file requirements-ci.txt
+-r requirements.txt
+pytest>=9.2.0,<10
