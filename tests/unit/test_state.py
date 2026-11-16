@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from decimal import Decimal
 from unittest.mock import patch
 
 import boto3
@@ -11,7 +12,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError, ReadTimeoutError
 from moto import mock_aws
 
-from envault.exceptions import StateConflictError
+from envault.exceptions import MalformedRecordError, StateConflictError
 from envault.fileid import ID_SCHEME_HMAC_SHA256, ID_SCHEME_SHA256
 from envault.state import (
     DECRYPTED,
@@ -119,6 +120,103 @@ def test_has_current_state_says_whether_a_record_is_stored():
     assert store.has_current_state(record.file_id) is True
     assert store.has_current_state("b" * 64) is True
     assert store.has_current_state("c" * 64) is False
+
+
+def _put_row(**attributes: object) -> None:
+    """Write a CURRENT row as anyone with table access could, bypassing FileRecord."""
+    item = _make_record().to_dynamo_item(sk="CURRENT")
+    item.update(attributes)
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(Item=item)
+
+
+@pytest.mark.parametrize(
+    ("attributes", "problem"),
+    [
+        ({"file_name": ["a", "list"]}, "file_name is a list, not a string"),
+        ({"file_name": 7}, "file_name is a Decimal, not a string"),
+        ({"s3_key": None}, "s3_key is null, not a string"),
+        ({"algorithm": True}, "algorithm is a bool, not a string"),
+        ({"sha256_hash": {"x": "y"}}, "sha256_hash is a dict, not a string"),
+        ({"encryption_context": "purpose=backup"}, "encryption_context is not a map of strings"),
+        ({"encryption_context": {"purpose": 1}}, "encryption_context is not a map of strings"),
+        ({"tags": ["project"]}, "tags is not a map of strings"),
+        ({"file_size_bytes": "1024"}, "file_size_bytes is not a whole number of bytes"),
+        ({"file_size_bytes": Decimal("1.5")}, "file_size_bytes is not a whole number of bytes"),
+        ({"file_size_bytes": -1}, "file_size_bytes is not a whole number of bytes"),
+    ],
+)
+@mock_aws
+def test_get_current_state_refuses_a_row_of_the_wrong_shape(
+    attributes: dict[str, object], problem: str
+) -> None:
+    """N2: a row is never coerced into a record; the error names the row and the attribute."""
+    store = _create_table()
+    _put_row(**attributes)
+
+    with pytest.raises(MalformedRecordError) as exc_info:
+        store.get_current_state("a" * 64)
+
+    assert exc_info.value.row_id == "a" * 64
+    assert exc_info.value.problems == (problem,)
+    message = str(exc_info.value)
+    assert message.startswith(f"The record stored under {'a' * 16}... is malformed: {problem}.")
+    assert "purpose=backup" not in message and "1.5" not in message  # never the values
+
+
+def test_malformed_record_error_escapes_the_row_id() -> None:
+    error = MalformedRecordError("\x1b]0;PWNED\x07‮abcdefgh", ["file_name is a list"])
+    message = str(error)
+    assert "\x1b" not in message and "\x07" not in message and "‮" not in message
+    assert "\\x1b]0;PWNED\\x07\\u202eabcde..." in message
+
+
+@mock_aws
+def test_listings_skip_malformed_rows_and_report_them(caplog: pytest.LogCaptureFixture) -> None:
+    store = _create_table()
+    store.put_current_state(_make_record(file_id="b" * 64))
+    _put_row(PK="FILE#" + "c" * 64, encryption_context="x")
+    reported: list[MalformedRecordError] = []
+
+    by_state = store.list_by_state(ENCRYPTED, on_malformed=reported.append)
+    by_name = store.list_by_file_name("test.txt", ENCRYPTED, on_malformed=reported.append)
+    with caplog.at_level("WARNING", logger="envault.state"):
+        default = store.list_by_state(ENCRYPTED)
+
+    assert [r.file_id for r in by_state] == [r.file_id for r in by_name] == ["b" * 64]
+    assert [r.file_id for r in default] == ["b" * 64]
+    assert [e.row_id for e in reported] == ["c" * 64, "c" * 64]
+    assert "Skipping a malformed record" in caplog.text
+    assert "c" * 16 in caplog.text
+
+
+@mock_aws
+def test_rows_written_by_earlier_versions_still_parse() -> None:
+    """The first FileRecord also stored decrypted_at and an integer ttl; absent ones default."""
+    store = _create_table()
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(
+        Item={
+            "PK": "FILE#" + "d" * 64,
+            "SK": "CURRENT",
+            "sha256_hash": "d" * 64,
+            "file_name": "old.txt",
+            "current_state": ENCRYPTED,
+            "s3_key": "encrypted/dd/" + "d" * 64 + "/old.txt.encrypted",
+            "kms_key_id": "alias/envault",
+            "encryption_context": {"purpose": "envault-backup"},
+            "algorithm": "AES_256_GCM_HKDF_SHA512_COMMIT_KEY_ECDSA_P384",
+            "message_id": "ab" * 32,
+            "file_size_bytes": 12,
+            "tags": {},
+            "encrypted_at": "2025-01-01T00:00:00+00:00",
+            "decrypted_at": "",
+            "ttl": 0,
+        }
+    )
+
+    record = store.get_current_state("d" * 64)
+
+    assert record is not None and record.file_size_bytes == 12
+    assert record.s3_version_id == "" and record.last_updated == ""
 
 
 @mock_aws

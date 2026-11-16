@@ -18,9 +18,10 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -28,7 +29,7 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from envault.config import boto_config
-from envault.exceptions import StateConflictError
+from envault.exceptions import MalformedRecordError, StateConflictError
 from envault.fileid import ID_SCHEME_HMAC_SHA256, ID_SCHEME_SHA256
 from envault.retry import aws_retry
 
@@ -343,7 +344,11 @@ class StateStore:
 
     @aws_retry()
     def get_current_state(self, file_id: str) -> FileRecord | None:
-        """Return the current state record stored under ``file_id``, or None if not found."""
+        """Return the current state record stored under ``file_id``, or None if not found.
+
+        Raises:
+            MalformedRecordError: The row stored there is not shaped like a record.
+        """
         response = self._table.get_item(Key={"PK": f"{FILE_PREFIX}{file_id}", "SK": CURRENT})
         item = response.get("Item")
         if not item:
@@ -362,12 +367,24 @@ class StateStore:
         return "Item" in response
 
     @aws_retry()
-    def list_by_state(self, state: str, max_items: int = 0) -> list[FileRecord]:
+    def list_by_state(
+        self,
+        state: str,
+        max_items: int = 0,
+        *,
+        on_malformed: Callable[[MalformedRecordError], None] | None = None,
+    ) -> list[FileRecord]:
         """Return all files in a given state (uses state-index GSI).
+
+        A malformed row (see :func:`_item_to_record`) is left out of the list
+        and handed to ``on_malformed``; without one it is logged as a warning.
+        One bad row never hides the others.
 
         Args:
             state: The state to filter by (e.g. ENCRYPTED, DECRYPTED).
-            max_items: Maximum items to return. 0 means no limit.
+            max_items: Maximum rows to read. 0 means no limit. Malformed rows
+                count towards it.
+            on_malformed: Called with the error for each malformed row.
         """
         items = self._paginate_query(
             max_items=max_items,
@@ -375,21 +392,28 @@ class StateStore:
             KeyConditionExpression=Key("current_state").eq(state),
             FilterExpression=Attr("SK").eq(CURRENT),
         )
-        return [_item_to_record(item) for item in items]
+        return _well_formed_records(items, on_malformed)
 
     @aws_retry()
-    def list_by_file_name(self, file_name: str, state: str) -> list[FileRecord]:
+    def list_by_file_name(
+        self,
+        file_name: str,
+        state: str,
+        *,
+        on_malformed: Callable[[MalformedRecordError], None] | None = None,
+    ) -> list[FileRecord]:
         """Return CURRENT records matching a file_name in a given state.
 
         Results are sorted by encrypted_at descending (newest first).
         Uses state-index GSI with FilterExpression on file_name and SK.
+        Malformed rows are left out and reported as :meth:`list_by_state` does.
         """
         items = self._paginate_query(
             IndexName="state-index",
             KeyConditionExpression=Key("current_state").eq(state),
             FilterExpression=Attr("SK").eq(CURRENT) & Attr("file_name").eq(file_name),
         )
-        records = [_item_to_record(item) for item in items]
+        records = _well_formed_records(items, on_malformed)
         records.sort(key=lambda r: r.encrypted_at, reverse=True)
         return records
 
@@ -496,12 +520,103 @@ class StateStore:
         }
 
 
+#: Attributes a CURRENT row holds as strings, whenever it has them.
+_STRING_ATTRIBUTES = (
+    "sha256_hash",
+    "file_id",
+    "id_scheme",
+    "id_key_arn",
+    "file_name",
+    "current_state",
+    "s3_key",
+    "s3_key_scheme",
+    "s3_version_id",
+    "kms_key_id",
+    "algorithm",
+    "message_id",
+    "encrypted_at",
+    "last_updated",
+)
+#: Attributes a CURRENT row holds as maps of strings to strings.
+_STRING_MAP_ATTRIBUTES = ("encryption_context", "tags")
+
+
+def _kind(value: object) -> str:
+    return "null" if value is None else f"a {type(value).__name__}"
+
+
+def _is_string_map(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(inner, str) for key, inner in value.items()
+    )
+
+
+def _is_byte_count(value: object) -> bool:
+    """A whole, non-negative number: an int, or the Decimal DynamoDB returns for one."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return (
+        isinstance(value, Decimal)
+        and value.is_finite()
+        and value == value.to_integral_value()
+        and value >= 0
+    )
+
+
+def _malformed_attributes(item: Mapping[str, Any]) -> list[str]:
+    """What is wrong with the types of a CURRENT row's attributes ([] if nothing).
+
+    Absent attributes are fine (rows from older versions lack some); present
+    ones must have the type envault writes. Values are never quoted.
+    """
+    problems = [
+        f"{name} is {_kind(item[name])}, not a string"
+        for name in _STRING_ATTRIBUTES
+        if name in item and not isinstance(item[name], str)
+    ]
+    problems += [
+        f"{name} is not a map of strings"
+        for name in _STRING_MAP_ATTRIBUTES
+        if name in item and not _is_string_map(item[name])
+    ]
+    if "file_size_bytes" in item and not _is_byte_count(item["file_size_bytes"]):
+        problems.append("file_size_bytes is not a whole number of bytes")
+    return problems
+
+
+def _well_formed_records(
+    items: Iterable[dict[str, Any]],
+    on_malformed: Callable[[MalformedRecordError], None] | None,
+) -> list[FileRecord]:
+    """The rows that parse; each malformed one goes to ``on_malformed`` (default: logged)."""
+    records: list[FileRecord] = []
+    for item in items:
+        try:
+            records.append(_item_to_record(item))
+        except MalformedRecordError as exc:
+            if on_malformed is None:
+                logger.warning("Skipping a malformed record: %s", exc)
+            else:
+                on_malformed(exc)
+    return records
+
+
 def _item_to_record(item: dict[str, Any]) -> FileRecord:
     """Convert a raw DynamoDB item to a FileRecord, in either identifier layout.
 
     An unknown ``id_scheme`` is kept as it is, so that whoever uses the
     record can refuse it; it is never read as legacy.
+
+    Raises:
+        MalformedRecordError: An attribute has a type envault never writes
+            (anyone with write access to the table can put one there). Such a
+            row is never coerced into a record.
     """
+    problems = _malformed_attributes(item)
+    if problems:
+        raise MalformedRecordError(str(item.get("PK", "")).removeprefix(FILE_PREFIX), problems)
     scheme = item_id_scheme(item)
     return FileRecord(
         file_id=item_file_id(item),

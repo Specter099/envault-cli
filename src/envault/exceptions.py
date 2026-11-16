@@ -1,5 +1,12 @@
 """Custom exceptions for envault."""
 
+from collections.abc import Sequence
+
+
+def _printable(text: str) -> str:
+    """``text`` with every character outside printable ASCII written as a Python escape."""
+    return "".join(ch if " " <= ch <= "~" and ch != "\\" else ascii(ch)[1:-1] for ch in text)
+
 
 class EnvaultError(Exception):
     """Base exception for all envault errors."""
@@ -24,6 +31,34 @@ class AlreadyEncryptedError(EnvaultError):
 
 class StateConflictError(EnvaultError):
     """Raised when a state transition is not valid."""
+
+
+class MalformedRecordError(EnvaultError):
+    """A state-table row does not have the shape envault writes, so it is not used.
+
+    An attribute has the wrong type: a file name that is not a string, an
+    encryption context that is not a map of strings, a size that is not a
+    whole number of bytes. Rows come from DynamoDB, which anyone with write
+    access to the table can edit, so such a row is refused rather than guessed
+    at. Listings skip it and report it; a lookup that lands on it fails.
+
+    The message names the row by the first 16 characters of the identifier in
+    its key (``FILE#<identifier>``), with anything but printable ASCII
+    escaped, and names the attributes at fault, never their values.
+
+    Attributes:
+        row_id: The identifier part of the row's key, as stored.
+        problems: What is wrong, one entry per attribute.
+    """
+
+    def __init__(self, row_id: str, problems: Sequence[str]) -> None:
+        self.row_id = row_id
+        self.problems = tuple(problems)
+        shown = _printable(row_id[:16]) or "(an empty key)"
+        super().__init__(
+            f"The record stored under {shown}... is malformed: {'; '.join(self.problems)}. "
+            "Refusing to use it: the state table may have been tampered with."
+        )
 
 
 class ChecksumMismatchError(EnvaultError):
