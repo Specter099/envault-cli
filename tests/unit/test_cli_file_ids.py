@@ -1269,3 +1269,46 @@ def test_file_option_takes_only_an_identifier(env: dict[str, str], command: str)
 
     assert result.exit_code == 1
     assert "Invalid identifier" in result.output
+
+
+# ---------------------------------------------------------------------------
+# N10: encrypt says when the ID key is outside the trusted accounts
+# ---------------------------------------------------------------------------
+
+
+def test_encrypt_warns_once_when_the_id_key_is_outside_the_trusted_accounts(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """Records named with such a key are refused on read: say so while writing them."""
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    (batch / "a.txt").write_bytes(PIN)
+    (batch / "b.txt").write_bytes(OTHER)
+    elsewhere = {**env, "ENVAULT_ALLOWED_ACCOUNT_IDS": "111122223333"}
+
+    result = _run(elsewhere, "encrypt", str(batch))
+    read = _run(elsewhere, "decrypt", "a.txt", "-o", str(tmp_path / "out.txt"))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr.count("Warning:") == 1, result.stderr  # once, not per file
+    assert f"in account {ACCOUNT}" in result.stderr
+    assert "ENVAULT_ALLOWED_ACCOUNT_IDS" in result.stderr
+    assert "refused on read" in result.stderr
+    assert "Warning" not in result.stdout
+    assert read.exit_code == 1, read.output  # and so it is
+    assert "identifier key" in read.output
+
+
+@pytest.mark.parametrize("allowed", [None, "", ACCOUNT, f"111122223333, {ACCOUNT}"])
+def test_encrypt_does_not_warn_about_a_trusted_or_unchecked_id_key(
+    env: dict[str, str], tmp_path: pathlib.Path, allowed: str | None
+) -> None:
+    environment = {k: v for k, v in env.items() if k != "ENVAULT_ALLOWED_ACCOUNT_IDS"}
+    if allowed is not None:
+        environment["ENVAULT_ALLOWED_ACCOUNT_IDS"] = allowed
+    (tmp_path / "pin.txt").write_bytes(PIN)
+
+    result = _run(environment, "encrypt", str(tmp_path / "pin.txt"))
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" not in result.output

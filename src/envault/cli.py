@@ -57,8 +57,10 @@ from envault.fileid import (
     ID_SCHEMES,
     FileIdVerifier,
     IdKey,
+    KeyedFileId,
     check_id_key_arn,
     is_file_id,
+    parse_kms_key_arn,
     sha256_digest,
 )
 from envault.fileutils import best_effort_delete as _best_effort_delete
@@ -603,15 +605,64 @@ _id_key_lookup_option = click.option(
 )
 
 
-def _require_id_key(id_key_id: str | None, region: str) -> IdKey:
-    """The configured identifier key; a usage error (exit 2) if there is none."""
+# encrypt and migrate do not decrypt, but the records they write are read under
+# ENVAULT_ALLOWED_ACCOUNT_IDS, which must list the ID key's account (N10).
+_trusted_accounts_option = click.option(
+    "--allowed-account-ids",
+    envvar="ENVAULT_ALLOWED_ACCOUNT_IDS",
+    default="",
+    help="Comma-separated AWS account IDs trusted for decryption. Optional here: if set "
+    "and the ID key is in none of them, a warning says the records written now would be "
+    "refused on read.",
+)
+
+
+def _require_id_key(id_key_id: str | None, region: str, allowed_account_ids: str = "") -> IdKey:
+    """The configured identifier key; a usage error (exit 2) if there is none.
+
+    With ``allowed_account_ids`` (the raw option value) set, the key warns
+    once if it turns out to be in none of those accounts.
+    """
     if not id_key_id:
         raise click.UsageError(
             "No key to name files with: pass --id-key-id or set ENVAULT_ID_KEY_ID to the KMS "
             "HMAC key that derives file identifiers (alias/envault-id in the envault stack). "
             "envault no longer names new files by the SHA-256 of their content."
         )
+    trusted = [account.strip() for account in allowed_account_ids.split(",") if account.strip()]
+    if trusted:
+        return _TrustCheckedIdKey(id_key_id, region, trusted)
     return IdKey(id_key_id, region)
+
+
+class _TrustCheckedIdKey(IdKey):
+    """The ID key of encrypt or migrate, warning once if reads would refuse what it names.
+
+    Reading a keyed record checks its identifier key's account against
+    ENVAULT_ALLOWED_ACCOUNT_IDS before anything else. The key's account is
+    only known from the ARN KMS reports with the first identifier (GenerateMac),
+    so that is where it is checked: a warning on stderr, the command goes on.
+    """
+
+    def __init__(self, key_id: str, region: str, allowed_account_ids: Sequence[str]) -> None:
+        super().__init__(key_id, region)
+        self.allowed_account_ids = tuple(allowed_account_ids)
+        self._checked = False
+
+    def file_id(self, digest: bytes) -> KeyedFileId:
+        keyed = super().file_id(digest)
+        if not self._checked:
+            self._checked = True
+            arn = parse_kms_key_arn(keyed.key_arn)
+            if arn is not None and arn.account not in self.allowed_account_ids:
+                click.echo(
+                    f"Warning: the ID key {arn.arn} is in account {arn.account}, which "
+                    "ENVAULT_ALLOWED_ACCOUNT_IDS does not list. envault refuses to read a record "
+                    "whose identifier key is in an untrusted account, so the records written "
+                    f"now will be refused on read until {arn.account} is added to it.",
+                    err=True,
+                )
+        return keyed
 
 
 def _optional_id_key(id_key_id: str | None, region: str) -> IdKey | None:
@@ -645,6 +696,7 @@ def _exit_on_error(headline: str = "Error") -> Iterator[None]:
 @click.option("--force", is_flag=True, help="Re-encrypt even if already ENCRYPTED.")
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1", show_default=True)
 @_id_key_required_option
+@_trusted_accounts_option
 @_audit_ttl_option
 def encrypt(
     input_path: Path,
@@ -655,6 +707,7 @@ def encrypt(
     force: bool,
     region: str,
     id_key_id: str | None,
+    allowed_account_ids: str,
     audit_ttl_days: int,
 ) -> None:
     """Encrypt a file or directory and store state in DynamoDB.
@@ -672,7 +725,7 @@ def encrypt(
     key (ENVAULT_ID_KEY_ID), which reveals nothing about its content; the
     SHA-256 itself is never stored, uploaded or printed.
     """
-    id_key = _require_id_key(id_key_id, region)
+    id_key = _require_id_key(id_key_id, region, allowed_account_ids)
     config = Config(key_id=key_id, bucket=bucket, region=region, audit_ttl_days=audit_ttl_days)
     tags = _parse_tags(tag)
     store = StateStore(table_name=table, region=region)
@@ -1357,6 +1410,7 @@ _KMS_KEY_ARN_RE = re.compile(
 )
 @click.option("--dry-run", is_flag=True, help="Parse and verify without writing to DynamoDB.")
 @_id_key_required_option
+@_trusted_accounts_option
 @_audit_ttl_option
 def migrate(
     from_path: Path,
@@ -1367,6 +1421,7 @@ def migrate(
     bucket: str | None,
     dry_run: bool,
     id_key_id: str | None,
+    allowed_account_ids: str,
     audit_ttl_days: int,
 ) -> None:
     """Import the legacy shell workflow's metadata into DynamoDB.
@@ -1382,7 +1437,7 @@ def migrate(
 
     Exits 1 if any record could not be migrated.
     """
-    id_key = _require_id_key(id_key_id, region)
+    id_key = _require_id_key(id_key_id, region, allowed_account_ids)
     base = Path(os.path.abspath(from_path)).parent
     roots = _LegacyRoots(
         base=base,

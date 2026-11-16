@@ -320,6 +320,17 @@ def test_migrate_creates_keyed_records(legacy: Legacy) -> None:
         assert sha[:16] not in result.output
 
 
+def test_migrate_warns_once_when_the_id_key_is_outside_the_trusted_accounts(
+    legacy: Legacy,
+) -> None:
+    """N10, as for encrypt: the records migrated would be refused on read."""
+    result = _migrate(legacy, env={**legacy.env, "ENVAULT_ALLOWED_ACCOUNT_IDS": "111122223333"})
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr.count("Warning:") == 1, result.stderr
+    assert "refused on read" in result.stderr
+
+
 def test_migrate_records_legacy_sync_s3_key(legacy: Legacy) -> None:
     """The keys `aws s3 sync ../encrypted s3://$S3_BUCKET/encrypted` produced (M4 c)."""
     assert _migrate(legacy).exit_code == 0
