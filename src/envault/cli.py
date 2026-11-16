@@ -873,17 +873,18 @@ def decrypt(
                 version_id=version_id,
                 allow_latest=latest,
             )
-            result = decrypt_file(
+            # A keyed identifier is verified while the plaintext is still in a
+            # hidden .part file: only plaintext that passed every check is ever
+            # named ".verified", and the read is recorded before it is published.
+            decrypt_file(
                 input_path=tmp_encrypted,
                 output_path=staging,
                 expected_sha256=selection.expected_sha256,
                 region=region,
                 allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
+                verify_digest=_identity_check(selection, verifier),
             )
-            # Still hidden in the staging file: a keyed identifier is verified
-            # before the read is recorded or the plaintext published.
-            _verify_identity(selection, result.sha256_hash, verifier)
 
             # Fail closed, like exec: reading a file does not change what is stored
             # in S3, so current_state is left alone and the read is recorded as an
@@ -1783,6 +1784,9 @@ def _rotate_records(
                 allow_latest=latest,
             )
             selection = _Selection(record, expected_file_id=record.file_id)
+            # Verified (keyed records: VerifyMac) before the plaintext reaches
+            # tmp_pt, and so before anything is re-encrypted under the record's
+            # identifier.
             decrypted = decrypt_file(
                 tmp_dl,
                 tmp_pt,
@@ -1790,10 +1794,9 @@ def _rotate_records(
                 region=region,
                 allowed_account_ids=account_ids,
                 expected_context=record.encryption_context,
+                verify_digest=_identity_check(selection, verifier),
             )
             scratch.discard(tmp_dl)
-            # Before anything is re-encrypted under the record's identifier.
-            _verify_identity(selection, decrypted.sha256_hash, verifier)
 
             # The record keeps its identifier and scheme; the context names it
             # the way that scheme always has.
@@ -2186,15 +2189,15 @@ def _stream_secret(
         _s3_version_id(record, allow_latest),
         allow_latest=allow_latest,
     )
-    result = decrypt_to_stream(
+    decrypt_to_stream(
         ciphertext,
         out,
         expected_sha256=selection.expected_sha256,
         expected_context=record.encryption_context,
         region=region,
         allowed_account_ids=account_ids,
+        verify_digest=_identity_check(selection, verifier),
     )
-    _verify_identity(selection, result.sha256_hash, verifier)
 
 
 def _decode_secret(buf: bytearray, identifier: str) -> str:
@@ -2444,42 +2447,52 @@ class _Selection:
 
         For a legacy record the identifier is that SHA-256. For a keyed one it
         is only known when the operator typed it; the keyed identifier itself
-        is checked afterwards by :func:`_verify_identity`.
+        is checked by the check :func:`_identity_check` builds.
         """
         if self.record.id_scheme == ID_SCHEME_SHA256:
             return self.expected_file_id
         return self.typed_sha256
 
 
-def _verify_identity(
-    selection: _Selection, plaintext_sha256: str, verifier: FileIdVerifier
-) -> None:
-    """Refuse decrypted plaintext that is not the file a keyed record identifies.
+def _identity_check(
+    selection: _Selection, verifier: FileIdVerifier
+) -> Callable[[bytes], None] | None:
+    """The check decrypted plaintext must pass to be the file a keyed record identifies.
 
-    Runs after decryption into a staging file, a buffer or an unsealed memfd,
-    and before anything is published, sealed, handed to a command or
-    re-encrypted. For a keyed record KMS VerifyMac checks the expected
-    identifier against the plaintext's SHA-256 digest under the record's
-    identifier key (already found trustworthy by :func:`_check_record`). A
-    legacy record's identifier is the SHA-256 itself, which the crypto layer
-    compared with :attr:`_Selection.expected_sha256` while decrypting.
+    Passed to the crypto layer as ``verify_digest``, which calls it with the
+    plaintext's raw SHA-256 digest after decryption into a hidden ``.part``
+    file, a buffer or an unsealed memfd: before the plaintext is named,
+    published, sealed, handed to a command or re-encrypted. For a keyed record
+    KMS VerifyMac checks the expected identifier against that digest under the
+    record's identifier key (already found trustworthy by
+    :func:`_check_record`). A legacy record needs none (None): its identifier
+    is the SHA-256 itself, which the crypto layer compares with
+    :attr:`_Selection.expected_sha256` while decrypting.
 
-    Raises:
+    The check raises:
         FileIdMismatchError: The plaintext is not that file (an integrity failure).
         UntrustedIdKeyError: The record's identifier key is not trusted.
         KMSError: KMS could not answer (availability or permission).
+
+    Raises:
+        _IdentifierError: The record's identifier scheme is unknown
+            (:func:`_check_record` refuses these first).
     """
     record = selection.record
     if record.id_scheme == ID_SCHEME_SHA256:
-        return
-    if record.id_scheme != ID_SCHEME_HMAC_SHA256:  # _check_record refuses these first
+        return None
+    if record.id_scheme != ID_SCHEME_HMAC_SHA256:
         raise _IdentifierError(
             f"The record for {record.file_name!r} uses unknown identifier scheme "
             f"{record.id_scheme!r}; refusing to deliver it."
         )
-    verifier.verify(
-        selection.expected_file_id, sha256_digest(plaintext_sha256), key_arn=record.id_key_arn
-    )
+    expected_file_id = selection.expected_file_id
+    key_arn = record.id_key_arn
+
+    def check(digest: bytes) -> None:
+        verifier.verify(expected_file_id, digest, key_arn=key_arn)
+
+    return check
 
 
 def _resolve_identifier(

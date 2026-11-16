@@ -584,6 +584,25 @@ def _rewind_point(source: BinaryIO) -> int | None:
         return None
 
 
+#: Set on an exception a ``verify_digest`` callback raised. :func:`decrypt_file`
+#: does not retry such a failure: the callback has retried whatever was worth
+#: retrying, and decrypting again would repeat every KMS call for nothing (L1).
+_RAISED_BY_VERIFY_DIGEST = "_envault_raised_by_verify_digest"
+
+
+def _verify_digest(verify_digest: Callable[[bytes], None], result: DecryptResult) -> None:
+    """Hand the plaintext's raw SHA-256 digest to ``verify_digest``, marking what it raises."""
+    try:
+        verify_digest(bytes.fromhex(result.sha256_hash))
+    except Exception as exc:
+        setattr(exc, _RAISED_BY_VERIFY_DIGEST, True)
+        raise
+
+
+def _not_raised_by_verify_digest(exc: BaseException) -> bool:
+    return not getattr(exc, _RAISED_BY_VERIFY_DIGEST, False)
+
+
 def decrypt_to_stream(
     source: BinaryIO,
     out: BinaryIO,
@@ -593,13 +612,18 @@ def decrypt_to_stream(
     region: str = "us-east-1",
     allowed_account_ids: list[str] | None = None,
     retry_transient: bool = True,
+    verify_digest: Callable[[bytes], None] | None = None,
 ) -> DecryptResult:
     """Decrypt ``source`` into ``out``, verifying before the caller exposes it.
 
     The encryption context is checked against ``expected_context`` as soon as the
     ciphertext header is parsed — before a single plaintext byte is written — so
     a substituted ciphertext is rejected without ever materialising. The checksum
-    is verified after the stream completes.
+    is verified after the stream completes, and then ``verify_digest``, if given,
+    is called with the plaintext's raw 32-byte SHA-256 digest: a further check
+    the caller makes (envault's keyed identifiers: KMS VerifyMac) before this
+    returns. Whatever it raises propagates, and it is called once, outside the
+    retries described below.
 
     ``out`` may be any writable binary sink: a memfd from
     :class:`~envault.isolation.CredentialFd`, a buffer, or a file. The caller is
@@ -624,6 +648,8 @@ def decrypt_to_stream(
         retry_transient: False makes exactly one attempt. :func:`decrypt_file`
             passes False because it retries at its own level, with a fresh
             temporary file per attempt.
+        verify_digest: Called with the plaintext's raw SHA-256 digest once
+            it has been written to ``out`` and has passed the checksum.
 
     Returns:
         DecryptResult with the plaintext hash, size, and encryption context.
@@ -637,6 +663,7 @@ def decrypt_to_stream(
         KMSError: If KMS was throttled, unreachable, or refused the request
             (access denied, key disabled or pending deletion). Not evidence of
             tampering.
+        Exception: Whatever ``verify_digest`` raises.
     """
     if not allowed_account_ids:
         raise ConfigurationError(
@@ -659,14 +686,18 @@ def decrypt_to_stream(
         )
 
     if start is None:
-        return once()
+        result = once()
+    else:
 
-    @aws_retry(never=_DECRYPT_NEVER, when=lambda _exc: not sink.touched)
-    def attempt() -> DecryptResult:
-        source.seek(start)
-        return once()
+        @aws_retry(never=_DECRYPT_NEVER, when=lambda _exc: not sink.touched)
+        def attempt() -> DecryptResult:
+            source.seek(start)
+            return once()
 
-    return attempt()
+        result = attempt()
+    if verify_digest is not None:
+        verify_digest(bytes.fromhex(result.sha256_hash))
+    return result
 
 
 def _decrypt_stream_once(
@@ -723,7 +754,7 @@ def _decrypt_stream_once(
     )
 
 
-@aws_retry(never=_DECRYPT_NEVER)
+@aws_retry(never=_DECRYPT_NEVER, when=_not_raised_by_verify_digest)
 def decrypt_file(
     input_path: Path,
     output_path: Path,
@@ -731,17 +762,20 @@ def decrypt_file(
     region: str = "us-east-1",
     allowed_account_ids: list[str] | None = None,
     expected_context: dict[str, str] | None = None,
+    *,
+    verify_digest: Callable[[bytes], None] | None = None,
 ) -> DecryptResult:
     """Decrypt a file to a path, verifying before the plaintext becomes reachable.
 
     Plaintext is streamed to a temporary file in the destination directory and
-    renamed into place only after the encryption context and checksum both
-    verify, so a failed, truncated, or tampered decrypt never leaves partial or
-    unverified plaintext at the destination. On any failure the temporary file
-    is zero-overwritten and removed.
+    renamed into place only after the encryption context, the checksum and
+    ``verify_digest`` all pass, so a failed, truncated, or tampered decrypt
+    never leaves partial or unverified plaintext at the destination. On any
+    failure the temporary file is zero-overwritten and removed.
 
     Transient KMS failures are retried (up to 3 attempts), each attempt with a
-    new temporary file; integrity failures and interrupts never are.
+    new temporary file; integrity failures and interrupts never are, and
+    neither is anything ``verify_digest`` raises.
 
     Args:
         input_path: Path to the encrypted file.
@@ -751,6 +785,9 @@ def decrypt_file(
         allowed_account_ids: AWS account IDs trusted to have encrypted the data.
         expected_context: If provided, verified against the ciphertext header
             before any plaintext is written.
+        verify_digest: Called with the plaintext's raw 32-byte SHA-256 digest
+            after the checksum passed and before the rename: the file at
+            ``output_path`` exists only if it returns.
 
     Returns:
         DecryptResult with hash and size of the decrypted file.
@@ -764,6 +801,7 @@ def decrypt_file(
             deterministic.
         KMSError: If KMS was throttled or unavailable on every attempt, or
             refused the request (access denied, key disabled).
+        Exception: Whatever ``verify_digest`` raises.
     """
     logger.info("Decrypting file", extra={"input": str(input_path)})
 
@@ -791,6 +829,10 @@ def decrypt_file(
                     allowed_account_ids=allowed_account_ids,
                     retry_transient=False,
                 )
+        # Still under its hidden .part name: the plaintext gets the name the
+        # caller asked for only once every check has passed.
+        if verify_digest is not None:
+            _verify_digest(verify_digest, result)
         os.replace(tmp_path, output_path)
     finally:
         if tmp_fd >= 0:

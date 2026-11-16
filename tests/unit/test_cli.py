@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -396,9 +396,10 @@ def _make_mock_decrypt(header_context: dict[str, str], content: bytes = b"decryp
     """Build a fake decrypt_file that mirrors the real ordering guarantee.
 
     The real implementation verifies the encryption context against the
-    ciphertext header *before* writing any plaintext, so the fake does too —
-    otherwise these tests would assert against a laxer contract than the code
-    they stand in for.
+    ciphertext header *before* writing any plaintext, and calls
+    ``verify_digest`` before the plaintext gets ``output_path``'s name, so the
+    fake does too — otherwise these tests would assert against a laxer
+    contract than the code they stand in for.
     """
 
     def _mock(
@@ -408,9 +409,13 @@ def _make_mock_decrypt(header_context: dict[str, str], content: bytes = b"decryp
         region: str = "us-east-1",
         allowed_account_ids: list[str] | None = None,
         expected_context: dict[str, str] | None = None,
+        *,
+        verify_digest: Callable[[bytes], None] | None = None,
     ) -> DecryptResult:
         if expected_context is not None:
             verify_encryption_context(expected_context, header_context)
+        if verify_digest is not None:
+            verify_digest(hashlib.sha256(content).digest())
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(content)
         return DecryptResult(

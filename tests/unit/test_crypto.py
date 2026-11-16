@@ -830,6 +830,107 @@ def test_decrypt_to_stream_retry_transient_false_makes_one_attempt(
 
 
 # ---------------------------------------------------------------------------
+# N3: verify_digest runs before the plaintext gets its name, and is not retried
+# ---------------------------------------------------------------------------
+
+
+def _transient_kms_error() -> Exception:
+    """What FileIdVerifier.verify raises once VerifyMac throttling outlasted its retries."""
+    from envault.exceptions import KMSError
+
+    try:
+        raise _client_error("ThrottlingException", "VerifyMac")
+    except ClientError as cause:
+        try:
+            raise KMSError("throttled", operation="VerifyMac", transient=True) from cause
+        except KMSError as error:
+            return error
+
+
+def test_decrypt_file_verifies_the_digest_before_the_rename(kms_key: str, tmp_path: Path) -> None:
+    encrypted, _ = _encrypt_marker(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "plain.txt"
+    seen: list[tuple[bytes, list[str]]] = []
+
+    def verify_digest(digest: bytes) -> None:
+        seen.append((digest, sorted(p.name for p in out_dir.iterdir())))
+
+    result = decrypt_file(
+        encrypted, output, allowed_account_ids=[MOTO_ACCOUNT_ID], verify_digest=verify_digest
+    )
+
+    [(digest, listing)] = seen
+    assert digest == hashlib.sha256(PLAINTEXT_MARKER).digest()  # the raw 32 bytes
+    assert len(listing) == 1 and listing[0].endswith(".part"), listing  # not yet plain.txt
+    assert output.read_bytes() == PLAINTEXT_MARKER
+    assert result.sha256_hash == hashlib.sha256(PLAINTEXT_MARKER).hexdigest()
+    assert digest.hex() not in repr(result)
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "transient-kms"])
+def test_decrypt_file_rejected_digest_leaves_nothing_and_is_not_retried(
+    kms_key: str, tmp_path: Path, no_retry_sleep: list[float], failure: str
+) -> None:
+    from envault.exceptions import FileIdMismatchError
+
+    encrypted, _ = _encrypt_marker(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    output = out_dir / "plain.txt"
+    error = FileIdMismatchError("f" * 64) if failure == "mismatch" else _transient_kms_error()
+    calls: list[bytes] = []
+
+    def verify_digest(digest: bytes) -> None:
+        calls.append(digest)
+        raise error
+
+    with _kms_faults() as kms_calls:
+        with pytest.raises(type(error)) as exc_info:
+            decrypt_file(
+                encrypted,
+                output,
+                allowed_account_ids=[MOTO_ACCOUNT_ID],
+                verify_digest=verify_digest,
+            )
+
+    assert exc_info.value is error
+    assert len(calls) == 1, "the callback retries on its own; decrypting again cannot help"
+    assert kms_calls["Decrypt"] == 1
+    assert no_retry_sleep == []
+    assert list(out_dir.iterdir()) == [], "no output, no .part"
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "transient-kms"])
+def test_decrypt_to_stream_checks_the_digest_once_before_returning(
+    kms_key: str, tmp_path: Path, no_retry_sleep: list[float], failure: str
+) -> None:
+    from envault.exceptions import FileIdMismatchError
+
+    encrypted, _ = _encrypt_marker(tmp_path, content=b"")  # nothing written: still no retry
+    error = FileIdMismatchError("f" * 64) if failure == "mismatch" else _transient_kms_error()
+    calls: list[bytes] = []
+
+    def verify_digest(digest: bytes) -> None:
+        calls.append(digest)
+        raise error
+
+    with _kms_faults() as kms_calls:
+        with pytest.raises(type(error)):
+            decrypt_to_stream(
+                io.BytesIO(encrypted.read_bytes()),
+                io.BytesIO(),
+                allowed_account_ids=[MOTO_ACCOUNT_ID],
+                verify_digest=verify_digest,
+            )
+
+    assert calls == [hashlib.sha256(b"").digest()]
+    assert kms_calls["Decrypt"] == 1
+    assert no_retry_sleep == []
+
+
+# ---------------------------------------------------------------------------
 # r15: properties that must stay true (regression guards)
 # ---------------------------------------------------------------------------
 

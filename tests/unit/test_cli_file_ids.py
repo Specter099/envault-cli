@@ -19,6 +19,7 @@ import base64
 import hashlib
 import io
 import logging
+import os
 import pathlib
 import time
 import urllib.parse
@@ -40,6 +41,7 @@ from envault import cli as cli_mod
 from envault import identity
 from envault.cli import main
 from envault.crypto import decrypt_to_stream, encrypt_file
+from envault.fileid import FileIdVerifier
 from envault.state import ENCRYPTED, StateStore
 
 from ._id_key import ID_KEY_ALIAS, create_id_key, file_id_of
@@ -936,6 +938,80 @@ def test_a_keyed_record_pointed_at_other_content_is_refused(
         _assert_not_exposed(content, f"{how} output", result.output)
     accesses = StateStore(TABLE, REGION).list_events_for_file(pin_id)
     assert not [e for e in accesses if e["operation"] in ("DECRYPT", "ACCESS")]
+
+
+@contextmanager
+def _naming_log(directory: pathlib.Path) -> Iterator[list[tuple[str, tuple[str, ...]]]]:
+    """Log, in order, each name a file is given in ``directory`` and each VerifyMac call.
+
+    ("name", (n,)): something was renamed or linked to ``directory/n``.
+    ("verify", names): VerifyMac was called while ``directory`` held ``names``.
+    """
+    log: list[tuple[str, tuple[str, ...]]] = []
+
+    def recording(real: Any) -> Any:
+        def call(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+            if pathlib.Path(dst).parent == directory:
+                log.append(("name", (pathlib.Path(dst).name,)))
+            return real(src, dst, *args, **kwargs)
+
+        return call
+
+    real_verify = FileIdVerifier.verify
+
+    def verify(self: Any, *args: Any, **kwargs: Any) -> Any:
+        log.append(("verify", tuple(sorted(p.name for p in directory.iterdir()))))
+        return real_verify(self, *args, **kwargs)
+
+    with (
+        patch("os.replace", recording(os.replace)),
+        patch("os.rename", recording(os.rename)),
+        patch("os.link", recording(os.link)),
+        patch.object(FileIdVerifier, "verify", verify),
+    ):
+        yield log
+
+
+def test_mac_mismatch_never_names_plaintext_verified(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """N3: plaintext whose MAC does not verify never sits under a ".verified" name."""
+    pin_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+    other_id = _encrypt(env, tmp_path, "db.env", OTHER)
+    _substitute_ciphertext(_current(pin_id), _current(other_id))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    with _naming_log(out_dir) as log:
+        result = _run(env, "decrypt", "pin.txt", "-o", str(out_dir))
+
+    assert result.exit_code == 1, result.output
+    assert "checksum mismatch" in result.output.lower()
+    assert [kind for kind, _ in log] == ["verify"], log  # VerifyMac ran, nothing was named
+    [(_, present)] = log
+    assert len(present) == 1 and present[0].endswith(".part"), present  # still in progress
+    assert not [n for _, names in log for n in names if n.endswith(".verified")], log
+    assert list(out_dir.iterdir()) == []
+
+
+def test_plaintext_is_named_verified_only_after_its_mac_verifies(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    _encrypt(env, tmp_path, "pin.txt", PIN)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    with _naming_log(out_dir) as log:
+        result = _run(env, "decrypt", "pin.txt", "-o", str(out_dir))
+
+    assert result.exit_code == 0, result.output
+    (first_kind, present), *rest = log
+    assert first_kind == "verify", log
+    assert len(present) == 1 and present[0].endswith(".part"), log  # not yet ".verified"
+    named = [names[0] for kind, names in rest if kind == "name"]
+    assert named[0].startswith(".pin.txt.") and named[0].endswith(".verified"), log
+    assert named[-1] == "pin.txt"
+    assert (out_dir / "pin.txt").read_bytes() == PIN
 
 
 def test_a_keyed_row_describing_another_file_is_refused(
