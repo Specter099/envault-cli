@@ -143,6 +143,60 @@ def test_third_signal_ends_the_process_at_once(tmp_path: pathlib.Path) -> None:
     proc.communicate()
 
 
+def test_third_signal_ends_the_process_inside_a_deferred_section(tmp_path: pathlib.Path) -> None:
+    """N5: signals held by a deferred section count towards the third-signal escape.
+
+    Cleanup itself runs deferred (zero-fill, unlink), so a hang there must
+    not make envault unkillable without SIGKILL.
+    """
+    script = tmp_path / "held.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import time
+            from envault.cli import _install_signal_handlers, _signals_deferred
+            _install_signal_handlers()
+            with _signals_deferred():
+                print("HOLDING", flush=True)
+                time.sleep(60)  # a zero-fill or an unlink that hangs
+            print("RELEASED", flush=True)
+            """
+        )
+    )
+    proc = subprocess.Popen(  # noqa: S603
+        [sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == b"HOLDING"
+        for _ in range(2):  # the first is held for later, the second ignored
+            proc.send_signal(signal.SIGTERM)
+            time.sleep(0.3)
+        assert proc.poll() is None
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)  # the third ends it, held or not
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+        assert time.monotonic() - started < 10
+        out, _ = proc.communicate()
+        assert b"RELEASED" not in out
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
+def test_signals_held_in_a_deferred_section_count_towards_the_escape(handlers: None) -> None:
+    seen: dict[str, int | None] = {}
+    with pytest.raises(SystemExit) as exc_info:
+        with cli_mod._signals_deferred():
+            _signal_self(signal.SIGTERM)  # held
+            _signal_self(signal.SIGINT)  # counted: one more ends the process
+            seen.update(pending=cli_mod._signals.pending, ignored=cli_mod._signals.ignored)
+    assert seen == {"pending": signal.SIGTERM, "ignored": 1}
+    assert exc_info.value.code == 143  # the first one is the one acted on
+    assert cli_mod._signals.ignored == 1
+
+
 def test_signal_during_deferred_section_is_delivered_after_it(handlers: None) -> None:
     steps: list[str] = []
     with pytest.raises(SystemExit) as exc_info:

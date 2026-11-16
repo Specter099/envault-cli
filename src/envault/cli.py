@@ -245,8 +245,9 @@ def _friendly_message(e: click.UsageError) -> str:
 # runs. After the first of these signals, the next one is ignored: the process
 # is already on its way out, and a second Ctrl-C must not cut the overwrite of
 # plaintext short. A third ends the process at once, in case something holds
-# it up. Signals are deferred (held, then acted on), never blocked with a
-# signal mask, which the command `exec` starts would inherit.
+# it up, even inside a deferred section. Signals are deferred (held, then acted
+# on), never blocked with a signal mask, which the command `exec` starts would
+# inherit.
 # ---------------------------------------------------------------------------
 
 #: Stop signals ignored during shutdown before the next one ends the process.
@@ -274,8 +275,13 @@ def _stop_exception(signum: int) -> BaseException:
 
 
 def _on_stop_signal(signum: int, frame: FrameType | None) -> None:
-    """Handler for SIGTERM, SIGHUP and SIGINT once the entry point installed it."""
-    if _signals.stopping is not None:
+    """Handler for SIGTERM, SIGHUP and SIGINT once the entry point installed it.
+
+    Every stop signal counts towards the third-signal escape, including those
+    that arrive while a deferred section holds the first: a cleanup that hangs
+    inside one must not make the process unkillable short of SIGKILL.
+    """
+    if _signals.stopping is not None or _signals.pending is not None:
         _signals.ignored += 1
         if _signals.ignored > _SIGNALS_IGNORED_WHILE_STOPPING:
             # The operator insists: end now, cleanup or not.
@@ -283,8 +289,7 @@ def _on_stop_signal(signum: int, frame: FrameType | None) -> None:
             os.kill(os.getpid(), signum)
         return
     if _signals.deferring:
-        if _signals.pending is None:
-            _signals.pending = signum
+        _signals.pending = signum
         return
     _signals.stopping = signum
     raise _stop_exception(signum)
