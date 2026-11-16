@@ -48,6 +48,12 @@ class EncryptionContextMismatchError(EnvaultError):
     def __init__(self, expected: dict[str, str], actual: dict[str, str]) -> None:
         self.expected = expected
         self.actual = actual
+        if not expected:
+            super().__init__(
+                "Refusing to decrypt with an empty encryption context. "
+                "AAD checks for purpose/sha256/file_name/kms_key_alias would be skipped."
+            )
+            return
         # Identify which application-level keys differ
         diff_keys = [k for k in expected if actual.get(k) != expected[k]]
         detail = ", ".join(diff_keys) if diff_keys else "unknown"

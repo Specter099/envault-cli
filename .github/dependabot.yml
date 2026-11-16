@@ -21,3 +21,14 @@ updates:
       - "chore"
     commit-message:
       prefix: "chore"
+
+  # CDK stack dependencies live in a separate requirements.txt
+  - package-ecosystem: "pip"
+    directory: "/infra/cdk"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "chore"
+    commit-message:
+      prefix: "chore"

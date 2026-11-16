@@ -26,6 +26,8 @@ dependencies = [
     "boto3>=1.26.0,<2",
     "click>=8.1.0,<9",
     "rich>=13.0.0,<16",
+    # Transitive of rich; pin past CVE-2026-4539 (ReDoS in AdlLexer < 2.20.0).
+    "pygments>=2.20.0,<4",
     "tenacity>=8.2.0,<10",
     # >=3 required: cli.py imports pythonjsonlogger.json (moved in 3.0)
     "python-json-logger>=3.0.0,<5",
