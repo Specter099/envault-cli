@@ -58,12 +58,19 @@ def _clear_identity_cache() -> Iterator[None]:
 
 @pytest.fixture
 def handlers() -> Iterator[None]:
-    """Install the CLI's signal handlers for one test, then put the old ones back."""
+    """Install the CLI's signal handlers for one test, then put the old ones back.
+
+    The handlers leave a signal the parent ignored alone, by design, and the
+    test run may have inherited an ignored SIGHUP (``nohup pytest``). These
+    tests are about the handlers, so SIGHUP starts at its default here.
+    """
+    previous_sighup = signal.signal(signal.SIGHUP, signal.SIG_DFL)
     restore = cli_mod._install_signal_handlers()
     try:
         yield
     finally:
         restore()
+        signal.signal(signal.SIGHUP, previous_sighup)
 
 
 def _signal_self(signum: int) -> None:
@@ -351,6 +358,9 @@ _CHILD = textwrap.dedent(
     from envault.cli import cli, main
     from unit._id_key import create_id_key, install_generate_mac_key_arn_fix
 
+    # As envault would start from a shell, whatever the test run inherited
+    # (nohup ignores SIGHUP); IGNORE_SIGHUP below ignores it on purpose.
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
     install_generate_mac_key_arn_fix()
     with mock_aws():
         kms = boto3.client("kms", region_name="us-east-1")

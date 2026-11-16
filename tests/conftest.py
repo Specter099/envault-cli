@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import signal
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import boto3
@@ -26,6 +28,33 @@ def aws_credentials():
     os.environ["AWS_SECURITY_TOKEN"] = "testing"  # noqa: S105
     os.environ["AWS_SESSION_TOKEN"] = "testing"  # noqa: S105
     os.environ["AWS_DEFAULT_REGION"] = REGION
+
+
+_PROCESS_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGPIPE", "SIGXFSZ")
+    if hasattr(signal, name)
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_signal_dispositions() -> Iterator[None]:
+    """Put back the signal dispositions and signal mask a test changed.
+
+    `envault exec` sets the stop signals, SIGPIPE and SIGXFSZ to their
+    defaults just before os.execvpe, which in-process tests replace: without
+    this, a test that ran exec would leave the whole test run with a default
+    SIGINT (no KeyboardInterrupt) and SIGPIPE.
+    """
+    saved = {signum: signal.getsignal(signum) for signum in _PROCESS_SIGNALS}
+    has_mask = hasattr(signal, "pthread_sigmask")
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, []) if has_mask else None
+    yield
+    for signum, handler in saved.items():
+        if handler is not None:
+            signal.signal(signum, handler)
+    if mask is not None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 @pytest.fixture(autouse=True)
