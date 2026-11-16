@@ -641,6 +641,10 @@ class EnvaultStack(Stack):
         cdk.CfnOutput(self, "TableName", value=table.table_name)
         cdk.CfnOutput(self, "ManagedPolicyArn", value=policy.managed_policy_arn)
 
+        # ENVAULT_ALLOWED_ACCOUNT_IDS: decryption trusts only data keys, and
+        # reads trust only identifier keys, in the listed accounts. Both keys
+        # are in this stack's account. Keys from additional_kms_key_arns in
+        # other accounts must be added by hand.
         cdk.CfnOutput(
             self,
             "EnvaultEnvVars",
@@ -648,7 +652,8 @@ class EnvaultStack(Stack):
                 f"export ENVAULT_KEY_ID=alias/envault\n"
                 f"export ENVAULT_ID_KEY_ID={ID_KEY_ALIAS}\n"
                 f"export ENVAULT_BUCKET={bucket.bucket_name}\n"
-                f"export ENVAULT_TABLE={table.table_name}"
+                f"export ENVAULT_TABLE={table.table_name}\n"
+                f"export ENVAULT_ALLOWED_ACCOUNT_IDS={self.account}"
             ),
             description="Copy-paste these env vars to configure the envault CLI",
         )

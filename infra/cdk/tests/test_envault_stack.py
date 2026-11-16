@@ -306,7 +306,8 @@ def test_outputs_point_at_the_data_bucket(tmp_path: Path, context: dict[str, Any
         "export ENVAULT_KEY_ID=alias/envault\n"
         "export ENVAULT_ID_KEY_ID=alias/envault-id\n"
         f"export ENVAULT_BUCKET=<{DATA_BUCKET}>\n"
-        f"export ENVAULT_TABLE=<{STATE_TABLE}>"
+        f"export ENVAULT_TABLE=<{STATE_TABLE}>\n"
+        f"export ENVAULT_ALLOWED_ACCOUNT_IDS={ACCOUNT}"
     )
 
 
