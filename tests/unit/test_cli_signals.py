@@ -450,6 +450,15 @@ _CHILD = textwrap.dedent(
         print("READY", flush=True)
         if os.environ.get("IGNORE_SIGHUP"):
             signal.signal(signal.SIGHUP, signal.SIG_IGN)  # as nohup would
+        if os.environ.get("STOP_AT"):
+            # SIGTERM right after this function of envault.cli returns.
+            import envault.cli as cli_module
+            real = getattr(cli_module, os.environ["STOP_AT"])
+            def stop_after(*args, **kwargs):
+                result = real(*args, **kwargs)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return result
+            setattr(cli_module, os.environ["STOP_AT"], stop_after)
         sys.argv = ["envault", *sys.argv[1:]]
         cli()
     """
@@ -587,3 +596,107 @@ def test_exec_child_gets_default_signal_dispositions(
     assert bool(masks["SigIgn"] & bit[signal.SIGHUP]) is parent_ignores_sighup
     assert not masks["SigIgn"] & bit[signal.SIGTERM]
     assert not masks["SigIgn"] & bit[signal.SIGPIPE]
+
+
+# ---------------------------------------------------------------------------
+# N6: a stop signal just before exec is never lost
+# ---------------------------------------------------------------------------
+
+_STOP_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+
+
+def test_exec_holds_stop_signals_from_the_last_check_until_execve(
+    env: dict[str, str],
+) -> None:
+    """The order that closes the race (call order: the race itself is not reproducible).
+
+    A stop signal whose C-level handler runs just before execve was never
+    acted on: the command started with the secrets. Now the stop signals are
+    blocked (pending handlers run as that call returns), dispositions set to
+    their defaults, and only then the original mask restored, so a stop that
+    arrived in between ends envault with its default action before execve.
+    The command still inherits an unblocked mask and default dispositions.
+    """
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)  # whatever the test run inherited
+    events: list[tuple[object, ...]] = []
+    real_mask, real_signal = signal.pthread_sigmask, signal.signal
+
+    def mask(how: int, signals: object) -> set[int]:
+        result = real_mask(how, signals)  # type: ignore[arg-type]
+        events.append(("mask", how, frozenset(signals)))  # type: ignore[arg-type]
+        return result
+
+    def disposition(signum: int, handler: object) -> object:
+        events.append(("signal", signum, handler))
+        return real_signal(signum, handler)  # type: ignore[arg-type]
+
+    def execvpe(file: str, argv: list[str], child_env: dict[str, str]) -> None:
+        blocked = real_mask(signal.SIG_BLOCK, [])
+        handlers = {s: signal.getsignal(s) for s in (*_STOP_SIGNALS, signal.SIGPIPE)}
+        events.append(("exec", frozenset(blocked), handlers))
+
+    with (
+        patch("signal.pthread_sigmask", mask),
+        patch("signal.signal", disposition),
+        patch("os.execvpe", execvpe),
+    ):
+        result = _run(env, "exec", "-f", "big.dat=F", "--", "/bin/true")
+
+    assert result.exit_code == 0, result.output
+    kinds = [event[0] for event in events]
+    block = events.index(("mask", signal.SIG_BLOCK, _STOP_SIGNALS))
+    resets = [i for i, e in enumerate(events) if e[0] == "signal" and e[1] in _STOP_SIGNALS]
+    unblock = max(i for i, e in enumerate(events) if e[:2] == ("mask", signal.SIG_SETMASK))
+    exec_at = kinds.index("exec")
+    assert block < min(resets), events
+    assert {events[i][1] for i in resets} == _STOP_SIGNALS
+    assert all(events[i][2] == signal.SIG_DFL for i in resets), events
+    assert max(resets) < unblock < exec_at, events
+    _, blocked_at_exec, handlers_at_exec = events[exec_at]
+    assert not blocked_at_exec & _STOP_SIGNALS  # type: ignore[operator]
+    assert set(handlers_at_exec.values()) == {signal.SIG_DFL}  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("stop_at", "returncode"),
+    [
+        # The handler runs at once: SystemExit(143), as for any SIGTERM.
+        ("_substitute_paths", 143),
+        # Blocked by then: pending until the mask is restored, then the default action.
+        ("_default_signals_for_child", -signal.SIGTERM),
+    ],
+)
+def test_exec_stopped_after_the_audit_write_never_starts_the_command(
+    tmp_path: pathlib.Path, stop_at: str, returncode: int
+) -> None:
+    """SIGTERM after the ACCESS event is written, before execve: no command, no secret."""
+    proc = _spawn(
+        tmp_path,
+        "exec",
+        "-s",
+        "big.dat=SECRET",
+        "--",
+        "sh",
+        "-c",
+        "echo ran > ran.txt",
+        extra={"BIG_MB": "1", "STOP_AT": stop_at},
+    )
+    code, stderr = _finish(proc)
+
+    assert code == returncode, stderr
+    assert not (tmp_path / "ran.txt").exists(), "the command ran"
+    assert "Traceback" not in stderr
+
+
+def test_exec_that_cannot_start_the_command_puts_the_handlers_back(
+    env: dict[str, str], handlers: None
+) -> None:
+    before = {s: signal.getsignal(s) for s in (*_STOP_SIGNALS, signal.SIGPIPE)}
+
+    result = _run(env, "exec", "-f", "big.dat=F", "--", "/nonexistent/envault-test-command")
+
+    assert result.exit_code == 127, result.output
+    assert "Could not run" in result.output
+    assert {s: signal.getsignal(s) for s in before} == before
+    assert before[signal.SIGTERM] is cli_mod._on_stop_signal
+    assert not signal.pthread_sigmask(signal.SIG_BLOCK, []) & _STOP_SIGNALS

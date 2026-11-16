@@ -246,8 +246,9 @@ def _friendly_message(e: click.UsageError) -> str:
 # is already on its way out, and a second Ctrl-C must not cut the overwrite of
 # plaintext short. A third ends the process at once, in case something holds
 # it up, even inside a deferred section. Signals are deferred (held, then acted
-# on), never blocked with a signal mask, which the command `exec` starts would
-# inherit.
+# on), not blocked with a signal mask, which the command `exec` starts would
+# inherit; exec blocks them only from its last check for a stop until just
+# before execve (see _exec_unless_stopped).
 # ---------------------------------------------------------------------------
 
 #: Stop signals ignored during shutdown before the next one ends the process.
@@ -344,19 +345,94 @@ def _install_signal_handlers() -> Callable[[], None]:
     return restore
 
 
-def _default_signals_for_child() -> dict[int, Any]:
-    """Reset SIGPIPE and SIGXFSZ, which Python ignores, before exec (as subprocess does).
+#: The signals envault treats as a request to stop.
+_STOP_SIGNAL_NAMES = ("SIGINT", "SIGTERM", "SIGHUP")
 
-    Ignored dispositions survive execve: without this, the command `exec`
-    starts would see EPIPE instead of being stopped by SIGPIPE. Returns the
-    previous handlers, to put back if the exec fails.
+
+def _default_signals_for_child() -> dict[int, Any]:
+    """Set the dispositions the command `exec` starts inherits; return the previous ones.
+
+    The stop signals go to SIG_DFL, as execve would reset envault's handlers
+    anyway, but now, while they are blocked: one that is still pending when
+    the mask is restored then ends envault before the command starts. A stop
+    signal the parent ignored stays ignored (``nohup`` ignores SIGHUP), as
+    execve would keep it. SIGPIPE and SIGXFSZ, which Python ignores, go to
+    SIG_DFL as subprocess does: ignored dispositions survive execve, and the
+    command would see EPIPE instead of being stopped by SIGPIPE. The previous
+    handlers are put back if the exec fails.
     """
     previous: dict[int, Any] = {}
+    for name in _STOP_SIGNAL_NAMES:
+        signum = getattr(signal, name, None)
+        if signum is not None and signal.getsignal(signum) != signal.SIG_IGN:
+            previous[signum] = signal.signal(signum, signal.SIG_DFL)
     for name in ("SIGPIPE", "SIGXFSZ"):
         signum = getattr(signal, name, None)
         if signum is not None:
             previous[signum] = signal.signal(signum, signal.SIG_DFL)
     return previous
+
+
+def _raise_if_stop_requested() -> None:
+    """Act on a stop signal that was recorded but not acted on yet."""
+    signum = _signals.pending if _signals.pending is not None else _signals.stopping
+    if signum is not None:
+        _signals.pending = None
+        _signals.stopping = signum
+        raise _stop_exception(signum)
+
+
+def _exec_unless_stopped(argv: list[str], env: dict[str, str]) -> None:
+    """Replace this process with ``argv`` (os.execvpe), unless a stop signal came first.
+
+    A stop signal is acted on by a Python-level handler, which runs between
+    bytecodes. One whose C-level handler ran just before execve was never
+    acted on: the command started, with the secrets, although the operator
+    had asked envault to stop. So:
+
+    1. SIGINT, SIGTERM and SIGHUP are blocked: from here on, one stays
+       pending in the kernel. Python runs the handlers of those that arrived
+       before (``pthread_sigmask`` does that before returning): envault's
+       raises SystemExit or KeyboardInterrupt, and nothing is executed.
+    2. A stop recorded but not acted on yet stops it too.
+    3. The dispositions the command inherits are set
+       (:func:`_default_signals_for_child`).
+    4. The original signal mask is restored: a stop signal that arrived
+       since step 1 now ends envault with its default action.
+    5. execve.
+
+    The command inherits envault's original mask and default dispositions.
+
+    Raises:
+        OSError: execve failed; envault's handlers are back in place.
+        SystemExit, KeyboardInterrupt: A stop signal arrived first.
+    """
+    stop_signals = {getattr(signal, name) for name in _STOP_SIGNAL_NAMES if hasattr(signal, name)}
+    can_block = hasattr(signal, "pthread_sigmask")
+    # The current mask; first, Python runs the handler of any stop signal
+    # that has already arrived, while nothing has been changed.
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, []) if can_block else None
+    try:
+        if can_block:
+            signal.pthread_sigmask(signal.SIG_BLOCK, stop_signals)
+        _raise_if_stop_requested()
+        previous = _default_signals_for_child()
+    except BaseException:
+        if original_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+        raise
+    try:
+        if original_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+        # No shell, deliberately: argv is passed through untouched so a secret
+        # or filename can never be reinterpreted as shell syntax. execve
+        # (rather than fork) also replaces this address space, discarding
+        # every plaintext copy CPython made while decrypting.
+        os.execvpe(argv[0], argv, env)  # noqa: S606
+    except OSError:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        raise
 
 
 def _destroy(path: Path, plaintext: bool) -> None:
@@ -2148,21 +2224,19 @@ def exec_(
     sys.stdout.flush()
     sys.stderr.flush()
 
-    # execve resets envault's own signal handlers to their defaults in the child
-    # (and keeps a SIGHUP the parent ignored, ignored); nothing is blocked.
-    previous_handlers = _default_signals_for_child()
+    # The command starts with default signal dispositions (a SIGHUP the parent
+    # ignored stays ignored) and nothing blocked, and never after a stop
+    # signal, however late it arrived.
     try:
-        # No shell, deliberately: argv is passed through untouched so a secret or
-        # filename can never be reinterpreted as shell syntax. execve (rather
-        # than fork) also replaces this address space, discarding every plaintext
-        # copy CPython made while decrypting.
-        os.execvpe(argv[0], argv, child_env)  # noqa: S606
+        _exec_unless_stopped(argv, child_env)
     except OSError as exc:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
         _close_all(creds, [])
         console.print(f"[bold red]Could not run {_display(argv[0])}:[/bold red] {_display(exc)}")
         sys.exit(127)
+    except BaseException:
+        # Stopped before execve: the command never starts.
+        _close_all(creds, [])
+        raise
 
 
 def _close_all(creds: list[CredentialFd], sinks: list[_BufferSink]) -> None:
