@@ -208,3 +208,41 @@ def test_decrypt_of_tampered_ciphertext_leaves_nothing(
     assert list(private_tempdir.iterdir()) == []
     events = store.list_events_for_file(record.file_id)
     assert not [e for e in events if e["operation"] == "DECRYPT"]
+
+
+# ---------------------------------------------------------------------------
+# R2: an output path written as a directory must be one
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("missing", ["missing-dir/", "missing-dir//", "a/b/"])
+def test_decrypt_output_with_trailing_slash_must_exist(
+    env: dict[str, str], tmp_path: pathlib.Path, missing: str
+) -> None:
+    """`-o out/` names a directory: when there is none, refuse (exit 2) instead of a file `out`."""
+    target = f"{tmp_path}/{missing}"
+
+    result = _run(env, "decrypt", "s.txt", "-o", target)
+
+    assert result.exit_code == 2, result.output
+    assert "not an existing directory" in result.output
+    assert not (tmp_path / missing.split("/")[0]).exists()  # neither a file nor a directory
+    events = StateStore(TABLE, REGION).list_events_for_file(file_id_of(SECRET))
+    assert [e["operation"] for e in events] == ["ENCRYPT"], "refused before anything was read"
+
+
+def test_decrypt_output_with_trailing_slash_into_existing_directory(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    a_file = tmp_path / "a-file"
+    a_file.write_bytes(b"not a directory")
+
+    into_dir = _run(env, "decrypt", "s.txt", "-o", f"{out_dir}/")
+    onto_file = _run(env, "decrypt", "s.txt", "-o", f"{a_file}/")
+
+    assert into_dir.exit_code == 0, into_dir.output
+    assert (out_dir / "s.txt").read_bytes() == SECRET
+    assert onto_file.exit_code == 2, onto_file.output
+    assert a_file.read_bytes() == b"not a directory"

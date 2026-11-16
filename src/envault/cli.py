@@ -763,10 +763,12 @@ def _encrypt_fd(
 @click.option(
     "--output",
     "-o",
-    type=click.Path(path_type=Path),
-    default=Path("."),
+    # Kept as typed: a trailing separator says "directory", and Path() drops it.
+    type=click.Path(),
+    default=".",
     show_default=True,
-    help="Existing directory (file keeps its original name) or the output file path.",
+    help="Existing directory (file keeps its original name) or the output file path. "
+    "A path ending in / must be an existing directory.",
 )
 @click.option("--force", is_flag=True, help="Overwrite the output file if it already exists.")
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
@@ -795,7 +797,7 @@ def _encrypt_fd(
 @_audit_ttl_option
 def decrypt(
     identifier: str,
-    output: Path,
+    output: str,
     force: bool,
     table: str,
     bucket: str,
@@ -817,6 +819,7 @@ def decrypt(
         to encrypt (prod/db.env), or its basename when that is unambiguous.
     When several files are stored under the same name, use --version N to pick one.
     """
+    destination = _output_destination(output)
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region)
     correlation_id = str(uuid.uuid4())
@@ -830,15 +833,15 @@ def decrypt(
         record = selection.record
         _check_record(record, region=region, allowed_account_ids=account_ids)
 
-    if output.is_dir():
+    if destination.is_dir():
         safe_name = Path(record.file_name).name
         # The name comes from DynamoDB: no hidden files, no control or
         # invisible characters in a name the operator's tools will print.
         if not safe_name or safe_name.startswith(".") or _has_unsafe_characters(safe_name):
             safe_name = _fallback_output_name(record)
-        output_path = output / safe_name
+        output_path = destination / safe_name
     else:
-        output_path = output
+        output_path = destination
 
     # Refuse before creating temps so a no-op collision leaves no residue.
     if output_path.exists() and not force:
@@ -946,6 +949,27 @@ def decrypt(
             sys.exit(1)
 
     console.print(f"[green]✓[/green] Decrypted → {_display(str(output_path))}")
+
+
+def _output_destination(raw: str) -> Path:
+    """decrypt's -o value as a path. Written as a directory, it must be one.
+
+    ``Path("out/")`` is ``Path("out")``: without this check a missing
+    directory became a file of that name (and ``a/b/`` a file ``b`` in a new
+    directory ``a``).
+
+    Raises:
+        click.UsageError: ``raw`` ends with a path separator and is not an
+            existing directory (exit 2, before anything is read).
+    """
+    separators = tuple(sep for sep in (os.sep, os.altsep) if sep)
+    if raw.endswith(separators) and not Path(raw).is_dir():
+        raise click.UsageError(
+            f"--output {raw!r} ends with {raw[-1]!r} but is not an existing directory. "
+            "Create the directory first, or leave out the trailing separator to write "
+            "to a file of that name."
+        )
+    return Path(raw)
 
 
 def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
