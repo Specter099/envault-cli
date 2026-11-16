@@ -176,12 +176,30 @@ def test_ops_topic_uses_dedicated_rotating_key(template: dict[str, Any]) -> None
 
 
 def test_ops_topic_key_policy_admits_cloudwatch_alarms(template: dict[str, Any]) -> None:
+    """N7: no condition on the key statement; the topic policy decides who may publish.
+
+    Whether SNS's KMS calls on CloudWatch's behalf carry aws:SourceArn and
+    aws:SourceAccount is unverified. If they do not, a condition here would
+    never match and silence every alarm (M10 again). The key encrypts this
+    one topic and nothing else.
+    """
     key = resources(template, "AWS::KMS::Key")[ops_topic_key_id(template)]
     (statement,) = cloudwatch_statements(key["Properties"]["KeyPolicy"]["Statement"])
     assert statement["Effect"] == "Allow"
     assert sorted(as_list(statement["Action"])) == ["kms:Decrypt", "kms:GenerateDataKey*"]
     assert statement["Resource"] == "*"
-    assert_alarm_conditions(statement)
+    assert "Condition" not in statement
+
+
+def test_ops_topic_key_encrypts_only_the_ops_topic(template: dict[str, Any]) -> None:
+    """What makes the unconditioned key statement safe: nothing else uses the key."""
+    key_id = ops_topic_key_id(template)
+    users = [
+        logical_id
+        for logical_id, resource in template["Resources"].items()
+        if logical_id != key_id and key_id in str(resource.get("Properties", {}))
+    ]
+    assert users == [OPS_TOPIC], users
 
 
 def test_data_key_policy_admits_no_service_principal(template: dict[str, Any]) -> None:

@@ -21,8 +21,8 @@ from cdk_nag import NagPackSuppression, NagSuppressions
 from constructs import Construct
 
 #: Every CloudWatch alarm that notifies the ops topic is named with this prefix.
-#: The ops topic's key policy and topic policy admit only alarms whose ARN
-#: matches ``...:alarm:<prefix>*``, so a new alarm must keep the prefix.
+#: The ops topic's policy lets only alarms whose ARN matches
+#: ``...:alarm:<prefix>*`` publish, so a new alarm must keep the prefix.
 ALARM_NAME_PREFIX = "envault-"
 
 #: Alias of the HMAC key that names files (the CLI's ENVAULT_ID_KEY_ID).
@@ -523,8 +523,9 @@ class EnvaultStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
             pending_window=Duration.days(30),
         )
-        # Confused-deputy guard shared by both policies: only CloudWatch
-        # alarms in this account whose names start with ALARM_NAME_PREFIX.
+        # Confused-deputy guard: only CloudWatch alarms in this account whose
+        # names start with ALARM_NAME_PREFIX may publish. It is on the topic
+        # policy below.
         alarm_publisher = iam.ServicePrincipal("cloudwatch.amazonaws.com")
         alarm_publisher_conditions = {
             "StringEquals": {"aws:SourceAccount": self.account},
@@ -537,13 +538,20 @@ class EnvaultStack(Stack):
                 )
             },
         }
+        # The key statement deliberately has no such conditions:
+        # - the key is dedicated to this one topic, and encrypts nothing else;
+        # - the topic policy decides which alarms may publish, and SNS uses
+        #   the key only for messages that policy let through;
+        # - whether the KMS calls SNS makes on CloudWatch's behalf carry
+        #   aws:SourceArn and aws:SourceAccount is unverified, and a condition
+        #   that never matches would silently disable every alarm, which is
+        #   the original M10 failure.
         ops_topic_key.add_to_resource_policy(
             iam.PolicyStatement(
                 sid="AllowCloudWatchAlarmsToUseKey",
                 principals=[alarm_publisher],
                 actions=["kms:Decrypt", "kms:GenerateDataKey*"],
                 resources=["*"],
-                conditions=alarm_publisher_conditions,
             )
         )
 
