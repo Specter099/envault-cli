@@ -1049,6 +1049,13 @@ def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: How a missing IDENTIFIER is explained: every form IDENTIFIER takes.
+_IDENTIFIER_HINT = (
+    "decrypt command requires a file ID, the SHA-256 of its content "
+    "(with ENVAULT_ID_KEY_ID), or a stored name"
+)
+
+
 class TestFriendlyErrors:
     """Test that CLI errors are human-readable (no raw Click format or tracebacks)."""
 
@@ -1068,7 +1075,7 @@ class TestFriendlyErrors:
                 cli()
         assert exc_info.value.code == 2
         text = output.getvalue()
-        assert "decrypt command requires a SHA256 hash or filename" in text
+        assert _IDENTIFIER_HINT in " ".join(text.split())  # however the console wraps it
         assert "envault decrypt --help" in text
         assert not text.strip().startswith("Error:")
         assert not text.strip().startswith("Usage:")
@@ -1106,7 +1113,7 @@ class TestFriendlyErrors:
     @pytest.mark.parametrize(
         ("arg_name", "cmd_name", "expected_fragment"),
         [
-            ("IDENTIFIER", "decrypt", "decrypt command requires a SHA256 hash or filename"),
+            ("IDENTIFIER", "decrypt", _IDENTIFIER_HINT),
             ("INPUT_PATH", "encrypt", "encrypt command requires a file or directory"),
             ("FROM_PATH", "migrate", "migrate command requires the path to output.json"),
         ],
@@ -1119,6 +1126,17 @@ class TestFriendlyErrors:
         err = click.UsageError(f"Missing argument '{arg_name}'.", ctx=ctx)
         result = _friendly_message(err)
         assert expected_fragment in result
+
+    @pytest.mark.parametrize(
+        "command",
+        ["encrypt", "decrypt", "status", "audit", "dashboard", "migrate", "rotate-key", "exec"],
+    )
+    def test_no_help_text_calls_an_identifier_a_sha256_hash(self, command: str) -> None:
+        """Identifiers are keyed file IDs; a SHA-256 is one way to look a file up."""
+        result = CliRunner().invoke(main, [command, "--help"])
+        assert result.exit_code == 0, result.output
+        assert "SHA256 hash" not in result.output
+        assert "sha256 hash" not in result.output.lower()
 
     def test_friendly_message_passes_through_unknown_errors(self) -> None:
         """Non-missing-argument errors are returned unchanged."""

@@ -218,7 +218,9 @@ def main(ctx: click.Context, verbose: bool) -> None:
 
 # Descriptive hints for required positional arguments, keyed by argument name.
 _ARG_HINTS: dict[str, str] = {
-    "IDENTIFIER": "a SHA256 hash or filename",
+    "IDENTIFIER": (
+        "a file ID, the SHA-256 of its content (with ENVAULT_ID_KEY_ID), or a stored name"
+    ),
     "INPUT_PATH": "a file or directory to encrypt",
     "FROM_PATH": "the path to output.json (NDJSON format)",
 }
