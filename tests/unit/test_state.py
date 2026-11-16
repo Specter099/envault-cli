@@ -106,6 +106,22 @@ def test_get_current_state_not_found_returns_none():
 
 
 @mock_aws
+def test_has_current_state_says_whether_a_record_is_stored():
+    store = _create_table()
+    record = _make_record()
+    store.put_current_state(record)
+    store.put_event(record, operation="ENCRYPT", correlation_id="c")
+    # Present even when the row would not parse: nothing is read but the key.
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(
+        Item={"PK": "FILE#" + "b" * 64, "SK": "CURRENT", "file_name": ["not", "a", "string"]}
+    )
+
+    assert store.has_current_state(record.file_id) is True
+    assert store.has_current_state("b" * 64) is True
+    assert store.has_current_state("c" * 64) is False
+
+
+@mock_aws
 def test_put_event_appends_to_audit_log():
     store = _create_table()
     record = _make_record()

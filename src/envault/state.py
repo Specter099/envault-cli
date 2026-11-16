@@ -351,6 +351,17 @@ class StateStore:
         return _item_to_record(item)
 
     @aws_retry()
+    def has_current_state(self, file_id: str) -> bool:
+        """True if a current state record is stored under ``file_id``, whatever it holds.
+
+        Only the key is read back, and nothing is parsed or checked.
+        """
+        response = self._table.get_item(
+            Key={"PK": f"{FILE_PREFIX}{file_id}", "SK": CURRENT}, ProjectionExpression="PK"
+        )
+        return "Item" in response
+
+    @aws_retry()
     def list_by_state(self, state: str, max_items: int = 0) -> list[FileRecord]:
         """Return all files in a given state (uses state-index GSI).
 

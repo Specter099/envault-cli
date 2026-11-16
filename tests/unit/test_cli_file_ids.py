@@ -767,6 +767,120 @@ def test_lookup_by_sha256_without_the_id_key_says_how(
     assert not (tmp_path / "out.txt").exists()
 
 
+@pytest.mark.parametrize("command", ["decrypt", "exec", "status", "audit"])
+def test_lookup_by_sha256_sends_no_raw_hash_to_dynamodb_or_s3(
+    env: dict[str, str], tmp_path: pathlib.Path, command: str
+) -> None:
+    """Residual 1: the typed SHA-256 is mapped (GenerateMac) before anything is looked up.
+
+    It never becomes a DynamoDB key or key condition, which CloudTrail data
+    events record: no spelling of it is in any DynamoDB or S3 request's URL,
+    headers or body. Only the file's keyed identifier is looked up.
+    """
+    file_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+
+    with _aws_calls() as calls:
+        result = _lookup(env, tmp_path, command, _sha256(PIN))
+
+    assert result.exit_code == 0, result.output
+    for service, operation, request in calls:
+        if service in ("dynamodb", "s3"):
+            _assert_not_exposed(PIN, f"{command}: {service} {operation} request", request)
+    order = [(service, operation) for service, operation, _ in calls]
+    assert order[0] == ("kms", "GenerateMac"), order
+    lookups = [r for s, op, r in calls if s == "dynamodb" and op in ("GetItem", "Query")]
+    assert lookups and all(f"FILE#{file_id}" in r for r in lookups), lookups
+
+
+def test_audit_by_sha256_of_a_keyed_file_without_events_sends_no_raw_hash(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """Events expire (TTL); the file's record does not. It still counts as found."""
+    file_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+    for event in StateStore(TABLE, REGION).list_events_for_file(file_id):
+        _table().delete_item(Key={"PK": event["PK"], "SK": event["SK"]})
+
+    with _aws_calls() as calls:
+        result = _run(env, "audit", "--file", _sha256(PIN))
+
+    assert result.exit_code == 0, result.output
+    assert "No events found" in result.output
+    for service, operation, request in calls:
+        if service in ("dynamodb", "s3"):
+            _assert_not_exposed(PIN, f"audit: {service} {operation} request", request)
+
+
+def test_lookup_by_sha256_prefers_the_keyed_record_to_a_legacy_one(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """Content stored both ways (re-encrypted after keyed identifiers): the keyed record wins."""
+    _legacy_record(PIN, "pin.txt", tmp_path)
+    file_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+
+    with _aws_calls() as calls:
+        shown = _run(env, "status", "--file", _sha256(PIN))
+        read = _run(env, "decrypt", _sha256(PIN), "-o", str(tmp_path / "out.txt"))
+
+    assert shown.exit_code == 0, shown.output
+    assert file_id[:16] in shown.output
+    assert read.exit_code == 0, read.output
+    assert (tmp_path / "out.txt").read_bytes() == PIN
+    for service, operation, request in calls:
+        if service in ("dynamodb", "s3"):
+            _assert_not_exposed(PIN, f"{service} {operation} request", request)
+    events = StateStore(TABLE, REGION).list_events_for_file(file_id)
+    assert [e for e in events if e["operation"] == "DECRYPT"]
+
+
+@pytest.mark.parametrize("planted", ["another-id-key", "legacy-scheme"])
+def test_lookup_by_sha256_refuses_a_row_not_keyed_with_the_configured_key(
+    env: dict[str, str], tmp_path: pathlib.Path, planted: str
+) -> None:
+    """The row under the mapped identifier must name the configured ID key (M5)."""
+    file_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+    row = _current(file_id)
+    if planted == "another-id-key":
+        row["id_key_arn"] = create_id_key(alias="alias/envault-id-2")
+    else:
+        for name in ("file_id", "id_scheme", "id_key_arn"):
+            del row[name]
+        row["sha256_hash"] = file_id
+    _table().put_item(Item=row)
+    out = tmp_path / "out.txt"
+
+    result = _run(env, "decrypt", _sha256(PIN), "-o", str(out))
+
+    assert result.exit_code == 1, result.output
+    assert "does not name the configured identifier key" in result.output
+    assert not out.exists()
+
+
+def test_lookup_needs_generate_mac_while_the_id_key_is_set(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """64 hex characters are mapped first, so an unusable ID key stops the lookup.
+
+    Falling back to looking the value up as typed would send it to DynamoDB,
+    which is what mapping first prevents. Without the ID key, a file
+    identifier needs no GenerateMac.
+    """
+    file_id = _encrypt(env, tmp_path, "pin.txt", PIN)
+
+    with (
+        _aws_calls() as calls,
+        _failing("GenerateMac", _client_error("AccessDeniedException", "GenerateMac")),
+    ):
+        refused = _run(env, "decrypt", file_id, "-o", str(tmp_path / "a.txt"))
+    without_id_key = _run(_without_id_key(env), "decrypt", file_id, "-o", str(tmp_path / "b.txt"))
+
+    assert refused.exit_code == 1, refused.output
+    assert "kms:GenerateMac" in refused.output
+    assert not [c for c in calls if c[0] in ("dynamodb", "s3")]
+    assert not (tmp_path / "a.txt").exists()
+    assert without_id_key.exit_code == 0, without_id_key.output
+    assert (tmp_path / "b.txt").read_bytes() == PIN
+
+
 def test_lookup_by_sha256_also_checks_the_content_against_it(
     env: dict[str, str], tmp_path: pathlib.Path
 ) -> None:

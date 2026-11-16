@@ -496,8 +496,9 @@ _audit_ttl_option = click.option(
 # The HMAC key that names files (M6, see envault.fileid). encrypt and migrate
 # cannot run without it: there is no fallback to naming files by the SHA-256 of
 # their content. decrypt, exec, status and audit use it only to look a file up
-# by that SHA-256; reading a keyed record verifies it with the key the record
-# names, configured or not.
+# by that SHA-256: while it is set, 64 hex characters are mapped with it first,
+# so a SHA-256 is never sent to DynamoDB. Reading a keyed record verifies it
+# with the key the record names, configured or not.
 _ID_KEY_HELP = (
     "KMS HMAC key (HMAC_256, GENERATE_VERIFY_MAC) that names files, as an alias, key ID "
     "or ARN, e.g. alias/envault-id from the envault stack."
@@ -514,7 +515,9 @@ _id_key_lookup_option = click.option(
     envvar="ENVAULT_ID_KEY_ID",
     default=None,
     metavar="KEY",
-    help=f"{_ID_KEY_HELP} Optional: lets a file be looked up by the SHA-256 of its content.",
+    help=f"{_ID_KEY_HELP} Optional: lets a file be looked up by the SHA-256 of its content. "
+    "While it is set, 64 hex characters are first mapped through it (kms:GenerateMac), so a "
+    "SHA-256 is never sent to DynamoDB.",
 )
 
 
@@ -2495,42 +2498,47 @@ def _resolve_identifier(
 
 
 def _record_by_id(identifier: str, store: StateStore, id_key: IdKey | None) -> _Selection:
-    """The record for 64 hex characters: a file's identifier, or the SHA-256 of its content.
+    """The record for 64 hex characters: the SHA-256 of a file's content, or a file's identifier.
 
-    First the value is looked up as stored: a keyed identifier, or the SHA-256
-    that identifies a legacy record. Otherwise, if an ID key is configured,
-    it is taken as the SHA-256 of a file's content: KMS maps it to the keyed
-    identifier (GenerateMac) and that is looked up; the plaintext must then
-    hash to the SHA-256 typed, as well as verify against the identifier. Either
-    way the row must say it is about the identifier it is stored under (M5).
+    With an ID key configured, the value is first taken as the SHA-256 of a
+    file's content: KMS maps it to the keyed identifier (GenerateMac) and only
+    that is looked up. A SHA-256 that names a keyed record therefore never
+    reaches DynamoDB, nor the CloudTrail data events that record lookup keys.
+    The row found must be keyed with the configured key, and the plaintext
+    must hash to the SHA-256 typed as well as verify against the identifier.
 
-    A value that is neither cannot be told apart from a SHA-256 nobody stored,
-    so the first lookup may send a typed SHA-256 to DynamoDB as a key.
+    Only if nothing is stored under the mapped identifier is the value looked
+    up as typed: a file's identifier, or the SHA-256 that names a legacy
+    record. Without an ID key that is the only lookup. Either way the row must
+    say it is about the identifier it is stored under (M5).
 
     Raises:
         _IdentifierError: No record, or a row that contradicts its key.
-        KMSError: The ID key could not map the SHA-256.
+        KMSError: The ID key could not map the value. The lookup stops there:
+            looking the value up as typed instead would send it to DynamoDB.
     """
+    if id_key is not None:
+        keyed = id_key.file_id(sha256_digest(identifier))
+        record = store.get_current_state(keyed.file_id)
+        if record is not None:
+            _require_row_describes(record, keyed.file_id)
+            if record.id_scheme != ID_SCHEME_HMAC_SHA256 or record.id_key_arn != keyed.key_arn:
+                raise _IdentifierError(
+                    f"The record stored under {keyed.file_id[:16]}... does not name the "
+                    "configured identifier key. Refusing to use it: the state table may have "
+                    "been tampered with."
+                )
+            return _Selection(record, expected_file_id=keyed.file_id, typed_sha256=identifier)
     record = store.get_current_state(identifier)
     if record is not None:
         _require_row_describes(record, identifier)
         return _Selection(record, expected_file_id=identifier)
     if id_key is None:
         raise _IdentifierError(f"No record found for {identifier[:16]}... {_SHA256_LOOKUP_HINT}")
-    keyed = id_key.file_id(sha256_digest(identifier))
-    record = store.get_current_state(keyed.file_id)
-    if record is None:
-        raise _IdentifierError(
-            f"No record found for {identifier[:16]}..., neither as a file identifier nor as "
-            "the SHA-256 of a file's content."
-        )
-    _require_row_describes(record, keyed.file_id)
-    if record.id_scheme != ID_SCHEME_HMAC_SHA256 or record.id_key_arn != keyed.key_arn:
-        raise _IdentifierError(
-            f"The record stored under {keyed.file_id[:16]}... does not name the configured "
-            "identifier key. Refusing to use it: the state table may have been tampered with."
-        )
-    return _Selection(record, expected_file_id=keyed.file_id, typed_sha256=identifier)
+    raise _IdentifierError(
+        f"No record found for {identifier[:16]}..., neither as the SHA-256 of a file's content "
+        "nor as a file identifier."
+    )
 
 
 def _require_row_describes(record: FileRecord, stored_under: str) -> None:
@@ -2544,11 +2552,19 @@ def _require_row_describes(record: FileRecord, stored_under: str) -> None:
 
 
 def _events_by_id(identifier: str, store: StateStore, id_key: IdKey | None) -> list[dict[str, Any]]:
-    """Audit events for 64 hex characters, read as :func:`_record_by_id` reads them."""
-    events = store.list_events_for_file(identifier)
-    if events or id_key is None:
-        return events
-    return store.list_events_for_file(id_key.file_id(sha256_digest(identifier)).file_id)
+    """Audit events for 64 hex characters, found the way :func:`_record_by_id` finds a record.
+
+    With an ID key the value is mapped first. It is looked up as typed only if
+    nothing at all is stored under the mapped identifier: no events (they
+    expire) and no record either, so a keyed file whose events have expired
+    does not send the SHA-256 typed to DynamoDB.
+    """
+    if id_key is not None:
+        file_id = id_key.file_id(sha256_digest(identifier)).file_id
+        events = store.list_events_for_file(file_id)
+        if events or store.has_current_state(file_id):
+            return events
+    return store.list_events_for_file(identifier)
 
 
 def _records_named(name: str, store: StateStore) -> list[FileRecord]:
