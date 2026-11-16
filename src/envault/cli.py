@@ -47,6 +47,7 @@ from envault.exceptions import (
     EnvaultError,
     InvalidS3KeyError,
     KMSError,
+    MalformedRecordError,
     MigrationError,
     StateConflictError,
 )
@@ -990,7 +991,11 @@ def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
 def status(
     state: str, identifier: str | None, table: str, region: str, id_key_id: str | None
 ) -> None:
-    """Show current encryption state of files."""
+    """Show current encryption state of files.
+
+    A malformed record (an attribute of a type envault never writes) is left
+    out of the listing with a warning; --file refuses one (exit 1).
+    """
     with _exit_on_error():
         store = StateStore(table_name=table, region=region)
 
@@ -1001,13 +1006,17 @@ def status(
             return
 
         records = []
+        malformed: list[MalformedRecordError] = []
         if state in ("encrypted", "all"):
-            records.extend(store.list_by_state(ENCRYPTED))
+            records.extend(store.list_by_state(ENCRYPTED, on_malformed=malformed.append))
         if state in ("decrypted", "all"):
-            records.extend(store.list_by_state(DECRYPTED))
+            records.extend(store.list_by_state(DECRYPTED, on_malformed=malformed.append))
+        for problem in malformed:
+            console.print(f"[yellow]Warning:[/yellow] {_display(problem)}")
 
         if not records:
-            console.print("[yellow]No records found.[/yellow]")
+            if not malformed:
+                console.print("[yellow]No records found.[/yellow]")
             return
         _print_records(records)
 
@@ -1616,6 +1625,10 @@ def rotate_key(
     identifier and its identifier scheme: a keyed record is verified with the
     key it names before it is re-encrypted; a legacy record (identified by
     its SHA-256) stays legacy.
+
+    A malformed record (an attribute of a type envault never writes) cannot
+    be rotated: it is reported with a ✗, the others are rotated, and the
+    command exits 1, with --dry-run too.
     """
     store = StateStore(table_name=table, region=region)
     s3 = S3Store(bucket=bucket, region=region, kms_key_id=new_key_id)
@@ -1629,10 +1642,15 @@ def rotate_key(
     # recorded against it, so rotation must cover them all. Records written by
     # earlier versions were flipped to DECRYPTED on first read; skipping those
     # would silently leave the most-accessed files under the old key.
+    malformed: list[MalformedRecordError] = []
     with _exit_on_error():
-        records = store.list_by_state(ENCRYPTED)
+        records = store.list_by_state(ENCRYPTED, on_malformed=malformed.append)
         seen = {r.file_id for r in records}
-        legacy = [r for r in store.list_by_state(DECRYPTED) if r.file_id not in seen]
+        legacy = [
+            r
+            for r in store.list_by_state(DECRYPTED, on_malformed=malformed.append)
+            if r.file_id not in seen
+        ]
     if legacy:
         console.print(
             f"[dim]Including {len(legacy)} record(s) marked DECRYPTED by an earlier "
@@ -1640,33 +1658,54 @@ def rotate_key(
         )
     records.extend(legacy)
 
-    if not records:
+    if not records and not malformed:
         console.print("[yellow]No tracked files found.[/yellow]")
         return
 
     console.print(f"Found {len(records)} files to rotate.")
+    for problem in malformed:
+        console.print(f"[red]✗[/red] {_display(problem)}")
     if dry_run:
         console.print("[dim]Dry run — no changes will be made.[/dim]")
         for r in records:
             console.print(f"  Would rotate: {_display(r.file_name)} ({_id_prefix(r.file_id)}...)")
+        if malformed:
+            console.print(
+                f"[bold red]Rotation would be incomplete:[/bold red] {len(malformed)} "
+                "malformed record(s) cannot be rotated."
+            )
+            sys.exit(1)
         return
 
-    # Plaintext copies live in a private RAM directory where there is one; the
-    # scratch destroys them, and the directory, however rotation ends.
-    with _Scratch() as scratch:
-        _rotate_records(
-            records,
-            scratch,
-            store=store,
-            s3=s3,
-            new_key_id=new_key_id,
-            bucket=bucket,
-            region=region,
-            account_ids=account_ids,
-            latest=latest,
-            audit_ttl_days=audit_ttl_days,
-            correlation_id=correlation_id,
+    rotated = 0
+    if records:
+        # Plaintext copies live in a private RAM directory where there is one;
+        # the scratch destroys them, and the directory, however rotation ends.
+        with _Scratch() as scratch:
+            rotated = _rotate_records(
+                records,
+                scratch,
+                store=store,
+                s3=s3,
+                new_key_id=new_key_id,
+                bucket=bucket,
+                region=region,
+                account_ids=account_ids,
+                latest=latest,
+                audit_ttl_days=audit_ttl_days,
+                correlation_id=correlation_id,
+            )
+
+    errors = len(records) - rotated + len(malformed)
+    console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
+    if errors:
+        # A partially-rotated corpus means some files are still readable with the
+        # old key. Exiting 0 here would report an incomplete rotation as success.
+        console.print(
+            f"[bold red]Rotation incomplete:[/bold red] {errors} file(s) are still "
+            "encrypted under the previous key."
         )
+        sys.exit(1)
 
 
 def _rotate_records(
@@ -1682,7 +1721,8 @@ def _rotate_records(
     latest: bool,
     audit_ttl_days: int,
     correlation_id: str,
-) -> None:
+) -> int:
+    """Rotate each record, reporting each failure on its own line; return how many rotated."""
     shm_dir = scratch.ram_dir()
     if shm_dir is None:
         console.print(
@@ -1697,7 +1737,7 @@ def _rotate_records(
     new_key_config = Config(key_id=new_key_id, bucket=bucket, region=region)
     verifier = FileIdVerifier(region=region, allowed_account_ids=account_ids)
 
-    rotated = errors = 0
+    rotated = 0
     for record in track(records, description="Rotating keys..."):
         tmp_dl: Path | None = None
         tmp_pt: Path | None = None
@@ -1810,19 +1850,9 @@ def _rotate_records(
             console.print(
                 f"[red]Error rotating {_display(record.file_name)}: {_display(exc)}[/red]"
             )
-            errors += 1
         finally:
             scratch.discard(tmp_dl, tmp_pt, tmp_enc)
-
-    console.print(f"\n[green]Rotated {rotated} files[/green], {errors} errors.")
-    if errors:
-        # A partially-rotated corpus means some files are still readable with the
-        # old key. Exiting 0 here would report an incomplete rotation as success.
-        console.print(
-            f"[bold red]Rotation incomplete:[/bold red] {errors} file(s) are still "
-            "encrypted under the previous key."
-        )
-        sys.exit(1)
+    return rotated
 
 
 def _private_ram_dir() -> Path | None:
@@ -2514,6 +2544,7 @@ def _record_by_id(identifier: str, store: StateStore, id_key: IdKey | None) -> _
 
     Raises:
         _IdentifierError: No record, or a row that contradicts its key.
+        MalformedRecordError: The row found is not shaped like a record.
         KMSError: The ID key could not map the value. The lookup stops there:
             looking the value up as typed instead would send it to DynamoDB.
     """
@@ -2568,11 +2599,33 @@ def _events_by_id(identifier: str, store: StateStore, id_key: IdKey | None) -> l
 
 
 def _records_named(name: str, store: StateStore) -> list[FileRecord]:
-    """ENCRYPTED records stored under ``name``, else (bare names only) under that basename."""
-    exact = store.list_by_file_name(name, ENCRYPTED)
+    """ENCRYPTED records stored under ``name``, else (bare names only) under that basename.
+
+    A malformed row stored under exactly ``name`` is refused: which version is
+    current cannot be told without it. The basename fallback reads every
+    ENCRYPTED row and ignores malformed ones, so one bad row cannot break
+    lookups of every other file.
+
+    Raises:
+        _IdentifierError: A row stored under exactly ``name`` is malformed.
+    """
+    malformed: list[MalformedRecordError] = []
+    exact = store.list_by_file_name(name, ENCRYPTED, on_malformed=malformed.append)
+    if malformed:
+        raise _IdentifierError(
+            f"The name {name!r} matches a malformed record. {malformed[0]}"
+        ) from malformed[0]
     if exact or "/" in name:
         return exact
-    return [r for r in store.list_by_state(ENCRYPTED) if PurePosixPath(r.file_name).name == name]
+    return [
+        r
+        for r in store.list_by_state(ENCRYPTED, on_malformed=_ignore_malformed)
+        if PurePosixPath(r.file_name).name == name
+    ]
+
+
+def _ignore_malformed(problem: MalformedRecordError) -> None:
+    logger.debug("Name lookup ignores a malformed record: %s", problem)
 
 
 _UNKNOWN_TIME = datetime.min.replace(tzinfo=timezone.utc)
