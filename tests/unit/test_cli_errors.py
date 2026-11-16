@@ -155,8 +155,8 @@ def test_encrypt_keeps_going_after_a_local_file_error(
     """An OSError on one file (it vanished after the walk) is that file's error only."""
     real = cli_mod._collect_files
 
-    def collect_then_remove(path: pathlib.Path):  # type: ignore[no-untyped-def]
-        files = real(path)
+    def collect_then_remove(path: pathlib.Path, *args):  # type: ignore[no-untyped-def]
+        files = real(path, *args)
         (batch / "b.txt").unlink()
         return files
 

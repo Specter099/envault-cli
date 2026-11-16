@@ -659,11 +659,14 @@ def encrypt(
 ) -> None:
     """Encrypt a file or directory and store state in DynamoDB.
 
-    INPUT_PATH can be a single file or a directory (processed recursively;
-    symlinks are not followed). Each file is stored under its path relative to
-    INPUT_PATH (prod/db.env), a single file under its name; decrypt and exec
-    accept that name. Every upload goes to a new S3 key: no upload replaces an
-    object a record points to.
+    INPUT_PATH can be a single file or a directory (processed recursively).
+    Symbolic links are never followed: INPUT_PATH itself must not be one, and
+    links (and anything else that is not a regular file) inside a directory
+    are listed as skipped; if nothing else is there, encrypt exits 1. Each
+    file is stored under its path relative to INPUT_PATH (prod/db.env), a
+    single file under its name; decrypt and exec accept that name. Every
+    upload goes to a new S3 key: no upload replaces an object a record
+    points to.
 
     Each file is identified by an HMAC of its SHA-256 under the --id-key-id
     key (ENVAULT_ID_KEY_ID), which reveals nothing about its content; the
@@ -676,8 +679,23 @@ def encrypt(
     s3 = S3Store(bucket=bucket, region=region, kms_key_id=key_id)
     correlation_id = str(uuid.uuid4())
 
-    files = _collect_files(input_path)
+    refusal = _input_path_refusal(input_path)
+    if refusal:
+        console.print(
+            f"[red]Refusing to encrypt {_display(str(input_path))}:[/red] {_display(refusal)}"
+        )
+        sys.exit(1)
+    skipped: list[_SkippedEntry] = []
+    files = _collect_files(input_path, skipped)
+    for entry in skipped:
+        console.print(f"[yellow]⏭[/yellow] {_display(entry.name)}: skipped ({entry.reason})")
     if not files:
+        if skipped:
+            console.print(
+                f"[red]Nothing to encrypt in {_display(str(input_path))}: everything in it "
+                f"was skipped ({len(skipped)}).[/red]"
+            )
+            sys.exit(1)
         console.print(f"[yellow]No files found in {_display(str(input_path))}[/yellow]")
         return
 
@@ -2819,8 +2837,53 @@ class _CollectedFile:
     identity: tuple[int, int]
 
 
-def _collect_files(path: Path) -> list[_CollectedFile]:
-    """Regular files under ``path``, never following directory or file symlinks."""
+@dataclass(frozen=True)
+class _SkippedEntry:
+    """Something under encrypt's INPUT_PATH that was not encrypted, and why."""
+
+    name: str  # relative to INPUT_PATH, with "/" separators
+    reason: str
+
+
+def _skip_reason(mode: int) -> str:
+    if stat.S_ISLNK(mode):
+        return "symbolic link, not followed"
+    return "not a regular file"
+
+
+def _input_path_refusal(path: Path) -> str | None:
+    """Why encrypt refuses INPUT_PATH itself, or None for a regular file or a directory.
+
+    A symbolic link is never followed, not even as INPUT_PATH (secret mounts,
+    Kubernetes' among them, are symlinks): the operator is told what to pass
+    instead.
+    """
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as exc:
+        return f"it cannot be read ({exc.strerror})."
+    if stat.S_ISLNK(mode):
+        return (
+            "it is a symbolic link, and envault does not follow symbolic links. "
+            f"Pass the path it points to instead: {os.path.realpath(path)}"
+        )
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+        return "it is not a regular file or a directory."
+    return None
+
+
+def _collect_files(path: Path, skipped: list[_SkippedEntry] | None = None) -> list[_CollectedFile]:
+    """Regular files under ``path``, never following directory or file symlinks.
+
+    Each symbolic link, and anything else that is not a regular file or a
+    directory (a FIFO, a socket, a device), is passed over and, if
+    ``skipped`` is given, appended to it, so that nothing is left out silently.
+    """
+
+    def skip(entry: Path, mode: int) -> None:
+        if skipped is not None:
+            skipped.append(_SkippedEntry(entry.relative_to(path).as_posix(), _skip_reason(mode)))
+
     try:
         top = os.lstat(path)
     except OSError:
@@ -2833,7 +2896,14 @@ def _collect_files(path: Path) -> list[_CollectedFile]:
     for root, dirnames, filenames in os.walk(path, followlinks=False):
         # os.walk(followlinks=False) still lists symlink directories; drop them
         # so we never encrypt a tree the operator did not intend to include.
-        dirnames[:] = sorted(d for d in dirnames if not Path(root, d).is_symlink())
+        kept = []
+        for dirname in sorted(dirnames):
+            candidate = Path(root, dirname)
+            if candidate.is_symlink():
+                skip(candidate, stat.S_IFLNK)
+            else:
+                kept.append(dirname)
+        dirnames[:] = kept
         for filename in sorted(filenames):
             candidate = Path(root) / filename
             try:
@@ -2848,6 +2918,8 @@ def _collect_files(path: Path) -> list[_CollectedFile]:
                         identity=(st.st_dev, st.st_ino),
                     )
                 )
+            else:
+                skip(candidate, st.st_mode)
     return files
 
 

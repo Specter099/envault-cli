@@ -121,8 +121,8 @@ def _swap_after_collection(swap):  # type: ignore[no-untyped-def]
     """Run the real _collect_files, then let another user change the tree."""
     real = cli_mod._collect_files
 
-    def collect_then_swap(path: pathlib.Path):  # type: ignore[no-untyped-def]
-        files = real(path)
+    def collect_then_swap(path: pathlib.Path, *args):  # type: ignore[no-untyped-def]
+        files = real(path, *args)
         swap()
         return files
 
@@ -322,3 +322,97 @@ def test_encrypt_force_writes_a_new_key_and_keeps_the_old_object(
     out = tree.parent / "out.txt"
     assert _run(env, "decrypt", "notes.txt", "-o", str(out)).exit_code == 0
     assert out.read_bytes() == HARMLESS
+
+
+# ---------------------------------------------------------------------------
+# N8: symbolic links are refused out loud, never skipped in silence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target", ["file", "directory"])
+def test_encrypt_refuses_symlink_input_path(
+    env: dict[str, str], tmp_path: pathlib.Path, target: str
+) -> None:
+    """Kubernetes secret mounts are symlinks: such a path stored nothing, and exited 0."""
+    if target == "file":
+        real = tmp_path / "secret.env"
+        real.write_bytes(HARMLESS)
+    else:
+        real = tmp_path / "secrets"
+        real.mkdir()
+        (real / "a.env").write_bytes(HARMLESS)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    result = _run(env, "encrypt", str(link))
+
+    assert result.exit_code == 1, result.output
+    assert "symbolic link" in result.output
+    assert os.path.realpath(link) in result.output  # what to pass instead
+    assert _records() == []
+    assert _objects() == []
+
+
+def test_encrypt_refuses_an_input_path_that_is_not_a_file_or_directory(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    result = _run(env, "encrypt", str(fifo))
+
+    assert result.exit_code == 1, result.output
+    assert "not a regular file or a directory" in result.output
+    assert _records() == []
+
+
+def test_encrypt_reports_what_it_skips_in_a_directory(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "real.env").write_bytes(HARMLESS)
+    (tree / "sub" / "link.env").symlink_to(tmp_path / "victim")
+    (tmp_path / "victim").write_bytes(VICTIM)
+    (tree / "linkdir").symlink_to(tmp_path)
+    os.mkfifo(tree / "pipe")
+
+    result = _run(env, "encrypt", str(tree))
+
+    assert result.exit_code == 0, result.output
+    for name, reason in (
+        ("sub/link.env", "symbolic link"),
+        ("linkdir", "symbolic link"),
+        ("pipe", "not a regular file"),
+    ):
+        [line] = [line for line in result.output.splitlines() if name in line]
+        assert reason in line, line
+    assert [r.file_name for r in _records()] == ["real.env"]  # type: ignore[attr-defined]
+
+
+def test_encrypt_of_a_directory_with_only_symlinks_exits_1(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tmp_path / "victim").write_bytes(VICTIM)
+    (tree / "link.env").symlink_to(tmp_path / "victim")
+
+    result = _run(env, "encrypt", str(tree))
+
+    assert result.exit_code == 1, result.output
+    assert "link.env" in result.output
+    assert "Nothing to encrypt" in result.output
+    assert _records() == []
+    assert _objects() == []
+
+
+def test_encrypt_of_an_empty_directory_finds_nothing_and_exits_0(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    (tmp_path / "empty").mkdir()
+
+    result = _run(env, "encrypt", str(tmp_path / "empty"))
+
+    assert result.exit_code == 0, result.output
+    assert "No files found" in result.output
