@@ -21,6 +21,7 @@ import io
 import logging
 import pathlib
 import time
+import urllib.parse
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from unittest.mock import patch
 
 import boto3
 import botocore.client
+import botocore.endpoint
 import pytest
 from botocore.exceptions import ClientError
 from click.testing import CliRunner, Result
@@ -356,18 +358,84 @@ class _Records(logging.Handler):
         self.records.append(record)
 
 
+def _text(value: object) -> str:
+    if isinstance(value, bytes | bytearray):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
+
+
+def _body_text(body: object) -> str:
+    """A request body as text, leaving a streamed body where it was for the real send."""
+    if body is None:
+        return ""
+    if isinstance(body, bytes | bytearray | str):
+        return _text(body)
+    read, seek = getattr(body, "read", None), getattr(body, "seek", None)
+    if callable(read) and callable(seek):
+        # A streamed upload (S3 PutObject's aws-chunked wrapper can only seek to
+        # 0, and has no tell: it is at its start when the request is created).
+        tell = getattr(body, "tell", None)
+        start = tell() if callable(tell) else 0
+        data = read()
+        seek(start)
+        return _text(data)
+    raise AssertionError(f"cannot inspect a request body of type {type(body).__name__}")
+
+
+def _wire_text(request: Any) -> str:
+    """Method, URL (as sent and percent-decoded), every header, and the body of a request."""
+    headers = [f"{_text(name)}: {_text(value)}" for name, value in request.headers.items()]
+    url = _text(request.url)
+    body = _body_text(request.body)
+    return "\n".join([f"{request.method} {url}", urllib.parse.unquote(url), *headers, "", body])
+
+
 @contextmanager
-def _aws_calls() -> Iterator[list[tuple[str, str, dict[str, Any]]]]:
-    """Record every AWS API call: (service, operation, parameters)."""
-    calls: list[tuple[str, str, dict[str, Any]]] = []
-    real = botocore.client.BaseClient._make_api_call
+def _aws_calls() -> Iterator[list[tuple[str, str, str]]]:
+    """Record every AWS request as it goes on the wire: (service, operation, request text).
 
-    def call(self: Any, operation: str, params: dict[str, Any]) -> Any:
-        calls.append((self.meta.service_model.service_name, operation, dict(params)))
-        return real(self, operation, params)
+    The request text is what :func:`_wire_text` makes of the request botocore
+    prepared: its URL, headers and body, after boto3 serialized the call and
+    botocore signed it. Parameters alone are not enough: a boto3 resource
+    condition (``Key("PK").eq(...)`` in a Query) only becomes text after them.
+    Captured in ``Endpoint.create_request``, which every client of every
+    session goes through, the Encryption SDK's KMS clients and moto included.
+    """
+    calls: list[tuple[str, str, str]] = []
+    real = botocore.endpoint.Endpoint.create_request
 
-    with patch.object(botocore.client.BaseClient, "_make_api_call", call):
+    def create_request(self: Any, params: Any, operation_model: Any = None) -> Any:
+        prepared = real(self, params, operation_model)
+        service = operation_model.service_model.service_name if operation_model else "?"
+        operation = operation_model.name if operation_model else "?"
+        calls.append((service, operation, _wire_text(prepared)))
+        return prepared
+
+    with patch.object(botocore.endpoint.Endpoint, "create_request", create_request):
         yield calls
+
+
+def test_request_capture_sees_serialized_conditions_and_streamed_bodies(
+    env: dict[str, str], tmp_path: pathlib.Path
+) -> None:
+    """N1: the capture sees what parameter-level capture missed, and disturbs nothing."""
+    marker = "f" * 64
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"body-marker-" + marker.encode())
+    s3 = boto3.client("s3", region_name=REGION)
+
+    with _aws_calls() as calls:
+        StateStore(TABLE, REGION).list_events_for_file(marker)  # a boto3 Key() condition
+        with upload.open("rb") as body:
+            s3.put_object(Bucket=BUCKET, Key="encrypted/probe", Body=body)
+
+    [(_, _, query)] = [c for c in calls if c[:2] == ("dynamodb", "Query")]
+    assert f"FILE#{marker}" in query
+    [(_, _, put)] = [c for c in calls if c[:2] == ("s3", "PutObject")]
+    assert "/encrypted/probe" in put
+    assert f"body-marker-{marker}" in put
+    stored = s3.get_object(Bucket=BUCKET, Key="encrypted/probe")["Body"].read()
+    assert stored == upload.read_bytes()  # reading the body for the capture lost nothing
 
 
 def _failing(operation: str, error: Exception, times: int = 1_000_000) -> Any:
@@ -495,10 +563,12 @@ def test_a_new_record_never_exposes_the_plaintexts_sha256(
         _assert_not_exposed(
             PIN, f"log record {record.name}", record.getMessage(), *vars(record).values()
         )
-    # Not even a lookup: DynamoDB and S3 data events never see the hash.
-    for service, operation, params in calls:
+    # Not even a lookup: DynamoDB and S3 data events never see the hash, in any
+    # request's URL, headers or body.
+    assert {service for service, _, _ in calls} >= {"dynamodb", "s3", "kms"}
+    for service, operation, request in calls:
         if service in ("dynamodb", "s3"):
-            _assert_not_exposed(PIN, f"{service} {operation} request", *_strings(params))
+            _assert_not_exposed(PIN, f"{service} {operation} request", request)
 
 
 # ---------------------------------------------------------------------------
@@ -641,9 +711,9 @@ def test_reencrypting_a_file_with_only_a_legacy_record_creates_a_keyed_one(
     assert set(records) == {_sha256(PIN), file_id_of(PIN)}
     assert records[file_id_of(PIN)].id_scheme == "hmac-sha256-v1"
     assert records[_sha256(PIN)].id_scheme == "sha256"
-    for service, operation, params in calls:
+    for service, operation, request in calls:
         if service in ("dynamodb", "s3"):
-            _assert_not_exposed(PIN, f"{service} {operation} request", *_strings(params))
+            _assert_not_exposed(PIN, f"{service} {operation} request", request)
 
 
 # ---------------------------------------------------------------------------
