@@ -1138,6 +1138,16 @@ class TestFriendlyErrors:
         assert "SHA256 hash" not in result.output
         assert "sha256 hash" not in result.output.lower()
 
+    @pytest.mark.parametrize("command", ["decrypt", "status", "audit"])
+    def test_help_says_status_shows_only_an_id_prefix(self, command: str) -> None:
+        """status prints the first 16 characters of a file ID, never the whole ID."""
+        result = CliRunner().invoke(main, [command, "--help"])
+        assert result.exit_code == 0, result.output
+        text = " ".join(result.output.split())
+        assert "status lists it" not in text
+        assert "status` lists it" not in text
+        assert "first 16" in text
+
     def test_friendly_message_passes_through_unknown_errors(self) -> None:
         """Non-missing-argument errors are returned unchanged."""
         ctx = click.Context(click.Command("decrypt"))

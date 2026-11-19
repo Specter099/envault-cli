@@ -5,7 +5,8 @@
 accident (a retried write, an SK collision). It does not stop a principal that
 holds ``dynamodb:PutItem`` on the table, which every envault user needs: such a
 principal can write the same item without the condition, rewriting an event's
-operation, principal or timestamp, or can delete events outright. The
+operation, principal, timestamp or expiry: a ``ttl`` in the past makes
+DynamoDB's TTL process delete the event. The
 ``principal_arn`` on an event is reported by the client that wrote it, not
 verified by DynamoDB. Treat this table as a convenient index of activity. The
 authoritative record of who used which key and object is CloudTrail: KMS events

@@ -966,7 +966,8 @@ def decrypt(
 
     \b
     IDENTIFIER is one of:
-      - the file's identifier, 64 hex characters as `status` lists it;
+      - the file's identifier, 64 hex characters (encrypt prints it in the
+        object key; `status` shows only the first 16);
       - the SHA-256 of its content, with --id-key-id / ENVAULT_ID_KEY_ID set
         (the content is then checked against that SHA-256 too);
       - the name it was stored under: its path relative to the directory given
@@ -1161,8 +1162,8 @@ def _publish(src: Path, dst: Path, *, overwrite: bool) -> None:
     "--file",
     "identifier",
     default=None,
-    help="A file's identifier, as status lists it, or the SHA-256 of its content "
-    "(with --id-key-id).",
+    help="A file's identifier: 64 hex characters, which encrypt prints in the object key "
+    "(status shows only the first 16). Or the SHA-256 of its content (with --id-key-id).",
 )
 @click.option("--table", envvar="ENVAULT_TABLE", required=True)
 @click.option("--region", envvar="ENVAULT_REGION", default="us-east-1")
@@ -1244,8 +1245,8 @@ def _utc_today() -> date:
     "--file",
     "identifier",
     default=None,
-    help="A file's identifier, as status lists it, or the SHA-256 of its content "
-    "(with --id-key-id).",
+    help="A file's identifier: 64 hex characters, which encrypt prints in the object key "
+    "(status shows only the first 16). Or the SHA-256 of its content (with --id-key-id).",
 )
 @click.option(
     "--since",
