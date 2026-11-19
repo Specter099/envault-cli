@@ -39,7 +39,7 @@ before 0.3.0 must keep their bucket names.
 
 **Counts.** 2026-11-14 review: 1 high, 10 medium, 10 low (21). After 0.3.0: 18 fixed, 2 fixed in
 template, 1 documented; R1–R3 and N1–N10 fixed (N7 in template); found during release
-preparation: P2 documented, P3 fixed, P1 and P4 open. Previous audit's open findings: 1 closed,
+preparation: P2 documented; P1, P3 and P4 fixed. Previous audit's open findings: 1 closed,
 1 partly closed, 9 open.
 
 ---
@@ -92,10 +92,10 @@ preparation: P2 documented, P3 fixed, P1 and P4 open. Previous audit's open find
 
 | ID | Severity | Issue | Status |
 |----|----------|-------|--------|
-| P1 | Low | CI's Gitleaks scan runs with no rules: `.gitleaks.toml` has an allowlist but no `[extend] useDefault = true`, which replaces the default rules | Open |
+| P1 | Low | CI's Gitleaks scan runs with no rules: `.gitleaks.toml` has an allowlist but no `[extend] useDefault = true`, which replaces the default rules | Fixed (`2b062ea`) |
 | P2 | Medium | A 0.2.0 client reads keyed records without a content check, and its `rotate-key` leaves their pinned versions noncurrent | Documented (upgrade every client first) |
 | P3 | Info | The detect-secrets pre-commit hook failed on 25 unmarked fake values | Fixed (`680fd77`) |
-| P4 | Info | Help text says a file ID is shown by `status`, which shows 16 characters | Open |
+| P4 | Info | Help text says a file ID is shown by `status`, which shows 16 characters | Fixed (`6646621`) |
 
 ---
 

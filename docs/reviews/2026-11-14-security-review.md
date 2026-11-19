@@ -59,7 +59,7 @@ could not be exercised here. At the base commit 183 unit tests passed, `ruff` wa
 fixed in the CloudFormation template but cannot be verified without a live deployment (M10,
 L9), and 1 is a design limitation that is now documented (L8). Verification found 10 more
 issues (N1–N10) and confirmed 3 queued residuals (R1–R3); all are fixed, N7 in the template
-only. Release preparation found 4 more (P1–P4): 1 fixed, 1 documented, 2 open.
+only. Release preparation found 4 more (P1–P4): 3 fixed, 1 documented.
 
 | ID | Severity | At review | Finding | Result |
 |----|----------|-----------|---------|--------|
@@ -403,15 +403,17 @@ stored name (`0f418e5`), and the `EnvaultEnvVars` output exports `ENVAULT_ALLOWE
 
 ## Found during release preparation
 
-- **P1 — CI's Gitleaks scan runs with no rules** (Low, CONFIRMED; open). `.gitleaks.toml`
+- **P1 — CI's Gitleaks scan runs with no rules** (Low, CONFIRMED; fixed). `.gitleaks.toml`
   holds only an `[allowlist]`. A configuration file without `[extend] useDefault = true`
   replaces gitleaks' default rules, so the scan CI runs can find nothing. Shown with gitleaks
   8.24.3, 8.28.0 and 8.30.1: a secret-shaped AWS access key ID and GitHub token in a probe file
   are reported with the default configuration and not with the repository's. With the default
   rules added, `a58ea77..HEAD` has 7 findings and the tree 8, all false positives (CloudFormation
   logical IDs, a placeholder key UUID, a test fixture's base64 commitment key, a private-key
-  header written by a test). Fix: extend the defaults and allowlist those, or mark them
-  `gitleaks:allow`. Not changed in this release.
+  header written by a test). The configuration now extends the default rules and allowlists
+  those seven values by exact match. gitleaks 8.30.1 then reports nothing on `a58ea77..HEAD` or
+  on the tree, and still reports a fake AWS access key planted in a probe file. Commit
+  `2b062ea`.
 - **P2 — 0.2.0 clients and keyed records** (Medium, CONFIRMED; documented). Run in process
   against moto with the 0.2.0 release code (`5aec2b1`): a 0.2.0 client reads a keyed record
   with no content check (the row has no `sha256_hash`, and 0.2.0 skips the check when it is
@@ -424,10 +426,11 @@ stored name (`0f418e5`), and the `EnvaultEnvVars` output exports `ENVAULT_ALLOWE
   fixture key headers and a docs line were neither baselined nor marked, so the pre-commit hook
   failed on any commit touching those files. They are marked `pragma: allowlist secret` (the
   docs line is baselined). Commit `680fd77`.
-- **P4 — Help text overstates what `status` shows** (Info; open). `decrypt --help` calls a file
+- **P4 — Help text overstates what `status` shows** (Info; fixed). `decrypt --help` calls a file
   ID "64 hex characters as `status` lists it", and the `--file` help of `status` and `audit` says
   "as status lists it", but both commands show only the first 16 characters. The full ID is in
-  the S3 key `encrypt` prints. Needs a code change.
+  the S3 key `encrypt` prints. The help now says so, and that `status` shows only the first 16
+  characters; a test pins the wording for all three commands. Commit `6646621`.
 
 ---
 

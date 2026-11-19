@@ -79,6 +79,9 @@ deploy with `keep_generated_bucket_names=true`, or CloudFormation replaces both 
   encryption context (`purpose` = `envault-backup` or legacy `backup`); bucket/table
   encryption is granted only via S3 and DynamoDB (`kms:ViaService`). Unused
   `dynamodb:UpdateItem` removed.
+- CI: the Gitleaks scan ran with no rules, because `.gitleaks.toml` replaced the default rules
+  instead of extending them. It now extends them, and allowlists by exact value the seven
+  non-secret values they flag in this repository (P1).
 
 ### Breaking
 
@@ -231,6 +234,9 @@ deploy with `keep_generated_bucket_names=true`, or CloudFormation replaces both 
 - Tests: the check that no request carries the plaintext's SHA-256 inspects serialized
   requests, which it missed inside DynamoDB conditions (N1); the signal tests pass under
   `nohup` and leave no signal disposition changed (N4).
+- Help: `decrypt`, `status --file` and `audit --file` no longer say that `status` lists a full
+  file ID. It shows the first 16 characters; the full ID is in the object key `encrypt`
+  prints (P4).
 
 ### Removed
 
