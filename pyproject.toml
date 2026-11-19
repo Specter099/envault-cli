@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "envault-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Client-side envelope encryption for files using AWS KMS, with DynamoDB state tracking"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -69,6 +69,10 @@ Issues = "https://github.com/Specter099/envault-cli/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/envault"]
+
+[tool.hatch.build.targets.sdist]
+# Repository tooling configuration, not part of the package source.
+exclude = ["/.claude"]
 
 [tool.ruff]
 line-length = 100
