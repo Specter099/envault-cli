@@ -23,5 +23,5 @@ regexes = [
     '''^LEGACY_S3_PREFIX$''',
     '''^correlation_id=$''',
     # A PEM header with no key after it, written by a symlink test.
-    '''^-----BEGIN PRIVATE KEY-----\\n"\)''',
+    '''^-----BEGIN PRIVATE KEY-----\\n"\)''',  # pragma: allowlist secret
 ]
