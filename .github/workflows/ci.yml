@@ -38,14 +38,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      # Every job installs the hashed lock (see the dev extra in pyproject.toml
+      # for how to regenerate it): wheels only, every file hash-checked, and
+      # pip fails if a package needs anything outside the lock. The package
+      # itself is then installed without touching the locked set.
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements/dev.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
 
       - name: Run ruff (lint)
-        run: ruff check src/ tests/
+        run: ruff check src/ tests/ infra/
 
       - name: Run ruff (format check)
-        run: ruff format --check src/ tests/
+        run: ruff format --check src/ tests/ infra/
 
       - name: Run mypy
         run: mypy src/envault/
@@ -63,16 +70,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements/dev.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
 
       - name: Audit dependencies
         run: |
-          pip install --upgrade pip
-          pip install pip-audit
-          # CVE-2026-4539: pygments (dev/docs highlighter, not a runtime dep)
-          # CVE-2026-3219: pip itself (CI installer), not shipped in the wheel
-          pip-audit --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-3219
+          # The locked development/CI environment (pip-audit itself is locked).
+          pip-audit
+          # The CDK toolchain lock used by the cdk-synth job.
+          # GHSA-464c-974j-9xm6: aws-cdk-lib < 2.253.0 inverts the encrypted
+          # flag of aws-codebuild S3LoggingOptions; the envault stack defines no
+          # CodeBuild project. Drop this once aws-cdk-lib is >= 2.253.0.
+          pip-audit --disable-pip --require-hashes --ignore-vuln GHSA-464c-974j-9xm6 \
+            -r infra/cdk/requirements-ci.txt
 
   test:
     name: Unit Tests (Python ${{ matrix.python-version }})
@@ -92,8 +105,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements/dev.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
 
       - name: Run unit tests
         env:
@@ -126,8 +142,22 @@ jobs:
       - name: Install CDK dependencies
         run: |
           npm install -g aws-cdk@2.1113.0
-          pip install -r infra/cdk/requirements.txt
+          python -m pip install --require-hashes --only-binary :all: -r infra/cdk/requirements-ci.txt
+          python -m pip check
+
+      # Assertion tests on the synthesized template (cdk-nag applied); they
+      # live in infra/cdk/tests and are not part of `pytest tests/unit`.
+      - name: CDK assertion tests
+        working-directory: infra/cdk
+        run: python -m pytest
 
       - name: CDK synth
         working-directory: infra/cdk
         run: cdk synth --strict --quiet
+
+      - name: CDK synth (context flags)
+        working-directory: infra/cdk
+        run: >-
+          cdk synth --strict --quiet
+          -c keep_generated_bucket_names=true
+          -c additional_kms_key_arns=arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab

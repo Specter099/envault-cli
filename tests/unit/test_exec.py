@@ -22,12 +22,14 @@ from envault import identity
 from envault.cli import main
 from envault.state import StateStore
 
+from ._id_key import ID_KEY_ALIAS, create_id_key
+
 TABLE_NAME = "envault-test-state"
 BUCKET_NAME = "envault-test-bucket"
 KEY_ALIAS = "alias/envault-test"
 REGION = "us-east-1"
 
-SECRET_VALUE = b"postgres://user:hunter2@db.internal:5432/app\n"
+SECRET_VALUE = b"postgres://user:hunter2@db.internal:5432/app\n"  # pragma: allowlist secret
 
 
 def _provision() -> str:
@@ -69,6 +71,7 @@ def _provision() -> str:
     kms = boto3.client("kms", region_name=REGION)
     key_id = kms.create_key(Description="envault-test")["KeyMetadata"]["KeyId"]
     kms.create_alias(AliasName=KEY_ALIAS, TargetKeyId=key_id)
+    create_id_key()
     return boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
 
 
@@ -82,13 +85,14 @@ def _clear_identity_cache():
 def _env(account: str) -> dict[str, str]:
     return {
         "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
         "AWS_DEFAULT_REGION": REGION,
         "ENVAULT_KEY_ID": KEY_ALIAS,
         "ENVAULT_BUCKET": BUCKET_NAME,
         "ENVAULT_TABLE": TABLE_NAME,
         "ENVAULT_REGION": REGION,
         "ENVAULT_ALLOWED_ACCOUNT_IDS": account,
+        "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS,
     }
 
 
@@ -237,7 +241,7 @@ def test_exec_records_access_with_principal() -> None:
             )
         store = StateStore(table_name=TABLE_NAME, region=REGION)
         records = store.list_by_state("ENCRYPTED")
-        events = store.list_events_for_file(records[0].sha256_hash)
+        events = store.list_events_for_file(records[0].file_id)
         access = [e for e in events if e.get("operation") == "ACCESS"]
         assert len(access) == 1
         assert access[0]["principal_arn"].startswith("arn:aws:")
@@ -290,8 +294,8 @@ def test_exec_refuses_on_checksum_mismatch() -> None:
         put = s3.put_object(Bucket=BUCKET_NAME, Key=new_key, Body=body)
         table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
         table.update_item(
-            Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
-            UpdateExpression="SET sha256_hash = :h, s3_key = :k, s3_version_id = :v",
+            Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
+            UpdateExpression="SET file_id = :h, s3_key = :k, s3_version_id = :v",
             ExpressionAttributeValues={
                 ":h": new_hash,
                 ":k": new_key,
@@ -321,7 +325,7 @@ def test_exec_refuses_on_encryption_context_mismatch() -> None:
         tampered = dict(record.encryption_context)
         tampered["purpose"] = "not-what-was-encrypted"
         table.update_item(
-            Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+            Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
             UpdateExpression="SET encryption_context = :c",
             ExpressionAttributeValues={":c": tampered},
         )
@@ -447,3 +451,48 @@ def test_exec_warns_when_inheriting_aws_credentials() -> None:
             )
         assert rec.called, result.output
         assert "inherit AWS credentials" in result.output
+
+
+@mock_aws
+def test_exec_passes_child_options_without_double_dash() -> None:
+    """Everything from the command name on belongs to the child, `--` or not (L6).
+
+    Interspersed parsing read `--region` in `aws s3 ls --region eu-west-1` as
+    envault's own option (looking the secret up in the wrong region), and
+    `psql -f schema.sql` as envault's `--file`.
+    """
+    account = _provision()
+    env = _env(account)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        _seed_secret(runner, env)
+        for child in (
+            ["aws", "s3", "ls", "--region", "eu-west-1"],
+            ["psql", "-f", "schema.sql"],
+            ["env", "-s", "x=Y", "--table", "other"],
+        ):
+            rec = _ExecRecorder()
+            with patch("os.execvpe", rec):
+                result = runner.invoke(main, ["exec", "-s", "db.env=V", *child], env=env)
+            assert result.exit_code == 0, result.output
+            assert rec.called, result.output
+            assert rec.argv == child
+            assert rec.env["V"] == SECRET_VALUE.decode().rstrip("\n")
+
+
+@mock_aws
+def test_exec_rejects_unknown_option_before_command() -> None:
+    """A mistyped envault option must not become the program to run."""
+    account = _provision()
+    env = _env(account)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        _seed_secret(runner, env)
+        rec = _ExecRecorder()
+        with patch("os.execvpe", rec):
+            result = runner.invoke(
+                main, ["exec", "--clean-envv", "-s", "db.env=V", "--", "/bin/true"], env=env
+            )
+        assert not rec.called
+        assert result.exit_code == 2
+        assert "--clean-envv" in result.output

@@ -1,4 +1,27 @@
+# Gitleaks configuration, used by CI (gitleaks-action) and by local scans.
+#
+# A configuration file replaces gitleaks' built-in rules unless it extends
+# them. Without [extend], the scan would run with no rules at all.
+[extend]
+useDefault = true
+
 [allowlist]
+description = "Known non-secret values: test fixtures, placeholders and identifiers"
 paths = [
     '''.secrets.baseline''',
+]
+# Matched against the value each rule extracts. Every entry is exact, so a
+# real credential cannot match one by accident.
+regexes = [
+    # CloudFormation logical IDs of the stack's resources (CDK tests pin them).
+    '''^Envault[A-Za-z]+[0-9A-F]{8}$''',
+    # The example key ID from the AWS documentation, used in test ARNs.
+    '''^1234abcd-12ab-34cd-56ef-1234567890ab$''',
+    # The key commitment from a test ciphertext's header: public, not a key.
+    '''^BJIxJnpAPJ82aZhk3cANM\+6l1judb7PEjVC9cg3pM\+E=$''',
+    # Python identifiers that the generic rule takes for values.
+    '''^LEGACY_S3_PREFIX$''',
+    '''^correlation_id=$''',
+    # A PEM header with no key after it, written by a symlink test.
+    '''^-----BEGIN PRIVATE KEY-----\\n"\)''',  # pragma: allowlist secret
 ]

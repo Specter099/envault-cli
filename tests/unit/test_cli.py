@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import glob
 import hashlib
-import json
+import sys
+import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,15 +18,17 @@ from envault.cli import (
     _best_effort_delete,
     _collect_files,
     _friendly_message,
-    _parse_output_json_entry,
     _parse_tags,
     _validate_date,
     cli,
     main,
 )
 from envault.crypto import DecryptResult, EncryptResult, verify_encryption_context
-from envault.exceptions import ChecksumMismatchError, EnvaultError, MigrationError
+from envault.exceptions import ChecksumMismatchError, EnvaultError
+from envault.fileid import ID_SCHEME_SHA256
 from envault.state import DECRYPTED, ENCRYPTED, FileRecord, StateStore
+
+from ._id_key import ID_KEY_ALIAS, create_id_key, file_id_of
 
 TABLE_NAME = "envault-test-state"
 BUCKET_NAME = "envault-test-bucket"
@@ -38,6 +41,16 @@ _CLI_ENV = {
     "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
     "AWS_DEFAULT_REGION": REGION,
 }
+# encrypt needs the HMAC key that names files (created with create_id_key()).
+_ENCRYPT_ENV = {**_CLI_ENV, "ENVAULT_ID_KEY_ID": ID_KEY_ALIAS}
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_hooks() -> Iterator[None]:
+    """cli() is the process entry point and installs process-wide hooks; undo them."""
+    unraisablehook = sys.unraisablehook
+    yield
+    sys.unraisablehook = unraisablehook
 
 
 def _ensure_kms_alias(alias: str = "alias/new-key") -> None:
@@ -112,7 +125,8 @@ def _seed_encrypted_record(
             "kms_key_alias": KEY_ID,
         }
     record = FileRecord(
-        sha256_hash=sha256,
+        id_scheme=ID_SCHEME_SHA256,
+        file_id=sha256,
         file_name="test.txt",
         current_state=ENCRYPTED,
         s3_key=f"encrypted/{sha256[:2]}/{sha256}/test.txt.encrypted",
@@ -127,108 +141,6 @@ def _seed_encrypted_record(
     )
     store.put_current_state(record)
     return record
-
-
-def _make_entry(input_path: str) -> dict[str, object]:
-    return {
-        "mode": "encrypt",
-        "input": input_path,
-        "header": {
-            "algorithm": "AES_256_GCM_HKDF_SHA512_COMMIT_KEY_ECDSA_P384",
-            "message_id": "abcd1234",
-            "encryption_context": {"purpose": "backup"},
-            "encrypted_data_keys": [{"key_provider": {"key_info": "alias/envault"}}],
-        },
-    }
-
-
-def test_parse_entry_uses_content_hash(tmp_path: Path) -> None:
-    """_parse_output_json_entry must hash file CONTENT, not the path string."""
-    plaintext = tmp_path / "secret.txt"
-    content = b"sensitive data\n"
-    plaintext.write_bytes(content)
-    expected_hash = hashlib.sha256(content).hexdigest()
-
-    entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-
-    assert record is not None
-    assert record.sha256_hash == expected_hash
-
-
-def test_parse_entry_skips_missing_file(tmp_path: Path) -> None:
-    """_parse_output_json_entry returns None when the plaintext file doesn't exist."""
-    entry = _make_entry("nonexistent/file.txt")
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-    assert record is None
-
-
-def test_parse_entry_skips_non_encrypt_mode() -> None:
-    entry = {"mode": "decrypt", "input": "some/file"}
-    assert _parse_output_json_entry(entry) is None
-
-
-def test_parse_entry_requires_import_root() -> None:
-    """Unconstrained hashing of arbitrary paths is not allowed."""
-    entry = _make_entry("secret.txt")
-    with pytest.raises(MigrationError, match="import_root is required"):
-        _parse_output_json_entry(entry)
-
-
-def test_parse_entry_rejects_path_traversal(tmp_path: Path) -> None:
-    """Paths with '..' components must raise MigrationError."""
-    entry = _make_entry("../../etc/passwd")
-    with pytest.raises(MigrationError, match="Path traversal not allowed"):
-        _parse_output_json_entry(entry, import_root=tmp_path)
-
-
-def test_parse_entry_rejects_path_outside_import_root(tmp_path: Path) -> None:
-    """Absolute paths outside the import directory must not be hashed."""
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    secret = outside / "secret.txt"
-    secret.write_bytes(b"x")
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    with pytest.raises(MigrationError, match="outside the import directory"):
-        _parse_output_json_entry(_make_entry(str(secret)), import_root=import_root)
-
-
-def test_parse_entry_confined_relative_path(tmp_path: Path) -> None:
-    """Relative paths are resolved inside the import directory."""
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    content = b"sensitive data\n"
-    (import_root / "secret.txt").write_bytes(content)
-    expected_hash = hashlib.sha256(content).hexdigest()
-    record = _parse_output_json_entry(_make_entry("secret.txt"), import_root=import_root)
-    assert record is not None
-    assert record.sha256_hash == expected_hash
-
-
-def test_parse_entry_rejects_symlink_component(tmp_path: Path) -> None:
-    """A symlink anywhere in the migration path must be rejected before I/O."""
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    real = tmp_path / "realdir"
-    real.mkdir()
-    (real / "secret.txt").write_bytes(b"x")
-    (import_root / "link").symlink_to(real)
-    with pytest.raises(MigrationError, match="Symlink"):
-        _parse_output_json_entry(_make_entry("link/secret.txt"), import_root=import_root)
-
-
-def test_parse_entry_records_file_size(tmp_path: Path) -> None:
-    """Migrated records must store actual file size, not zero."""
-    plaintext = tmp_path / "sized.txt"
-    content = b"hello world\n"
-    plaintext.write_bytes(content)
-
-    entry = _make_entry(str(plaintext))
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-
-    assert record is not None
-    assert record.file_size_bytes == len(content)
 
 
 def test_validate_date_accepts_valid() -> None:
@@ -398,6 +310,20 @@ def test_decrypt_version_flag_out_of_range() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _fake_encrypt_result(content: bytes, output_path: Path) -> EncryptResult:
+    """Write dummy ciphertext; return what encryption would report for ``content``."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"fake-ciphertext")
+    return EncryptResult(
+        sha256_hash=hashlib.sha256(content).hexdigest(),
+        file_size_bytes=len(content),
+        algorithm="AES_256_GCM_HKDF_SHA512_COMMIT_KEY",
+        # Real message ids are 32 random bytes, distinct for every encryption.
+        message_id=uuid.uuid4().hex + uuid.uuid4().hex,
+        output_path=output_path,
+    )
+
+
 def _mock_encrypt_file(
     input_path: Path,
     key_id: str,
@@ -405,17 +331,21 @@ def _mock_encrypt_file(
     output_path: Path,
     region: str = "us-east-1",
 ) -> EncryptResult:
-    """Fake encrypt_file that writes dummy ciphertext and returns EncryptResult."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(b"fake-ciphertext")
-    content = input_path.read_bytes()
-    return EncryptResult(
-        sha256_hash=hashlib.sha256(content).hexdigest(),
-        file_size_bytes=len(content),
-        algorithm="AES_256_GCM_HKDF_SHA512_COMMIT_KEY",
-        message_id="msg001",
-        output_path=output_path,
-    )
+    """Fake encrypt_file (rotate-key re-encrypts its own temporary plaintext with it)."""
+    return _fake_encrypt_result(input_path.read_bytes(), output_path)
+
+
+def _mock_encrypt_fd(
+    input_fd: int,
+    key_id: str,
+    encryption_context: dict[str, str],
+    output_path: Path,
+    region: str = "us-east-1",
+) -> EncryptResult:
+    """Fake encrypt_fd (encrypt hashes and encrypts from one descriptor)."""
+    with open(input_fd, "rb", closefd=False) as f:
+        f.seek(0)
+        return _fake_encrypt_result(f.read(), output_path)
 
 
 @mock_aws
@@ -423,16 +353,13 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
     """encrypt command: mocked crypto, real DynamoDB + S3."""
     _create_table()
     _create_bucket()
+    create_id_key()
 
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"sensitive data")
-    sha = hashlib.sha256(b"sensitive data").hexdigest()
 
     runner = CliRunner()
-    with (
-        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
-        patch("envault.cli.sha256_file", return_value=sha),
-    ):
+    with patch("envault.cli.encrypt_fd", side_effect=_mock_encrypt_fd):
         result = runner.invoke(
             main,
             [
@@ -447,12 +374,12 @@ def test_encrypt_command_end_to_end(tmp_path: Path) -> None:
                 "--region",
                 REGION,
             ],
-            env=_CLI_ENV,
+            env=_ENCRYPT_ENV,
         )
 
     assert result.exit_code == 0, result.output
     store = StateStore(table_name=TABLE_NAME, region=REGION)
-    record = store.get_current_state(sha)
+    record = store.get_current_state(file_id_of(b"sensitive data"))
     assert record is not None
     assert record.current_state == ENCRYPTED
 
@@ -469,9 +396,10 @@ def _make_mock_decrypt(header_context: dict[str, str], content: bytes = b"decryp
     """Build a fake decrypt_file that mirrors the real ordering guarantee.
 
     The real implementation verifies the encryption context against the
-    ciphertext header *before* writing any plaintext, so the fake does too —
-    otherwise these tests would assert against a laxer contract than the code
-    they stand in for.
+    ciphertext header *before* writing any plaintext, and calls
+    ``verify_digest`` before the plaintext gets ``output_path``'s name, so the
+    fake does too — otherwise these tests would assert against a laxer
+    contract than the code they stand in for.
     """
 
     def _mock(
@@ -481,13 +409,18 @@ def _make_mock_decrypt(header_context: dict[str, str], content: bytes = b"decryp
         region: str = "us-east-1",
         allowed_account_ids: list[str] | None = None,
         expected_context: dict[str, str] | None = None,
+        *,
+        verify_digest: Callable[[bytes], None] | None = None,
     ) -> DecryptResult:
         if expected_context is not None:
             verify_encryption_context(expected_context, header_context)
+        if verify_digest is not None:
+            verify_digest(hashlib.sha256(content).digest())
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(content)
         return DecryptResult(
-            sha256_hash=FAKE_SHA,
+            # What the real function reports: the digest of the bytes it wrote.
+            sha256_hash=hashlib.sha256(content).hexdigest(),
             file_size_bytes=len(content),
             output_path=output_path,
             encryption_context=header_context,
@@ -547,7 +480,7 @@ def test_decrypt_checksum_mismatch(tmp_path: Path) -> None:
     runner = CliRunner()
     with patch(
         "envault.cli.decrypt_file",
-        side_effect=ChecksumMismatchError(expected="aaa", actual="bbb"),
+        side_effect=ChecksumMismatchError(expected="aaa"),
     ):
         result = runner.invoke(
             main,
@@ -667,7 +600,7 @@ def test_decrypt_checksum_mismatch_shows_friendly_message(tmp_path: Path) -> Non
     runner = CliRunner()
     with patch(
         "envault.cli.decrypt_file",
-        side_effect=ChecksumMismatchError(expected="aaa", actual="bbb"),
+        side_effect=ChecksumMismatchError(expected="aaa"),
     ):
         result = runner.invoke(
             main,
@@ -839,46 +772,6 @@ def test_rotate_key_keeps_plaintext_off_disk(tmp_path: Path) -> None:
 
 
 @mock_aws
-def test_encrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
-    """Temp encrypted file must be cleaned up even if encrypt_file raises."""
-    _create_table()
-    _create_bucket()
-
-    plaintext = tmp_path / "secret.txt"
-    plaintext.write_bytes(b"data")
-    sha = hashlib.sha256(b"data").hexdigest()
-
-    runner = CliRunner()
-    with (
-        patch("envault.cli.encrypt_file", side_effect=EnvaultError("boom")),
-        patch("envault.cli.sha256_file", return_value=sha),
-    ):
-        result = runner.invoke(
-            main,
-            [
-                "encrypt",
-                str(plaintext),
-                "--key-id",
-                KEY_ID,
-                "--bucket",
-                BUCKET_NAME,
-                "--table",
-                TABLE_NAME,
-                "--region",
-                REGION,
-            ],
-            env=_CLI_ENV,
-        )
-
-    assert result.exit_code != 0
-    # No lingering temp files with the envault_enc_ prefix
-    import tempfile
-
-    leftover = glob.glob(f"{tempfile.gettempdir()}/envault_enc_*")
-    assert leftover == []
-
-
-@mock_aws
 def test_decrypt_refuses_empty_version_id(tmp_path: Path) -> None:
     """Migrated records with no VersionId must not silently fetch latest."""
     _create_table()
@@ -912,44 +805,6 @@ def test_decrypt_refuses_empty_version_id(tmp_path: Path) -> None:
     assert "--latest" in result.output
 
 
-@mock_aws
-def test_decrypt_temp_file_cleanup_on_failure(tmp_path: Path) -> None:
-    """Temp downloaded file must be cleaned up even if decrypt_file raises."""
-    _create_table()
-    _create_bucket()
-    store = StateStore(table_name=TABLE_NAME, region=REGION)
-    record = _seed_encrypted_record(store)
-    _upload_fake_ciphertext(record.s3_key)
-
-    runner = CliRunner()
-    with patch("envault.cli.decrypt_file", side_effect=EnvaultError("boom")):
-        result = runner.invoke(
-            main,
-            [
-                "decrypt",
-                FAKE_SHA,
-                "--output",
-                str(tmp_path),
-                "--table",
-                TABLE_NAME,
-                "--bucket",
-                BUCKET_NAME,
-                "--region",
-                REGION,
-                "--allowed-account-ids",
-                ACCOUNT_IDS,
-                "--latest",
-            ],
-            env=_CLI_ENV,
-        )
-
-    assert result.exit_code != 0
-    import tempfile
-
-    leftover = glob.glob(f"{tempfile.gettempdir()}/envault_dl_*")
-    assert leftover == []
-
-
 # ---------------------------------------------------------------------------
 # C-1: Partial-failure resilience — recovery logging on state write failure
 # ---------------------------------------------------------------------------
@@ -964,15 +819,14 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(
 
     _create_table()
     _create_bucket()
+    create_id_key()
 
     plaintext = tmp_path / "secret.txt"
     plaintext.write_bytes(b"sensitive data")
-    sha = hashlib.sha256(b"sensitive data").hexdigest()
 
     runner = CliRunner()
     with (
-        patch("envault.cli.encrypt_file", side_effect=_mock_encrypt_file),
-        patch("envault.cli.sha256_file", return_value=sha),
+        patch("envault.cli.encrypt_fd", side_effect=_mock_encrypt_fd),
         patch.object(StateStore, "put_current_state", side_effect=EnvaultError("DynamoDB down")),
         caplog.at_level(logging.ERROR, logger="envault.cli"),
     ):
@@ -990,7 +844,7 @@ def test_encrypt_logs_recovery_info_on_state_write_failure(
                 "--region",
                 REGION,
             ],
-            env=_CLI_ENV,
+            env=_ENCRYPT_ENV,
         )
 
     assert result.exit_code != 0
@@ -1195,6 +1049,13 @@ def test_rotate_key_mkstemp_failure_is_handled(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: How a missing IDENTIFIER is explained: every form IDENTIFIER takes.
+_IDENTIFIER_HINT = (
+    "decrypt command requires a file ID, the SHA-256 of its content "
+    "(with ENVAULT_ID_KEY_ID), or a stored name"
+)
+
+
 class TestFriendlyErrors:
     """Test that CLI errors are human-readable (no raw Click format or tracebacks)."""
 
@@ -1214,7 +1075,7 @@ class TestFriendlyErrors:
                 cli()
         assert exc_info.value.code == 2
         text = output.getvalue()
-        assert "decrypt command requires a SHA256 hash or filename" in text
+        assert _IDENTIFIER_HINT in " ".join(text.split())  # however the console wraps it
         assert "envault decrypt --help" in text
         assert not text.strip().startswith("Error:")
         assert not text.strip().startswith("Usage:")
@@ -1252,7 +1113,7 @@ class TestFriendlyErrors:
     @pytest.mark.parametrize(
         ("arg_name", "cmd_name", "expected_fragment"),
         [
-            ("IDENTIFIER", "decrypt", "decrypt command requires a SHA256 hash or filename"),
+            ("IDENTIFIER", "decrypt", _IDENTIFIER_HINT),
             ("INPUT_PATH", "encrypt", "encrypt command requires a file or directory"),
             ("FROM_PATH", "migrate", "migrate command requires the path to output.json"),
         ],
@@ -1265,6 +1126,27 @@ class TestFriendlyErrors:
         err = click.UsageError(f"Missing argument '{arg_name}'.", ctx=ctx)
         result = _friendly_message(err)
         assert expected_fragment in result
+
+    @pytest.mark.parametrize(
+        "command",
+        ["encrypt", "decrypt", "status", "audit", "dashboard", "migrate", "rotate-key", "exec"],
+    )
+    def test_no_help_text_calls_an_identifier_a_sha256_hash(self, command: str) -> None:
+        """Identifiers are keyed file IDs; a SHA-256 is one way to look a file up."""
+        result = CliRunner().invoke(main, [command, "--help"])
+        assert result.exit_code == 0, result.output
+        assert "SHA256 hash" not in result.output
+        assert "sha256 hash" not in result.output.lower()
+
+    @pytest.mark.parametrize("command", ["decrypt", "status", "audit"])
+    def test_help_says_status_shows_only_an_id_prefix(self, command: str) -> None:
+        """status prints the first 16 characters of a file ID, never the whole ID."""
+        result = CliRunner().invoke(main, [command, "--help"])
+        assert result.exit_code == 0, result.output
+        text = " ".join(result.output.split())
+        assert "status lists it" not in text
+        assert "status` lists it" not in text
+        assert "first 16" in text
 
     def test_friendly_message_passes_through_unknown_errors(self) -> None:
         """Non-missing-argument errors are returned unchanged."""
@@ -1868,7 +1750,7 @@ def test_decrypt_rejects_poisoned_s3_key(tmp_path: Path) -> None:
     record = _seed_encrypted_record(store)
     table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME)
     table.update_item(
-        Key={"PK": f"FILE#{record.sha256_hash}", "SK": "CURRENT"},
+        Key={"PK": f"FILE#{record.file_id}", "SK": "CURRENT"},
         UpdateExpression="SET s3_key = :k",
         ExpressionAttributeValues={":k": "other-prefix/not-ours"},
     )
@@ -2003,53 +1885,3 @@ def test_rotate_key_preflight_rejects_disabled_key() -> None:
     assert result.exit_code != 0
     assert decrypt_mock.call_count == 0
     assert "not enabled" in result.output.lower() or "key state" in result.output.lower()
-
-
-def test_parse_entry_null_header_does_not_crash(tmp_path: Path) -> None:
-    """A null header must be treated as empty, not raise AttributeError."""
-    plaintext = tmp_path / "secret.txt"
-    plaintext.write_bytes(b"x")
-    entry = {"mode": "encrypt", "input": str(plaintext), "header": None}
-    record = _parse_output_json_entry(entry, import_root=tmp_path)
-    assert record is not None
-    assert record.algorithm == ""
-    assert record.kms_key_id == "alias/s3_key"
-
-
-@mock_aws
-def test_migrate_skips_non_object_json_and_continues(tmp_path: Path) -> None:
-    """A bad NDJSON line must increment errors without aborting the rest of the file."""
-    _create_table()
-    import_root = tmp_path / "import"
-    import_root.mkdir()
-    secret = import_root / "secret.txt"
-    secret.write_bytes(b"payload\n")
-    ndjson = tmp_path / "import" / "output.json"
-    ndjson.write_text(
-        "\n".join(
-            [
-                "[]",
-                json.dumps(_make_entry("secret.txt")),
-                "null",
-            ]
-        )
-        + "\n"
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        [
-            "migrate",
-            str(ndjson),
-            "--table",
-            TABLE_NAME,
-            "--region",
-            REGION,
-            "--dry-run",
-        ],
-        env=_CLI_ENV,
-    )
-    assert result.exit_code == 0, result.output
-    assert "Migrated 1" in result.output
-    assert "errors 2" in result.output
