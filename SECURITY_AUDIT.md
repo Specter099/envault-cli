@@ -1,184 +1,196 @@
-# Weekly Security Audit — envault-cli
+# Security Audit — envault-cli
 
-**Reviewer:** Automated weekly static security review
-**Date:** 2026-09-21
-**Codebase:** `main` @ `4b98446`; remediations on `cursor/repository-security-audit-8de4`
-**Scope:** `src/envault/`, `infra/cdk/`, `.github/workflows/`, `code/`, tests, dependency manifests, git history (secret patterns). Static analysis only — no exploit code, no execution of untrusted payloads, no fetches of URLs found in the repo.
+**Review:** 2026-11-14 security review of `main` @ `a58ea77`
+**Remediated:** 2026-11-16, released as 0.3.0 (commits `faa0cb8` through `680fd77`)
+**Full record:** [docs/reviews/2026-11-14-security-review.md](docs/reviews/2026-11-14-security-review.md)
+(scope, method, threat model, evidence, fixes, commits and verification)
+**Previous audit:** the 2026-09-21 weekly audit that this file held until now, moved unchanged to
+[docs/reviews/2026-09-21-weekly-security-audit.md](docs/reviews/2026-09-21-weekly-security-audit.md);
+its open findings are reconciled [below](#previous-audit-2026-09-21-open-findings-reconciled).
 
 ---
 
 ## Executive summary
 
-Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryption SDK, `REQUIRE_ENCRYPT_REQUIRE_DECRYPT`, mandatory `DiscoveryFilter` with 12-digit account IDs, checksum-before-rename decrypt, and SHA-pinned GitHub Actions with OIDC PyPI publish.
+The cryptographic core held up: key commitment, a discovery filter confined to trusted
+accounts, one encrypted data key per message, the encryption context checked before any
+plaintext is written, and verification before publication all survived adversarial testing and
+were pinned by new regression tests. The problems were around it.
 
-`main` has not moved since 2026-08-09 (`4b98446`). Prior weekly PRs (#110–#114) that remediate these items are still unmerged drafts. This week's scan reproduced the same open findings on `main`, re-lands those remediations, and adds three follow-ups from the 2026-09-14 remaining list.
+The one **high** finding was that `-v` logged the plaintext KMS data key and the session token
+(H1). Among the **medium** ones: files were named by the unsalted SHA-256 of their content, so a
+short secret could be recovered from its S3 key, its DynamoDB key or the encryption context in
+CloudTrail (M6); a lookup by hash trusted whatever row it found, so a table writer could make
+`decrypt` and `exec` deliver another file (M5); same-named files made `exec` pick one
+arbitrarily (M8); SIGTERM and SIGHUP left plaintext on disk (M2) and Ctrl-C was retried (M1);
+`migrate` could not import genuine legacy metadata (M4); concurrent uploads could leave a record
+pinned to a version due to expire (M7); and CI had been red for weeks (M9).
 
-**This scan (on `main` before remediations):** 0 Critical, 8 High, 7 Medium, 6 Low
+Release 0.3.0 fixes all of them except two template changes that need a live deployment to
+verify (M10 alarm delivery, L9 bucket names) and one design limitation, now documented (L8: the
+DynamoDB audit trail is client-side; CloudTrail is authoritative). New files are named by a
+keyed HMAC computed in KMS, verified on every read. Verification found ten smaller issues
+(N1–N10) and confirmed three queued residuals (R1–R3); all are fixed. Gates pass on Python
+3.10–3.13 and in the CDK job.
 
-**After this PR:** 0 Critical, 2 High (accepted / requires operator action), 4 Medium, 5 Low
+**Before upgrading, read the README's upgrade steps**: every client must be upgraded first (a
+0.2.0 client reads keyed records without checking their content, see P2), and stacks deployed
+before 0.3.0 must keep their bucket names.
 
----
-
-## Remediations in this PR
-
-Re-landed from #110–#114:
-
-| ID | Severity | Fix |
-|----|----------|-----|
-| H-1 | High | Remove `kms:DisableKey` from the CMK deny (keep `ScheduleKeyDeletion`) |
-| H-2 | High | Drop unused `UpdateItem` / `ListBucket`; scope S3 to `encrypted/*`; grant `sts:GetCallerIdentity` |
-| H-3 | High | Encrypt the ops SNS topic with the envault CMK |
-| H-4 | High | `decrypt --force`; refuse overwrite *before* `mkstemp` |
-| H-5 | High | Reject DynamoDB `s3_key` values that are not `encrypted/{aa}/{sha256}/{name}.encrypted` |
-| H-6 | High | `os.walk(followlinks=False)` so encrypt does not follow directory symlink trees |
-| H-7 | High | `migrate` confines paths to the import directory; rejects `..` and per-component symlinks |
-| H-8 | High | Wire `ENVAULT_AUDIT_TTL_DAYS` on encrypt/decrypt/exec/rotate-key/migrate event writes |
-| H-9 | High | `rotate-key` `DescribeKey` preflight before any download/decrypt |
-| H-10 | High | `last_updated` CAS tokens use microseconds |
-| H-11 | High | Dashboard `last_activity` pages until a CURRENT GSI item survives the filter |
-| M-1 | Medium | `exec` warns when inheriting `AWS_*` (default unchanged — breaking if flipped) |
-| M-2 | Medium | Close encrypt output fd if the SDK stream fails before `fdopen` |
-| M-3 | Medium | Document pip-audit CVE ignore rationale in CI |
-| M-4 | Medium | Decrypt nests `fdopen` so a missing ciphertext cannot skip `.part` cleanup |
-| M-5 | Medium | `migrate` catches non-object NDJSON / null headers per line instead of aborting |
-| M-6 | Medium | `rotate-key` preflight requires `KeyState == Enabled` |
-
-New this week (2026-09-21):
-
-| ID | Severity | Fix |
-|----|----------|-----|
-| M-E | Medium | Fail closed when `s3_version_id` is empty unless `--latest` is passed |
-| H-A | High | CDK context `additional_kms_key_arns` grants extra rotation-target CMKs (no `Resource: *`) |
-| H-7b | High | `migrate` requires `import_root`; absolute paths are checked for lexical containment before any `lstat` |
-| M-7 | Medium | `exec` wipes secret buffers if `--secret` rejects non-UTF-8 / NUL |
+**Counts.** 2026-11-14 review: 1 high, 10 medium, 10 low (21). After 0.3.0: 18 fixed, 2 fixed in
+template, 1 documented; R1–R3 and N1–N10 fixed (N7 in template); found during release
+preparation: P2 documented, P3 fixed, P1 and P4 open. Previous audit's open findings: 1 closed,
+1 partly closed, 9 open.
 
 ---
 
-## Remaining findings (post-remediation)
+## Remediations (2026-11-14 review)
 
-### High
+| ID | Severity | Finding | Status | Fix |
+|----|----------|---------|--------|-----|
+| H1 | High | `-v` logs the plaintext KMS data key and the session token | Fixed | Root logger stays at WARNING; only envault's loggers go verbose; third-party records below WARNING are dropped |
+| M1 | Medium | The retry decorator retries KeyboardInterrupt and SystemExit | Fixed | Only `Exception` subclasses are retried |
+| M2 | Medium | SIGTERM/SIGHUP leave plaintext behind | Fixed | Signals become `SystemExit(143/129)`; every temporary file is registered and destroyed |
+| M3 | Medium | `audit --since DATE` shows only that one day | Fixed | `--since`/`--until` inclusive UTC day range, at most 366 days |
+| M4 | Medium | `migrate` rejects every genuine legacy record and exits 0 | Fixed | Plaintext and ciphertext roots, legacy-sync S3 keys, decoded key ARN, exit 1 on failure |
+| M5 | Medium | A hash identifier is never compared with the row | Fixed | The row must describe its identifier; the plaintext must hash to what was typed |
+| M6 | Medium | The unsalted plaintext SHA-256 is the public identifier | Fixed (new records) | Keyed `file_id` via a KMS HMAC key; VerifyMac on every read; legacy records keep their SHA-256 |
+| M7 | Medium | An overwritten upload leaves the record pinned to a noncurrent version | Fixed | A new S3 key per upload, written with `If-None-Match: *` |
+| M8 | Medium | Basename-only names make `exec` pick an arbitrary file | Fixed | Relative stored names; ambiguity and ties refused |
+| M9 | Medium | Dependency drift broke mypy; CI and the publish gate red | Fixed | `aws_retry` annotation; hash-locked dev and CDK dependencies used by CI and the release |
+| M10 | Medium | Alarms cannot publish to the CMK-encrypted ops topic | Fixed in template (not verified live) | The topic has its own key granting CloudWatch; the topic policy admits `envault-*` alarms |
+| L1 | Low | The retry policy misfires four ways | Fixed | Transient errors only; one HTTP attempt per call; lost-reply tolerance; KMS failure classification |
+| L2 | Low | SDK, OS and some AWS errors escape the CLI handlers | Fixed | One-line errors, per-file reporting, exit 1 |
+| L3 | Low | An interrupt between link and unlink zeroes the published file | Fixed | A multiply-linked inode is never overwritten |
+| L4 | Low | A symlink swapped in after collection gets encrypted | Fixed | One `O_NOFOLLOW` open per file, checked against the collected inode |
+| L5 | Low | Terminal escape sequences from stored names reach the terminal | Fixed | Untrusted values printed with visible escapes |
+| L6 | Low | Without `--`, `exec` parses the child's options | Fixed | Option parsing stops at COMMAND |
+| L7 | Low | The credential fd's offset is left at EOF | Fixed | `seal()` rewinds the descriptor |
+| L8 | Low | Append-only and attribution are client-side only | Documented | Docstrings, README and this file state the limit; CloudTrail is authoritative |
+| L9 | Low | Buckets use CloudFormation-generated names | Fixed in template (not verified live) | Account-regional bucket names; `keep_generated_bucket_names` opt-out for existing stacks |
+| L10 | Low | `additional_kms_key_arns` validation and coverage gaps | Fixed | Key ARNs only; extra keys in every data-key statement |
 
-#### H-B — Rotation is not a revocation primitive
+**Issues found during verification**, all fixed (details and commits in the record):
 
-**Location:** `infra/cdk/stacks/envault_stack.py` (noncurrent version expiration 365 days); `src/envault/cli.py` `rotate-key` re-uploads to the same S3 key
+| ID | Severity | Issue | Status |
+|----|----------|-------|--------|
+| R1 | Low | A typed SHA-256 of a keyed file reached DynamoDB before it was mapped | Fixed |
+| R2 | Low | `decrypt -o DIR/` with a missing DIR wrote a file named DIR | Fixed |
+| R3 | Info | Stale documentation (alias ARNs, SHA-256 identifiers in the agent docs) | Fixed |
+| N1 | Low | The M6 acceptance test could not see a hash inside a serialized DynamoDB condition | Fixed |
+| N2 | Low | One malformed row crashed lookups for everyone | Fixed |
+| N3 | Info | Keyed plaintext was named `.verified` before VerifyMac ran | Fixed |
+| N4 | Info | The signal tests failed under `nohup` | Fixed |
+| N5 | Info | The third-signal escape did not work inside a deferred section | Fixed |
+| N6 | Info | A stop signal just before `execve` could be lost | Fixed (tested by call order) |
+| N7 | Low | The ops key's source conditions might never match, silencing the alarms | Fixed in template (not verified live) |
+| N8 | Low | `encrypt <symlink>` exited 0 and stored nothing | Fixed |
+| N9 | Info | Version still 0.2.0; the sdist shipped `.claude/` | Fixed |
+| N10 | Info | `encrypt` did not check the ID key's account | Fixed (warning) |
 
-**Issue:** Versioning retains ciphertext wrapped under the old key for 365 days. `s3:GetObjectVersion` is still granted on `encrypted/*`.
+**Found during release preparation:**
 
-**Impact:** Anyone who still has `kms:Decrypt` on the old CMK can read prior versions for a year.
-
-**Fix:** After rotation, disable the old CMK (now possible — H-1). Optionally shorten noncurrent expiration or write rotation to a new object key. Document this as the true revocation boundary.
-
-#### H-C — `exec` inherits AWS credentials by default
-
-**Location:** `src/envault/cli.py` (`exec`, `--clean-env`)
-
-**Issue:** Without `--clean-env`, the child receives the operator's `AWS_*` environment. A warning is now printed; flipping the default is a breaking change.
-
-**Impact:** A compromised or buggy child command can use the operator's AWS credentials.
-
-**Fix:** Prefer `--clean-env` in examples and runbooks. Consider defaulting it in a future major version.
-
----
-
-### Medium
-
-#### M-A — `state-index` is a two-value partition that also stores events
-
-**Location:** `infra/cdk/stacks/envault_stack.py` (GSI); `src/envault/state.py` `put_event` copies `current_state`
-
-**Issue:** Events inherit `current_state` via `asdict`, so they project into `state-index`. Queries filter them out. The partition key has two values (hot partition at scale). Changing the GSI requires table replacement.
-
-**Impact:** Read cost and latency grow with audit history; dashboard paging (H-11) mitigates emptiness but not cost.
-
-**Fix:** Sparse-index marker (`gsi_state` only on CURRENT items) in a versioned migration.
-
-#### M-B — CDK L2 `kms.Key` default root `kms:*` policy
-
-**Location:** `infra/cdk/stacks/envault_stack.py` `kms.Key(...)`
-
-**Issue:** CDK's L2 construct grants the account root `kms:*`, delegating to IAM. Standard CDK behavior; risky in shared accounts.
-
-**Fix:** For shared accounts, use an explicit key policy (CfnKey) scoped to envault principals.
-
-#### M-C — No lockfile; pip-audit ignores two CVEs
-
-**Location:** `pyproject.toml`; `.github/workflows/ci.yml`, `publish.yml`
-
-**Issue:** Production deps are ranged, not locked. CI ignores CVE-2026-4539 (pygments, not a runtime dep) and CVE-2026-3219 (pip, CI installer). Rationale is now commented.
-
-**Impact:** Reproducible builds and transitive CVE tracking are weaker than a lockfile.
-
-**Fix:** Add `uv.lock` or `requirements.txt` from `pip-compile` for release artifacts.
-
-#### M-D — Filename lookup is O(all encrypted files)
-
-**Location:** `src/envault/state.py` `list_by_file_name`
-
-**Issue:** Queries the whole `ENCRYPTED` GSI partition and filters `file_name` client-side.
-
-**Impact:** `decrypt <name>` cost grows linearly with corpus size.
-
-**Fix:** `name-index` GSI (`file_name`, `encrypted_at`) in a future migration.
+| ID | Severity | Issue | Status |
+|----|----------|-------|--------|
+| P1 | Low | CI's Gitleaks scan runs with no rules: `.gitleaks.toml` has an allowlist but no `[extend] useDefault = true`, which replaces the default rules | Open |
+| P2 | Medium | A 0.2.0 client reads keyed records without a content check, and its `rotate-key` leaves their pinned versions noncurrent | Documented (upgrade every client first) |
+| P3 | Info | The detect-secrets pre-commit hook failed on 25 unmarked fake values | Fixed (`680fd77`) |
+| P4 | Info | Help text says a file ID is shown by `status`, which shows 16 characters | Open |
 
 ---
 
-### Low
+## Residual risks
 
-#### L-1 — GSI projections use `ALL`
+- **Legacy records keep exposing their raw SHA-256** (S3 key, DynamoDB key, encryption context).
+  rotate-key does not convert them; re-encrypting adds a keyed record and leaves the legacy one.
+- **GenerateMac and VerifyMac are guessing oracles** for whoever may call them, bounded only by
+  KMS quotas and visible in CloudTrail. Grant them only to principals that may decrypt anyway.
+  While `ENVAULT_ID_KEY_ID` is set, every 64-hex lookup calls GenerateMac.
+- **Name lookups trust anyone who can write the table**; lookups by file ID or SHA-256 are
+  verified against the row and the plaintext.
+- **L8**: any principal with `dynamodb:PutItem` (every envault user) can rewrite or forge audit
+  events or shorten their TTL, and `principal_arn` is self-reported. Use CloudTrail: KMS events,
+  plus DynamoDB and S3 data events.
+- **Signals**: SIGKILL, an OOM kill or a power loss bypass cleanup; a third stop signal ends
+  envault at once and may leave plaintext; zeroing is best effort on copy-on-write filesystems
+  and SSDs.
+- **exec's last window**: a stop signal that arrives after envault's last check and before
+  `execve` kills envault by its default action, without Python cleanup and after the ACCESS
+  event was written; the command does not start. The race was not reproduced.
+- **ISO partitions**: only `us-gov-` and `cn-` regions map to their partitions; in an `aws-iso*`
+  region decryption and the identifier-key check refuse (fail closed).
+- **Moto-only assumptions**: GenerateMac returning the key ARN, VerifyMac's mismatch error, S3
+  conditional-write status codes, HeadObject checksums, DynamoDB consistent reads after a failed
+  condition, and DynamoDB rejecting a GSI key of the wrong type were exercised against moto only.
+- **Superseded objects stay current** and orphans accumulate (no delete grant; the lifecycle rule
+  expires only noncurrent versions): disable an old CMK to revoke what it encrypted.
+- **The ID key must never be deleted or disabled.**
 
-**Location:** `infra/cdk/stacks/envault_stack.py`
+## AWS behaviour not verified
 
-Changing projection forces table replacement. Acceptable for current query patterns (`rotate-key` reads all attributes). For new stacks, consider `INCLUDE`.
+The remediation relies on these and could not check them against AWS (the documentation was not
+reachable from the review environment); each is listed with the finding it affects in the
+[record](docs/reviews/2026-11-14-security-review.md#residual-risks):
 
-#### L-2 — Access logs bucket uses S3-managed encryption
+- **KMS:** GenerateMac returns the key ARN in `KeyId`; VerifyMac raises `KMSInvalidMacException`
+  on a mismatch; CloudTrail omits the MAC `Message`; HMAC keys exist in the deployment regions
+  and are not rotated automatically; IAM authorizes GenerateMac/VerifyMac on the key ARN and
+  nothing for an alias ARN in `Resource`; the retryable error codes; NotFound and
+  InvalidCiphertext on Decrypt.
+- **S3:** `If-None-Match: *` gives 412 on an existing key and 409 on a racing write; HeadObject
+  returns `ChecksumSHA256` for SSE-KMS objects; HeadObject on a missing key gives 404 (403
+  without `s3:ListBucket`); SSE-KMS uploads need the caller's own KMS permissions.
+- **DynamoDB:** consistent reads after ConditionalCheckFailed; data events record GetItem and
+  Query keys; a GSI key of the wrong type is rejected.
+- **CloudWatch, SNS and KMS:** alarms publish as `cloudwatch.amazonaws.com` and SNS uses its KMS
+  permissions; `aws:SourceArn`/`aws:SourceAccount` reach the topic policy; the topic's non-TLS
+  deny does not block CloudWatch. Run the README's post-deploy alarm check.
+- **CloudFormation:** `BucketNamePrefix` with `BucketNamespace: account-regional`, `Ref`
+  returning the full name, and access logging to such a bucket.
 
-**Location:** `infra/cdk/stacks/envault_stack.py` `EnvaultAccessLogsBucket`
+## Tooling
 
-Log delivery to a CMK-encrypted bucket needs extra key-policy grants. S3-managed SSE plus `BLOCK_ALL` and TLS is acceptable for access logs.
-
-#### L-3 — No MFA Delete on the versioned data bucket
-
-Requires root credentials; cannot be set via CDK. Document as a post-deploy step.
-
-#### L-4 — Fake AWS credentials in CI are job-scoped
-
-**Location:** `.github/workflows/ci.yml` test job env. Intentional for moto. Keep them off later steps.
-
-#### L-5 — No object-delete / purge CLI path
-
-Storage grows monotonically. Honouring a deletion request requires a new command plus a tightly scoped `s3:DeleteObject` grant (not present today).
+- **cdk-nag suppression defect (found and fixed).** The three AwsSolutions-IAM5 suppressions were
+  plain dicts whose `applies_to` key never reached cdk-nag, so each waived every IAM5 finding on
+  the user policy; a wildcard KMS ARN (L10) passed synth because of it. They are now scoped
+  `NagPackSuppression` objects naming the resources' logical IDs (`1022453`). Any new IAM
+  wildcard needs its own scoped suppression.
+- **Ignored advisory GHSA-464c-974j-9xm6.** aws-cdk-lib before 2.253.0 inverts the `encrypted`
+  flag of aws-codebuild's `S3LoggingOptions`. The envault stack defines no CodeBuild project, so
+  it does not apply; CI ignores it when auditing the CDK lock (aws-cdk-lib 2.244.0). Drop the
+  ignore when aws-cdk-lib reaches 2.253.0; 2.256.0 would also offer typed bucket-namespace props
+  (it may need a newer aws-cdk CLI).
+- **pip-audit residuals, development and CI only.** CI audits the locked environment on Python
+  3.12, where it is clean. On 3.10 the lock pins filelock 4.1.0, with advisories fixed only in
+  releases that need Python 3.11; 3.10 and 3.11 virtual environments also carry the setuptools
+  that `venv` seeds, which is not in the lock. Neither ships in the package. Python 3.10 reached
+  end of life in October 2026; dropping it would remove the first.
 
 ---
 
-## Strengths verified this week (do not re-open)
+## Previous audit (2026-09-21): open findings reconciled
 
-- Streaming encrypt/decrypt; checksum and encryption context verified before plaintext is renamed into place
-- `DiscoveryFilter` with mandatory 12-digit account IDs; partition derived from region
-- `attribute_not_exists(SK)` on audit events; decrypt does not flip CURRENT to DECRYPTED
-- SHA-pinned Actions, `permissions: read-all`, OIDC PyPI, gitleaks job
-- `os.execvpe` has no shell; `--clean-env` exists
-- Filename sanitization for decrypt output (`Path.name`); Rich markup escaped
-- No `eval` / `pickle` / `subprocess` with `shell=True` in application code
-- `.env` gitignored; `.secrets.baseline` committed; CODEOWNERS present
-- Empty S3 VersionId is fail-closed (`--latest` opt-in)
-- Content-addressed S3 keys validated before fetch
-- Directory-symlink trees skipped on encrypt
-- `migrate` confined to the import directory
+| ID | Finding | Status now | Evidence |
+|----|---------|------------|----------|
+| H-B | Rotation is not a revocation primitive | Open, documented | rotate-key now writes a new S3 key and leaves the old object untouched (M7); the README documents disabling the old CMK as the revocation boundary, which the key policy allows. The old object stays current, readable with the old key until it is disabled. |
+| H-C | `exec` inherits AWS credentials by default | Open, accepted | Default unchanged; the warning stays; the README says to use `--clean-env`. |
+| M-A | `state-index` is a two-value partition that also stores events | Partly closed | Events stopped projecting into the index before this review (`5a6c856`: they carry `record_state`, not `current_state`); the two-value partition key remains. |
+| M-B | CDK L2 `kms.Key` default root `kms:*` policy | Open | Unchanged; the new HMAC key and ops topic key use the same default. |
+| M-C | No lockfile; pip-audit ignores two CVEs | Closed | M9: hash locks for development, CI and the release build (`4046296`, `9c659b9`); both CVE ignores removed, the locked versions being unaffected; one documented ignore for the CDK lock. The published package keeps version ranges, as libraries do. |
+| M-D | Filename lookup is O(all encrypted files) | Open | Unchanged; M8's basename fallback reads the ENCRYPTED partition once more when no exact name matches. |
+| L-1 | GSI projections use `ALL` | Open | Unchanged (changing it replaces the table). |
+| L-2 | Access logs bucket uses S3-managed encryption | Open, accepted | Unchanged. |
+| L-3 | No MFA Delete on the versioned data bucket | Open | Unchanged; a post-deploy step that needs root credentials. |
+| L-4 | Fake AWS credentials in CI are job-scoped | Open, accepted | Unchanged; the test steps of `ci.yml` and `publish.yml` set them. |
+| L-5 | No object-delete / purge CLI path | Open | Unchanged, and more visible: superseded objects now stay current (M7). |
 
 ---
 
 ## Prior reports
 
-- `docs/reviews/2026-07-26-deep-review.md` — state-machine findings (mostly fixed in 0.2.0)
-- `docs/plans/2026-03-03-security-audit-fixes.md` — original 25-item remediation plan
-- This file previously held a 2026-03-04 CISO review of commit `5b575e9`; those Critical items (plaintext-before-checksum, no streaming) are fixed. Historical copy belongs in `docs/reviews/` if needed.
-
----
-
-## Summary count
-
-**This scan (on `main` before remediations):** 0 Critical, 8 High, 7 Medium, 6 Low
-
-**After this PR:** 0 Critical, 2 High, 4 Medium, 5 Low
-
-Verification: `pytest tests/unit/` — **186 passed**; ruff + mypy clean. Crypto-safety inspector: PASS. Migration-safety inspector: PASS.
+- [docs/reviews/2026-11-14-security-review.md](docs/reviews/2026-11-14-security-review.md) — this review in full
+- [docs/reviews/2026-09-21-weekly-security-audit.md](docs/reviews/2026-09-21-weekly-security-audit.md) — the previous content of this file
+- [docs/reviews/2026-07-26-deep-review.md](docs/reviews/2026-07-26-deep-review.md) — state-machine findings (mostly fixed in 0.2.0)
+- [docs/plans/2026-03-03-security-audit-fixes.md](docs/plans/2026-03-03-security-audit-fixes.md) — original 25-item remediation plan
+- The 2026-03-04 CISO review of commit `5b575e9`, which this file held before 2026-09-21, is in
+  git history: `git show a8fd8f4:SECURITY_AUDIT.md`.
