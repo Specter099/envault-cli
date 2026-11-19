@@ -29,7 +29,7 @@ BUCKET_NAME = "envault-test-bucket"
 KEY_ALIAS = "alias/envault-test"
 REGION = "us-east-1"
 
-SECRET_VALUE = b"postgres://user:hunter2@db.internal:5432/app\n"
+SECRET_VALUE = b"postgres://user:hunter2@db.internal:5432/app\n"  # pragma: allowlist secret
 
 
 def _provision() -> str:
@@ -85,7 +85,7 @@ def _clear_identity_cache():
 def _env(account: str) -> dict[str, str]:
     return {
         "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
         "AWS_DEFAULT_REGION": REGION,
         "ENVAULT_KEY_ID": KEY_ALIAS,
         "ENVAULT_BUCKET": BUCKET_NAME,

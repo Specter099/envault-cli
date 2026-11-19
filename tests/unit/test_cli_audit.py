@@ -23,7 +23,7 @@ TABLE = "envault-test-state"
 REGION = "us-east-1"
 ENV = {
     "AWS_ACCESS_KEY_ID": "testing",
-    "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+    "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
     "AWS_DEFAULT_REGION": REGION,
     "ENVAULT_TABLE": TABLE,
     "ENVAULT_REGION": REGION,

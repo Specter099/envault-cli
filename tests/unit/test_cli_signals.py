@@ -280,7 +280,7 @@ def env(tmp_path: pathlib.Path) -> Iterator[dict[str, str]]:
         account = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
         environment = {
             "AWS_ACCESS_KEY_ID": "testing",
-            "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+            "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
             "AWS_DEFAULT_REGION": REGION,
             "ENVAULT_KEY_ID": ALIAS,
             "ENVAULT_BUCKET": BUCKET,
@@ -475,7 +475,7 @@ def _spawn(
     env = {
         **{k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "ENVAULT_"))},
         "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
+        "AWS_SECRET_ACCESS_KEY": "testing",  # pragma: allowlist secret
         "AWS_DEFAULT_REGION": REGION,
         "ENVAULT_KEY_ID": ALIAS,
         "ENVAULT_BUCKET": BUCKET,

@@ -94,7 +94,7 @@ def env() -> Iterator[dict[str, str]]:
         account = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
         yield {
             "AWS_ACCESS_KEY_ID": "testing",
-            "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+            "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
             "AWS_DEFAULT_REGION": REGION,
             "ENVAULT_KEY_ID": ALIAS,
             "ENVAULT_BUCKET": BUCKET,

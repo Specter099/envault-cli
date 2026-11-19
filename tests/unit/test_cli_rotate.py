@@ -23,7 +23,7 @@ BUCKET = "envault-test-bucket"
 ALIAS = "alias/envault-test"
 NEW_ALIAS = "alias/new-key"
 REGION = "us-east-1"
-SECRET = b"postgres://user:hunter2@db.internal:5432/app\n"
+SECRET = b"postgres://user:hunter2@db.internal:5432/app\n"  # pragma: allowlist secret
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +77,7 @@ def env(tmp_path: pathlib.Path) -> Iterator[dict[str, str]]:
         account = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
         environment = {
             "AWS_ACCESS_KEY_ID": "testing",
-            "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+            "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
             "AWS_DEFAULT_REGION": REGION,
             "ENVAULT_KEY_ID": ALIAS,
             "ENVAULT_BUCKET": BUCKET,

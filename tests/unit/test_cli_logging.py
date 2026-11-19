@@ -39,8 +39,8 @@ TABLE = "envault-test-state"
 BUCKET = "envault-test-bucket"
 ALIAS = "alias/envault-test"
 REGION = "us-east-1"
-SESSION_TOKEN = "FAKE-SESSION-TOKEN-0123456789abcdef"  # noqa: S105
-SECRET = b"postgres://app:correct-horse-battery@db.internal:5432/prod\n"
+SESSION_TOKEN = "FAKE-SESSION-TOKEN-0123456789abcdef"  # noqa: S105  # pragma: allowlist secret
+SECRET = b"postgres://app:correct-horse-battery@db.internal:5432/prod\n"  # pragma: allowlist secret
 
 _TOUCHED_LOGGERS = ("envault", "aws_encryption_sdk", "botocore", "urllib3")
 
@@ -117,7 +117,7 @@ def _provision() -> str:
 def _env(account: str, **extra: str) -> dict[str, str]:
     return {
         "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
         "AWS_DEFAULT_REGION": REGION,
         "ENVAULT_KEY_ID": ALIAS,
         "ENVAULT_BUCKET": BUCKET,
@@ -359,7 +359,7 @@ def test_failed_decrypt_prints_no_sdk_tracebacks_in_a_real_process(tmp_path: pat
     env = {
         **{k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "ENVAULT_"))},
         "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
+        "AWS_SECRET_ACCESS_KEY": "testing",  # pragma: allowlist secret
         "AWS_DEFAULT_REGION": REGION,
         "ENVAULT_KEY_ID": ALIAS,
         "ENVAULT_BUCKET": BUCKET,

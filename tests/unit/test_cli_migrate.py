@@ -65,16 +65,20 @@ BETA = b"beta secret line!!\n"
 GENUINE_RECORD: dict[str, Any] = {
     "header": {
         "algorithm": "AES_256_GCM_HKDF_SHA512_COMMIT_KEY_ECDSA_P384",
+        # pragma: allowlist nextline secret
         "commitment_key": "BJIxJnpAPJ82aZhk3cANM+6l1judb7PEjVC9cg3pM+E=",
         "content_type": 2,
         "encrypted_data_keys": [
             {
                 "encrypted_data_key": (
+                    # pragma: allowlist nextline secret
                     "YmYyYzg1ZDktNmQ0OC00NzhmLWEzZTYtNTEyYTIxNWE3YmIxUkMSkavWJ34oTIJNEtz1AxY7"
+                    # pragma: allowlist nextline secret
                     "mu8mqUr0TjzWxQ+YrwuWZ3KO7lSoYArDuEZwMsheInNpeZpOv5zgyxG7"
                 ),
                 "key_provider": {
                     "key_info": (
+                        # pragma: allowlist nextline secret
                         "YXJuOmF3czprbXM6dXMtZWFzdC0xOjEyMzQ1Njc4OTAxMjprZXkvYmYyYzg1ZDktNmQ0OC00"
                         "NzhmLWEzZTYtNTEyYTIxNWE3YmIx"
                     ),
@@ -84,6 +88,7 @@ GENUINE_RECORD: dict[str, Any] = {
         ],
         "encryption_context": {
             "aws-crypto-public-key": (
+                # pragma: allowlist nextline secret
                 "Agn7z2UHm0GqWSnkTPM4kk7MJti+A4VFWWg+bt2awEdCuQoN7dpDlyAVkuIR0jUp7g=="
             ),
             "purpose": "backup",
@@ -223,7 +228,7 @@ def _provision() -> tuple[str, dict[str, str]]:
     account = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
     env = {
         "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
         "AWS_DEFAULT_REGION": REGION,
         "ENVAULT_KEY_ID": NEW_ALIAS,
         "ENVAULT_TABLE": TABLE,
@@ -435,7 +440,7 @@ def test_migrate_rejects_input_outside_plaintext_root(
     """Checked lexically, before the path outside is touched in any way."""
     outside = tmp_path / "elsewhere" / "id_rsa"
     outside.parent.mkdir()
-    outside.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    outside.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")  # pragma: allowlist secret
     entry = legacy.entry("alpha.txt")
     entry["input"] = str(outside)
     legacy.write_lines(entry)

@@ -1222,6 +1222,7 @@ def test_encrypt_fd_reads_the_opened_file_not_the_current_path(
     from envault.fileutils import open_regular_nofollow
 
     private = tmp_path / "victim_private_key"
+    # pragma: allowlist nextline secret
     private.write_bytes(b"-----BEGIN PRIVATE KEY----- not in the tree\n")
     entry = tmp_path / "notes.txt"
     entry.write_bytes(b"harmless\n")

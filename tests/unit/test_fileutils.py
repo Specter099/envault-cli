@@ -138,7 +138,7 @@ def test_open_regular_nofollow_refuses_a_symlink(tmp_path: Path) -> None:
     from envault.fileutils import open_regular_nofollow
 
     target = tmp_path / "victim_private_key"
-    target.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    target.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")  # pragma: allowlist secret
     link = tmp_path / "notes.txt"
     link.symlink_to(target)
     with pytest.raises(UnsafeFileError, match="symbolic link") as exc_info:
@@ -152,7 +152,7 @@ def test_open_regular_nofollow_detects_symlink_swap_after_collection(tmp_path: P
     from envault.fileutils import open_regular_nofollow
 
     private = tmp_path / "victim_private_key"
-    private.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    private.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")  # pragma: allowlist secret
     entry = tmp_path / "notes.txt"
     entry.write_bytes(b"harmless\n")
     collected = _identity(entry)
@@ -245,7 +245,7 @@ def test_open_regular_nofollow_refuses_a_symlink_swapped_in_after_lstat(tmp_path
     from envault.fileutils import open_regular_nofollow
 
     private = tmp_path / "victim_private_key"
-    private.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    private.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")  # pragma: allowlist secret
     entry = tmp_path / "notes.txt"
     entry.symlink_to(private)
 

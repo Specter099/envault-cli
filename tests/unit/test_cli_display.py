@@ -171,7 +171,7 @@ def _provision() -> str:
 def _env(account: str) -> dict[str, str]:
     return {
         "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105
+        "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105  # pragma: allowlist secret
         "AWS_DEFAULT_REGION": REGION,
         "ENVAULT_KEY_ID": ALIAS,
         "ENVAULT_BUCKET": BUCKET,
