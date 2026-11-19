@@ -758,11 +758,11 @@ Linux from `requirements-dev.txt`, which has its regeneration command), and the 
 
 ```bash
 npm install -g aws-cdk@2.1113.0
-python -m venv .venv-cdk
-.venv-cdk/bin/python -m pip install --require-hashes --only-binary :all: -r infra/cdk/requirements-ci.txt
-.venv-cdk/bin/python -m pip check
-. .venv-cdk/bin/activate
 cd infra/cdk
+python -m venv .venv      # its own venv: the CDK lock's pins differ from requirements/dev.txt
+.venv/bin/python -m pip install --require-hashes --only-binary :all: -r requirements-ci.txt
+.venv/bin/python -m pip check
+. .venv/bin/activate
 python -m pytest
 cdk synth --strict --quiet
 cdk synth --strict --quiet -c keep_generated_bucket_names=true \
