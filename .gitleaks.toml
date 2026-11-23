@@ -1,3 +1,11 @@
+title = "envault-cli"
+
+# A config that only listed [allowlist] replaced the default rule set, so the
+# CI secrets-scan job reported a clean tree while matching nothing. Extend the
+# shipped rules, then add our path allowlist on top.
+[extend]
+useDefault = true
+
 [allowlist]
 paths = [
     '''.secrets.baseline''',
