@@ -354,7 +354,10 @@ class EnvaultStack(Stack):
                         " authorization; Resource * is required by the API."
                         " Used only to attribute audit events to the caller."
                     ),
-                    "applies_to": ["Resource::*"],
+                    # Action-scoped: Resource::* would also match S3
+                    # encrypted/* and DynamoDB index/* and hide a future
+                    # wildcard that is not one of those three.
+                    "applies_to": ["Action::sts:GetCallerIdentity"],
                 },
             ],
         )

@@ -14,11 +14,13 @@ from click.testing import CliRunner
 from moto import mock_aws
 
 from envault.cli import (
+    _AWS_SDK_LOGGERS,
     _best_effort_delete,
     _collect_files,
     _friendly_message,
     _parse_output_json_entry,
     _parse_tags,
+    _setup_logging,
     _validate_date,
     cli,
     main,
@@ -2092,6 +2094,67 @@ def test_decrypt_honours_audit_ttl_days(tmp_path: Path) -> None:
     assert len(events) == 1
     expected = int(time.time()) + 7 * 86400
     assert abs(int(events[0]["ttl"]) - expected) < 15
+
+
+def test_verbose_logging_does_not_enable_aws_sdk_debug() -> None:
+    """``-v`` must not set botocore/encryption-SDK loggers to DEBUG.
+
+    Those libraries emit KMS GenerateDataKey plaintext and AWS session tokens
+    at DEBUG. Root stays WARNING; only the ``envault`` logger is raised.
+    """
+    import logging
+
+    envault_log = logging.getLogger("envault")
+    prev_envault = envault_log.level
+    prev_sdk = {name: logging.getLogger(name).level for name in _AWS_SDK_LOGGERS}
+    try:
+        _setup_logging(verbose=True)
+        assert envault_log.isEnabledFor(logging.DEBUG)
+        for name in _AWS_SDK_LOGGERS:
+            noisy = logging.getLogger(name)
+            assert not noisy.isEnabledFor(logging.DEBUG), name
+            assert noisy.level == logging.WARNING, name
+        _setup_logging(verbose=False)
+        assert not envault_log.isEnabledFor(logging.DEBUG)
+        for name in _AWS_SDK_LOGGERS:
+            assert not logging.getLogger(name).isEnabledFor(logging.DEBUG), name
+    finally:
+        envault_log.setLevel(prev_envault)
+        for name, level in prev_sdk.items():
+            logging.getLogger(name).setLevel(level)
+
+
+@mock_aws
+def test_rotate_key_empty_context_does_not_create_temps() -> None:
+    """Empty AAD must fail before any 0600 plaintext temp is created."""
+    _create_table()
+    store = StateStore(table_name=TABLE_NAME, region=REGION)
+    _seed_encrypted_record(store, enc_context={})
+    _ensure_kms_alias("alias/new-key")
+
+    runner = CliRunner()
+    with patch("envault.cli.tempfile.mkstemp") as mkstemp:
+        result = runner.invoke(
+            main,
+            [
+                "rotate-key",
+                "--new-key-id",
+                "alias/new-key",
+                "--table",
+                TABLE_NAME,
+                "--bucket",
+                BUCKET_NAME,
+                "--region",
+                REGION,
+                "--allowed-account-ids",
+                ACCOUNT_IDS,
+                "--latest",
+            ],
+            env=_CLI_ENV,
+        )
+    assert result.exit_code != 0, result.output
+    assert "encryption context" in result.output.lower()
+    mkstemp.assert_not_called()
 
 
 @mock_aws

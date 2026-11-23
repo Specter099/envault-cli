@@ -47,14 +47,31 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
+# Libraries that log secrets at DEBUG (KMS plaintext data keys, AWS session
+# tokens, Authorization headers). Never raise these to DEBUG when ``-v`` is set.
+_AWS_SDK_LOGGERS = (
+    "botocore",
+    "boto3",
+    "urllib3",
+    "s3transfer",
+    "aws_encryption_sdk",
+)
+
+
 def _setup_logging(verbose: bool) -> None:
     from pythonjsonlogger.json import JsonFormatter
 
     handler = logging.StreamHandler(sys.stderr)
     fmt = JsonFormatter("%(asctime)s %(name)s %(levelname)s %(message)s")  # type: ignore[no-untyped-call,unused-ignore]
     handler.setFormatter(fmt)
-    level = logging.DEBUG if verbose else logging.WARNING
-    logging.basicConfig(level=level, handlers=[handler])
+    # Do not pass DEBUG to basicConfig: that enables botocore and the
+    # encryption SDK, which log GenerateDataKey plaintext and session tokens.
+    # No force=True — replacing root handlers would drop pytest caplog (and
+    # any embedding app's handlers). Pinning the SDK loggers is enough.
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
+    logging.getLogger("envault").setLevel(logging.DEBUG if verbose else logging.WARNING)
+    for name in _AWS_SDK_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 @click.group(invoke_without_command=True)
@@ -905,6 +922,11 @@ def rotate_key(
         tmp_pt: Path | None = None
         tmp_enc: Path | None = None
         try:
+            # Fail closed before any 0600 plaintext/ciphertext temps exist.
+            assert_s3_key_matches_hash(record.s3_key, record.sha256_hash)
+            _require_encryption_context(record)
+            version_id = _s3_version_id(record, latest)
+
             _fd_dl, _tmp_dl = tempfile.mkstemp(suffix=".encrypted", prefix="envault_dl_")
             os.close(_fd_dl)
             tmp_dl = Path(_tmp_dl)
@@ -918,12 +940,10 @@ def rotate_key(
             os.close(_fd_enc)
             tmp_enc = Path(_tmp_enc)
 
-            assert_s3_key_matches_hash(record.s3_key, record.sha256_hash)
-            _require_encryption_context(record)
             s3.download_file(
                 record.s3_key,
                 tmp_dl,
-                _s3_version_id(record, latest),
+                version_id,
                 allow_latest=latest,
             )
             decrypt_file(

@@ -82,6 +82,23 @@ def test_encrypt_file_refuses_symlink_input(tmp_path: Path) -> None:
     assert not out.exists()
 
 
+def test_decrypt_file_refuses_symlink_dest(tmp_path: Path) -> None:
+    """os.replace must not replace a symlink dest (target file stays intact)."""
+    enc = tmp_path / "in.enc"
+    enc.write_bytes(b"not-ciphertext")
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"do-not-replace-me")
+    link = tmp_path / "out.txt"
+    link.symlink_to(target)
+
+    with pytest.raises(EnvaultError, match="symlink"):
+        decrypt_file(enc, link, allowed_account_ids=[MOTO_ACCOUNT_ID])
+    assert target.read_bytes() == b"do-not-replace-me"
+    assert link.is_symlink()
+    leftovers = list(tmp_path.glob(".out.txt.*.part"))
+    assert leftovers == []
+
+
 def test_encrypt_file_refuses_symlink_dest(kms_key: str, tmp_path: Path) -> None:
     """os.replace must not replace a symlink dest (target file stays intact)."""
     src = tmp_path / "in.txt"

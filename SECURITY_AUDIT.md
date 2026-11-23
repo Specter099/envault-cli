@@ -1,8 +1,8 @@
 # Weekly Security Audit — envault-cli
 
 **Reviewer:** Automated weekly static security review
-**Date:** 2026-11-16
-**Codebase:** `main` @ `a58ea77`; remediations on `cursor/repository-security-review-9703`
+**Date:** 2026-11-23
+**Codebase:** `main` @ `a58ea77`; remediations on this branch
 **Scope:** `src/envault/`, `infra/cdk/`, `.github/workflows/`, `code/`, tests, dependency manifests, git history (secret patterns). Static analysis only — no exploit code, no execution of untrusted payloads, no fetches of URLs found in the repo.
 
 ---
@@ -11,9 +11,11 @@
 
 Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryption SDK, `REQUIRE_ENCRYPT_REQUIRE_DECRYPT`, mandatory `DiscoveryFilter` with 12-digit account IDs, checksum-before-rename decrypt, and SHA-pinned GitHub Actions with OIDC PyPI publish.
 
-`main` has not moved since 2026-09-25 (`a58ea77`, #115/#116). Drafts #117–#127 remain unmerged; this PR re-lands those remediations and closes three leftovers from last week's remaining list (empty encryption-context decrypt, migrate exit status, library encrypt symlink dest).
+`main` has not moved since 2026-09-25 (`a58ea77`, #115/#116). Drafts #117–#128 remain unmerged. This PR re-lands those remediations and closes five leftovers found on this week's independent scan of `main`.
 
-**This scan (on `main` before remediations):** 0 Critical, 7 High, 21 Medium, 11 Low
+Owner PR #129 (0.3.0, HMAC content identifiers, hash-locked CI) is a separate breaking-change track. This PR stays on the 0.2.0 line so it can merge without that upgrade.
+
+**This scan (on `main` before remediations):** 0 Critical, 9 High, 24 Medium, 11 Low
 
 **After this PR:** 0 Critical, 2 High (accepted / requires operator action), 5 Medium, 5 Low
 
@@ -21,7 +23,7 @@ Cryptographic foundations remain sound: streaming AES-256-GCM via the AWS Encryp
 
 ## Remediations in this PR
 
-Re-landed from #117–#127:
+Re-landed from #117–#128:
 
 | ID | Severity | Fix |
 |----|----------|-----|
@@ -47,20 +49,25 @@ Re-landed from #117–#127:
 | M-E | Medium | `migrate` skips records with empty `encryption_context` |
 | M-23 | Medium | `migrate` counts a failed audit-event write after CURRENT as an error |
 | M-24 | Medium | `migrate` rejects falsy non-object `header`/`encryption_context` |
+| M-25 | Medium | Decrypt/exec/rotate-key refuse an empty DynamoDB `encryption_context`; `verify_encryption_context({})` is no longer a no-op |
+| M-26 | Medium | `migrate` exits 1 when `errors > 0` (partial CURRENT writes still stand) |
+| M-27 | Medium | Library `encrypt_file` refuses a symlink `output_path` (target untouched) |
 | L-6 | Low | `migrate` refuses FROM_PATH when any path component is a symlink |
 | L-7 | Low | Pre-commit hook `rev` values pinned to commit SHAs |
 | L-8 | Low | Dashboard `last_activity` is Rich-escaped |
 | L-9 | Low | Actions checkout `persist-credentials: false` |
 | L-10 | Low | S3 `ObjectOwnership.BUCKET_OWNER_ENFORCED` |
+| L-11 | Low | `encrypt_file` / `decrypt_file` / S3 `download_file` `fsync` the sibling temp before `os.replace` |
 
-New this week (2026-11-16):
+New this week (2026-11-23):
 
 | ID | Severity | Fix |
 |----|----------|-----|
-| M-25 | Medium | Decrypt/exec/rotate-key refuse an empty DynamoDB `encryption_context`; `verify_encryption_context({})` is no longer a no-op |
-| M-26 | Medium | `migrate` exits 1 when `errors > 0` (partial CURRENT writes still stand) |
-| M-27 | Medium | Library `encrypt_file` refuses a symlink `output_path` (target untouched) |
-| L-11 | Low | `encrypt_file` / `decrypt_file` / S3 `download_file` `fsync` the sibling temp before `os.replace` |
+| H-I | High | `-v` no longer sets the root logger to DEBUG (botocore / encryption SDK leak KMS DEKs and session tokens at DEBUG) |
+| H-J | High | `.gitleaks.toml` extends the default rule set (`useDefault = true`); a config with only `[allowlist]` replaced the shipped rules, so CI scanned nothing |
+| M-28 | Medium | cdk-nag IAM5 STS waiver is `Action::sts:GetCallerIdentity` instead of `Resource::*` (the latter also matched S3 `encrypted/*` and DynamoDB `index/*`) |
+| M-29 | Medium | `rotate-key` validates S3 key, encryption context, and VersionId before creating any 0600 temps |
+| M-30 | Medium | Library `decrypt_file` refuses a symlink destination (parity with `encrypt_file` / `download_file`) |
 
 ---
 
@@ -76,7 +83,7 @@ New this week (2026-11-16):
 
 **Impact:** Anyone who still has `kms:Decrypt` on the old CMK can read prior versions for a year.
 
-**Fix:** After rotation, disable the old CMK (now possible — H-1). Optionally shorten noncurrent expiration or write rotation to a new object key. Document this as the true revocation boundary. README already notes this.
+**Fix:** After rotation, disable the old CMK (now possible — DisableKey is not denied). Optionally shorten noncurrent expiration or write rotation to a new object key. Document this as the true revocation boundary. README already notes this.
 
 #### H-C — `exec` inherits AWS credentials by default
 
@@ -186,9 +193,11 @@ Storage grows monotonically. Honouring a deletion request requires a new command
 - `migrate` confined to the import directory; FROM_PATH itself is `O_NOFOLLOW`; symlink parents refused
 - Empty migrated encryption context is skipped, not imported; decrypt of an empty stored context is refused
 - No hardcoded production secrets in the tree or sampled git history (test fixtures use `testing`)
-- cdk-nag suppressions for IAM5 include justification comments scoped to `encrypted/*`, `index/*`, and `sts:GetCallerIdentity`
+- cdk-nag suppressions for IAM5 include justification comments scoped to `encrypted/*`, `index/*`, and `sts:GetCallerIdentity` (action-scoped, not `Resource::*`)
 - No Dockerfiles in this repo
 - Pre-commit hooks SHA-pinned
+- `-v` raises only the `envault` logger; AWS SDK loggers stay at WARNING
+- Gitleaks config extends default rules
 
 ---
 
@@ -196,14 +205,15 @@ Storage grows monotonically. Honouring a deletion request requires a new command
 
 - `docs/reviews/2026-07-26-deep-review.md` — state-machine findings (mostly fixed in 0.2.0)
 - `docs/plans/2026-03-03-security-audit-fixes.md` — original 25-item remediation plan
-- Weekly PRs #110–#114 (closed unmerged), #115 (merged 2026-09-25), #117–#127 (open drafts this PR supersedes)
+- Weekly PRs #110–#114 (closed unmerged), #115 (merged 2026-09-25), #117–#128 (open drafts this PR supersedes)
+- Owner PR #129 — separate 0.3.0 breaking-change remediations (HMAC content identifiers); not landed here
 
 ---
 
 ## Summary count
 
-**This scan (on `main` before remediations):** 0 Critical, 7 High, 21 Medium, 11 Low
+**This scan (on `main` before remediations):** 0 Critical, 9 High, 24 Medium, 11 Low
 
 **After this PR:** 0 Critical, 2 High, 5 Medium, 5 Low
 
-Verification: `pytest tests/unit/` — **208 passed**; ruff clean. mypy: pre-existing tenacity return-type error in `retry.py` (unchanged). Crypto-safety inspector: PASS (8/8). Migration-safety inspector: PASS (6/6).
+Verification: `pytest tests/unit/` — **212 passed**; ruff check + format — clean. mypy: pre-existing tenacity return-type error in `retry.py` (unchanged). Crypto-safety inspector: PASS (8/8). Migration-safety inspector: PASS (6/6).

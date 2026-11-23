@@ -457,6 +457,15 @@ def decrypt_file(
     logger.info("Decrypting file", extra={"input": str(input_path)})
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Match encrypt_file / download_file: never os.replace a symlink dest
+    # (that replaces the symlink inode; the target is not followed, but the
+    # operator's link is still destroyed). Check before mkstemp so a planted
+    # symlink leaves no leftover .part.
+    if output_path.is_symlink():
+        raise EnvaultError(
+            f"Refusing to follow symlink: {output_path}. "
+            "Ciphertext and plaintext must be regular files."
+        )
     # mkstemp creates the file 0o600; renamed over output_path only on success.
     tmp_fd, _tmp_name = tempfile.mkstemp(
         dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".part"
@@ -484,6 +493,11 @@ def decrypt_file(
                 )
             out.flush()
             os.fsync(out.fileno())
+        if output_path.is_symlink():
+            raise EnvaultError(
+                f"Refusing to follow symlink: {output_path}. "
+                "Ciphertext and plaintext must be regular files."
+            )
         os.replace(tmp_path, output_path)
     finally:
         if tmp_fd >= 0:

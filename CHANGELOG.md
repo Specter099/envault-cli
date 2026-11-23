@@ -11,6 +11,19 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- ``-v`` / ``--verbose`` no longer raises the root logger to DEBUG. botocore and
+  the AWS Encryption SDK log KMS ``GenerateDataKey`` plaintext and AWS session
+  tokens at DEBUG; only the ``envault`` logger is raised.
+- ``.gitleaks.toml`` now extends the default rule set (`useDefault = true`). A
+  config that only listed ``[allowlist]`` replaced the shipped rules, so the CI
+  secrets-scan job reported a clean tree while matching nothing.
+- cdk-nag IAM5 waiver for ``sts:GetCallerIdentity`` is action-scoped. ``Resource::*``
+  also matched S3 ``encrypted/*`` and DynamoDB ``index/*``, so a future wildcard
+  on that policy would have been silently suppressed.
+- ``rotate-key`` validates the S3 key, encryption context, and VersionId before
+  creating any 0600 plaintext/ciphertext temps.
+- Library ``decrypt_file`` refuses a symlink destination (parity with
+  ``encrypt_file`` / ``download_file``); the symlink target is left untouched.
 - Decrypt/exec/rotate-key refuse a DynamoDB record whose `encryption_context` is
   empty (`verify_encryption_context({})` was a no-op and skipped AAD binding).
 - `migrate` exits 1 when any record fails, so CI cannot treat a partial import as
