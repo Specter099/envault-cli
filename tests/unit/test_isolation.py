@@ -113,3 +113,39 @@ def test_wipe_empty_buffer() -> None:
     buf = bytearray()
     wipe(buf)
     assert buf == bytearray()
+
+
+def test_credential_fd_offset_rewound_after_seal() -> None:
+    """r12 R17: a child reading through a duplicate of the fd must see the content.
+
+    The writer leaves the shared offset at end of file. On macOS/BSD, opening
+    /dev/fd/N duplicates the descriptor, so the child would read b"" unless
+    seal() rewinds it.
+    """
+    with CredentialFd("test") as cred:
+        with cred.writer() as out:
+            out.write(b"-----BEGIN CERTIFICATE-----\n")
+        cred.seal()
+        assert os.lseek(cred.fd, 0, os.SEEK_CUR) == 0
+        dup = os.dup(cred.fd)
+        try:
+            assert os.read(dup, 100) == b"-----BEGIN CERTIFICATE-----\n"
+        finally:
+            os.close(dup)
+
+
+def test_credential_fd_offset_rewound_after_seal_on_tempfile_backing() -> None:
+    """The non-Linux fallback (unlinked temp file) needs the rewind just as much."""
+    from unittest.mock import patch
+
+    with patch("envault.isolation._IS_LINUX", False):
+        with CredentialFd("test") as cred:
+            assert cred.backing == "unlinked-tmp"
+            with cred.writer() as out:
+                out.write(b"secret")
+            cred.seal()
+            dup = os.dup(cred.fd)
+            try:
+                assert os.read(dup, 100) == b"secret"
+            finally:
+                os.close(dup)

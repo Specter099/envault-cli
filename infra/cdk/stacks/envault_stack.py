@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import aws_cdk as cdk
 from aws_cdk import (
     Duration,
@@ -15,34 +17,138 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sns as sns
-from cdk_nag import NagSuppressions
+from cdk_nag import NagPackSuppression, NagSuppressions
 from constructs import Construct
+
+#: Every CloudWatch alarm that notifies the ops topic is named with this prefix.
+#: The ops topic's policy lets only alarms whose ARN matches
+#: ``...:alarm:<prefix>*`` publish, so a new alarm must keep the prefix.
+ALARM_NAME_PREFIX = "envault-"
+
+#: Alias of the HMAC key that names files (the CLI's ENVAULT_ID_KEY_ID).
+ID_KEY_ALIAS = "alias/envault-id"
+
+#: Bucket name prefixes. Unless ``keep_generated_bucket_names`` is set, the
+#: buckets are created in the S3 account-regional namespace and CloudFormation
+#: names them ``<prefix>-<account-id>-<region>-an``.
+DATA_BUCKET_PURPOSE = "envault-data"
+ACCESS_LOGS_BUCKET_PURPOSE = "envault-access-logs"
+
+# A KMS *key* ARN with every component concrete: partition (aws, aws-cn,
+# aws-us-gov, aws-iso-b, ...), region, 12-digit account, and a key ID that is
+# either a UUID or a multi-Region key ID (mrk- plus 32 hex digits).
+_KMS_KEY_ARN = re.compile(
+    r"arn:aws(?:-[a-z]+)*"
+    r":kms:[a-z]+(?:-[a-z]+)+-[0-9]+"
+    r":[0-9]{12}"
+    r":key/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})"
+)
+
+# The bucket name prefixes aws-cdk-lib (2.256.0 and later) accepts for
+# bucketNamePrefix: at most 37 lowercase letters, digits and hyphens, starting
+# and ending with a letter or digit.
+_BUCKET_NAME_PREFIX = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,35}[a-z0-9])?")
+
+
+def parse_additional_kms_key_arns(raw: object) -> list[str]:
+    """Validate the ``additional_kms_key_arns`` context value.
+
+    Extra KMS keys the CLI user policy may use, for ``rotate-key --new-key-id``.
+    Pass a comma-separated string at deploy time, or a list of strings in
+    cdk.json::
+
+        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:111122223333:key/<key-id>
+
+    Every entry must be a KMS key ARN with a concrete partition, region,
+    12-digit account and key ID. Wildcards are rejected, so a typo cannot widen
+    the policy beyond named keys.
+
+    Alias ARNs are rejected too: IAM authorizes KMS cryptographic operations
+    against the key ARN, so an alias ARN in ``Resource`` grants no use of the
+    key it points to (it only governs alias management such as kms:UpdateAlias).
+    ``rotate-key --new-key-id`` may still be given the alias at run time.
+
+    Returns the ARNs in the order given, without duplicates.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        entries = raw.split(",")
+    elif isinstance(raw, list | tuple) and all(isinstance(entry, str) for entry in raw):
+        entries = list(raw)
+    else:
+        raise ValueError(
+            "additional_kms_key_arns must be a comma-separated string or a list of "
+            f"strings, got {raw!r}"
+        )
+
+    arns: list[str] = []
+    for entry in (e.strip() for e in entries):
+        if not entry:
+            continue
+        if "*" in entry or "?" in entry:
+            raise ValueError(f"additional_kms_key_arns must not contain wildcards, got {entry!r}")
+        if entry.startswith("alias/") or ":alias/" in entry:
+            raise ValueError(
+                f"additional_kms_key_arns takes key ARNs, not aliases: got {entry!r}. "
+                "IAM authorizes KMS use against the key ARN, so an alias ARN in the "
+                "policy would grant nothing. Look up the key ARN with: "
+                "aws kms describe-key --key-id <alias> --query KeyMetadata.Arn --output text"
+            )
+        if not _KMS_KEY_ARN.fullmatch(entry):
+            raise ValueError(
+                "additional_kms_key_arns entries must be KMS key ARNs of the form "
+                "arn:<partition>:kms:<region>:<12-digit account>:key/<key id>, "
+                f"got {entry!r}"
+            )
+        if entry not in arns:
+            arns.append(entry)
+    return arns
 
 
 def _additional_kms_key_arns(scope: Construct) -> list[str]:
-    """Optional extra KMS key ARNs for ``rotate-key --new-key-id``.
+    """Read and validate the ``additional_kms_key_arns`` context value."""
+    return parse_additional_kms_key_arns(scope.node.try_get_context("additional_kms_key_arns"))
 
-    Pass at deploy time::
 
-        cdk deploy -c additional_kms_key_arns=arn:aws:kms:us-east-1:123:key/abc
+def _context_flag(scope: Construct, name: str) -> bool:
+    """Read a boolean context flag: absent (false), a JSON boolean, or true/false."""
+    value = scope.node.try_get_context(name)
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"{name} must be true or false, got {value!r}")
 
-    Multiple ARNs may be comma-separated. Values that are not KMS ARNs are
-    rejected at synth so a typo cannot widen the policy to an unrelated resource.
+
+def _cfn_element(construct: Construct) -> cdk.CfnElement:
+    """Return the CloudFormation resource behind an L2 construct."""
+    child = construct.node.default_child
+    if not isinstance(child, cdk.CfnElement):
+        raise TypeError(f"{construct.node.path} has no CloudFormation resource")
+    return child
+
+
+def _use_account_regional_name(bucket: s3.Bucket, purpose: str) -> None:
+    """Name ``bucket`` ``<purpose>-<account-id>-<region>-an``.
+
+    The bucket is created in the S3 account-regional namespace: CloudFormation
+    appends ``-<account-id>-<region>-an`` to ``BucketNamePrefix``. Only this
+    account can create buckets in its namespace, so the name cannot be claimed
+    first by another account. Dots in ``purpose`` become hyphens.
+
+    aws-cdk-lib 2.256.0 and later expose this as the ``bucket_name_prefix`` and
+    ``bucket_namespace`` props of ``s3.Bucket``; the pinned version predates
+    them, hence the L1 property overrides.
     """
-    raw = scope.node.try_get_context("additional_kms_key_arns") or ""
-    arns = [a.strip() for a in str(raw).split(",") if a.strip()]
-    for arn in arns:
-        is_kms_arn = (
-            arn.startswith("arn:")
-            and ":kms:" in arn
-            and (":key/" in arn or ":alias/" in arn)
-        )
-        if not is_kms_arn:
-            raise ValueError(
-                "additional_kms_key_arns must be comma-separated KMS key or alias ARNs, "
-                f"got {arn!r}"
-            )
-    return arns
+    prefix = purpose.replace(".", "-")
+    if not _BUCKET_NAME_PREFIX.fullmatch(prefix):
+        raise ValueError(f"invalid S3 bucket name prefix {prefix!r}")
+    cfn_bucket = _cfn_element(bucket)
+    if not isinstance(cfn_bucket, s3.CfnBucket):
+        raise TypeError(f"expected an s3.CfnBucket under {bucket.node.path}")
+    cfn_bucket.add_property_override("BucketNamePrefix", prefix)
+    cfn_bucket.add_property_override("BucketNamespace", "account-regional")
 
 
 class EnvaultStack(Stack):
@@ -50,13 +156,27 @@ class EnvaultStack(Stack):
 
     Resources:
       - KMS Customer Managed Key with annual rotation
+      - KMS HMAC key that names files (file identifiers, ``alias/envault-id``)
       - S3 bucket with versioning, SSE-KMS, and block public access
       - DynamoDB table with single-table design, GSIs, PITR, and KMS encryption
       - IAM managed policy for least-privilege access
+      - SNS topic (with its own KMS key) and CloudWatch alarms for operations
+
+    Context flags:
+      - ``additional_kms_key_arns``: extra KMS key ARNs for rotate-key
+        (see :func:`parse_additional_kms_key_arns`).
+      - ``keep_generated_bucket_names``: ``true`` for stacks deployed before
+        the buckets were named ``envault-{data,access-logs}-<account>-<region>-an``.
+        Adding a name to an existing bucket makes CloudFormation replace it
+        (the old bucket is retained but orphaned, with every S3 version that
+        DynamoDB records pin), so existing stacks must keep this set.
     """
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs: object) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        keep_generated_bucket_names = _context_flag(self, "keep_generated_bucket_names")
+        extra_kms_key_arns = _additional_kms_key_arns(self)
 
         # ------------------------------------------------------------------ #
         # Parameters                                                            #
@@ -121,6 +241,42 @@ class EnvaultStack(Stack):
         )
 
         # ------------------------------------------------------------------ #
+        # KMS HMAC key: file identifiers                                       #
+        # ------------------------------------------------------------------ #
+        # The CLI names each new file by HMAC-SHA-256(this key, SHA-256 of the
+        # plaintext), so S3 keys, DynamoDB keys and the KMS encryption context
+        # (which CloudTrail records) say nothing about a file's content: for a
+        # short secret the bare SHA-256 would. Every record stores this key's
+        # ARN and is verified against it (VerifyMac) on every read, so losing
+        # the key makes those records unreadable through envault: retained,
+        # and its deletion denied like the data key's. KMS does not rotate HMAC
+        # keys automatically (and a new key would give every file a new
+        # identifier), so automatic rotation stays off.
+        id_key = kms.Key(
+            self,
+            "EnvaultIdKey",
+            description="envault — names files: HMAC of each file's SHA-256 (file identifiers)",
+            key_spec=kms.KeySpec.HMAC_256,
+            key_usage=kms.KeyUsage.GENERATE_VERIFY_MAC,
+            removal_policy=RemovalPolicy.RETAIN,  # never auto-delete a KMS key
+        )
+        kms.Alias(
+            self,
+            "EnvaultIdKeyAlias",
+            alias_name=ID_KEY_ALIAS,
+            target_key=id_key,
+        )
+        id_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyScheduleKeyDeletion",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["kms:ScheduleKeyDeletion"],
+                resources=["*"],
+            )
+        )
+
+        # ------------------------------------------------------------------ #
         # S3 Access Logging Bucket                                              #
         # ------------------------------------------------------------------ #
         access_logs_bucket = s3.Bucket(
@@ -164,6 +320,19 @@ class EnvaultStack(Stack):
             ],
         )
 
+        # Bucket names: <purpose>-<account-id>-<region>-an in the account's own
+        # S3 namespace. Both naming properties are create-only, so stacks that
+        # already exist set keep_generated_bucket_names=true to keep their
+        # buckets (see the class docstring).
+        if keep_generated_bucket_names:
+            cdk.Annotations.of(self).add_info(
+                "keep_generated_bucket_names=true: the S3 buckets keep their "
+                "CloudFormation-generated names."
+            )
+        else:
+            _use_account_regional_name(access_logs_bucket, ACCESS_LOGS_BUCKET_PURPOSE)
+            _use_account_regional_name(bucket, DATA_BUCKET_PURPOSE)
+
         # ------------------------------------------------------------------ #
         # DynamoDB Table (single-table design)                                 #
         # ------------------------------------------------------------------ #
@@ -198,8 +367,8 @@ class EnvaultStack(Stack):
 
         # GSI: query all events on a given calendar date.
         # Projection ALL kept to avoid CloudFormation table replacement on existing stacks.
-        # For new deployments, INCLUDE with [SK, file_name, sha256_hash, correlation_id,
-        # operation] would reduce storage and exposure surface.
+        # For new deployments, INCLUDE with [SK, file_name, file_id (sha256_hash on
+        # legacy rows), correlation_id, operation] would reduce storage and exposure surface.
         table.add_global_secondary_index(
             index_name="date-index",
             partition_key=dynamodb.Attribute(name="date", type=dynamodb.AttributeType.STRING),
@@ -210,6 +379,12 @@ class EnvaultStack(Stack):
         # ------------------------------------------------------------------ #
         # IAM Managed Policy (least-privilege)                                 #
         # ------------------------------------------------------------------ #
+        # The stack key plus any extra keys for rotate-key --new-key-id. The
+        # extra keys appear in every KMS statement: rotate-key wraps data keys
+        # under the new key and re-uploads with SSE-KMS under it, and reading a
+        # rotated file back uses both again.
+        kms_key_arns = [encryption_key.key_arn, *extra_kms_key_arns]
+
         policy = iam.ManagedPolicy(
             self,
             "EnvaultUserPolicy",
@@ -223,7 +398,7 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsEnvelopeEncryption",
                     actions=["kms:GenerateDataKey", "kms:Decrypt"],
-                    resources=[encryption_key.key_arn, *_additional_kms_key_arns(self)],
+                    resources=kms_key_arns,
                     conditions={
                         "StringEquals": {
                             "kms:EncryptionContext:purpose": ["envault-backup", "backup"]
@@ -235,7 +410,7 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsViaStorageServices",
                     actions=["kms:GenerateDataKey", "kms:Decrypt"],
-                    resources=[encryption_key.key_arn],
+                    resources=kms_key_arns,
                     conditions={
                         "StringEquals": {
                             "kms:ViaService": [
@@ -248,7 +423,17 @@ class EnvaultStack(Stack):
                 iam.PolicyStatement(
                     sid="KmsDescribeKey",
                     actions=["kms:DescribeKey"],
-                    resources=[encryption_key.key_arn, *_additional_kms_key_arns(self)],
+                    resources=kms_key_arns,
+                ),
+                # File identifiers: GenerateMac names a file (encrypt, migrate,
+                # lookups by SHA-256), VerifyMac checks one on every read of a
+                # keyed record. Either is an oracle for guessing a file's
+                # content from its identifier, so it goes to the people who may
+                # decrypt the file anyway, on this one key.
+                iam.PolicyStatement(
+                    sid="KmsFileIdentifiers",
+                    actions=["kms:GenerateMac", "kms:VerifyMac"],
+                    resources=[id_key.key_arn],
                 ),
                 iam.PolicyStatement(
                     sid="S3EncryptedObjects",
@@ -279,59 +464,119 @@ class EnvaultStack(Stack):
         # ------------------------------------------------------------------ #
         # cdk-nag suppressions for scoped wildcards                            #
         # ------------------------------------------------------------------ #
+        # NagPackSuppression objects, not dicts: with a plain dict the
+        # snake_case "applies_to" key never reached cdk-nag, so each entry
+        # waived every IAM5 finding on the policy, including any new wildcard.
+        # applies_to must name the resources' CloudFormation logical IDs,
+        # which is how cdk-nag spells the finding.
+        bucket_logical_id = self.get_logical_id(_cfn_element(bucket))
+        table_logical_id = self.get_logical_id(_cfn_element(table))
         NagSuppressions.add_resource_suppressions(
             policy,
             [
-                {
-                    "id": "AwsSolutions-IAM5",
-                    "reason": (
+                NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
                         "S3 object-level actions require a key prefix wildcard."
                         " Access is scoped to encrypted/* on the single envault"
                         " bucket — the CLI never lists or reads other prefixes."
                     ),
-                    "applies_to": [
-                        f"Resource::<{bucket.node.id}.Arn>/encrypted/*",
-                    ],
-                },
-                {
-                    "id": "AwsSolutions-IAM5",
-                    "reason": (
+                    applies_to=[f"Resource::<{bucket_logical_id}.Arn>/encrypted/*"],
+                ),
+                NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
                         "DynamoDB GSI queries require table/index/* wildcard."
                         " Access is scoped to the single envault table and"
                         " only allows PutItem/GetItem/Query."
                     ),
-                    "applies_to": [
-                        f"Resource::<{table.node.id}.Arn>/index/*",
-                    ],
-                },
-                {
-                    "id": "AwsSolutions-IAM5",
-                    "reason": (
+                    applies_to=[f"Resource::<{table_logical_id}.Arn>/index/*"],
+                ),
+                NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
                         "sts:GetCallerIdentity does not support resource-level"
                         " authorization; Resource * is required by the API."
                         " Used only to attribute audit events to the caller."
                     ),
-                    "applies_to": ["Resource::*"],
-                },
+                    applies_to=["Resource::*"],
+                ),
             ],
         )
 
         # ------------------------------------------------------------------ #
         # Monitoring — SNS + CloudWatch Alarms                                #
         # ------------------------------------------------------------------ #
+        # SNS encrypts each message with the topic's KMS key using the
+        # publisher's permissions, so CloudWatch (the alarms' publisher) must
+        # be allowed to use the key, and the topic policy must let it publish.
+        # The topic gets its own key instead of the data key: the data key's
+        # policy then admits no AWS service, and disabling the data key during
+        # incident response does not also silence the alarms. Only in-flight
+        # notifications are encrypted with this key, so it is deleted with the
+        # stack (after KMS's 30-day waiting period).
+        ops_topic_key = kms.Key(
+            self,
+            "EnvaultOpsTopicKey",
+            description="envault — encrypts the operational alerts SNS topic",
+            enable_key_rotation=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            pending_window=Duration.days(30),
+        )
+        # Confused-deputy guard: only CloudWatch alarms in this account whose
+        # names start with ALARM_NAME_PREFIX may publish. It is on the topic
+        # policy below.
+        alarm_publisher = iam.ServicePrincipal("cloudwatch.amazonaws.com")
+        alarm_publisher_conditions = {
+            "StringEquals": {"aws:SourceAccount": self.account},
+            "ArnLike": {
+                "aws:SourceArn": self.format_arn(
+                    service="cloudwatch",
+                    resource="alarm",
+                    resource_name=f"{ALARM_NAME_PREFIX}*",
+                    arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
+                )
+            },
+        }
+        # The key statement deliberately has no such conditions:
+        # - the key is dedicated to this one topic, and encrypts nothing else;
+        # - the topic policy decides which alarms may publish, and SNS uses
+        #   the key only for messages that policy let through;
+        # - whether the KMS calls SNS makes on CloudWatch's behalf carry
+        #   aws:SourceArn and aws:SourceAccount is unverified, and a condition
+        #   that never matches would silently disable every alarm, which is
+        #   the original M10 failure.
+        ops_topic_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AllowCloudWatchAlarmsToUseKey",
+                principals=[alarm_publisher],
+                actions=["kms:Decrypt", "kms:GenerateDataKey*"],
+                resources=["*"],
+            )
+        )
+
         ops_topic = sns.Topic(
             self,
             "EnvaultOpsTopic",
             display_name="envault operational alerts",
             enforce_ssl=True,
-            master_key=encryption_key,
+            master_key=ops_topic_key,
+        )
+        ops_topic.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AllowCloudWatchAlarmsToPublish",
+                principals=[alarm_publisher],
+                actions=["sns:Publish"],
+                resources=[ops_topic.topic_arn],
+                conditions=alarm_publisher_conditions,
+            )
         )
 
         # DynamoDB throttle alarm
         table.metric_throttled_requests_for_operation("PutItem").create_alarm(
             self,
             "DynamoThrottleAlarm",
-            alarm_name="envault-dynamodb-throttle",
+            alarm_name=f"{ALARM_NAME_PREFIX}dynamodb-throttle",
             evaluation_periods=1,
             threshold=1,
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
@@ -362,7 +607,7 @@ class EnvaultStack(Stack):
         sys_err_expression.create_alarm(
             self,
             "DynamoSystemErrorAlarm",
-            alarm_name="envault-dynamodb-system-errors",
+            alarm_name=f"{ALARM_NAME_PREFIX}dynamodb-system-errors",
             evaluation_periods=1,
             threshold=1,
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
@@ -391,17 +636,24 @@ class EnvaultStack(Stack):
         # CloudFormation Outputs                                               #
         # ------------------------------------------------------------------ #
         cdk.CfnOutput(self, "KmsKeyAlias", value="alias/envault")
+        cdk.CfnOutput(self, "IdKeyAlias", value=ID_KEY_ALIAS)
         cdk.CfnOutput(self, "BucketName", value=bucket.bucket_name)
         cdk.CfnOutput(self, "TableName", value=table.table_name)
         cdk.CfnOutput(self, "ManagedPolicyArn", value=policy.managed_policy_arn)
 
+        # ENVAULT_ALLOWED_ACCOUNT_IDS: decryption trusts only data keys, and
+        # reads trust only identifier keys, in the listed accounts. Both keys
+        # are in this stack's account. Keys from additional_kms_key_arns in
+        # other accounts must be added by hand.
         cdk.CfnOutput(
             self,
             "EnvaultEnvVars",
             value=(
                 f"export ENVAULT_KEY_ID=alias/envault\n"
+                f"export ENVAULT_ID_KEY_ID={ID_KEY_ALIAS}\n"
                 f"export ENVAULT_BUCKET={bucket.bucket_name}\n"
-                f"export ENVAULT_TABLE={table.table_name}"
+                f"export ENVAULT_TABLE={table.table_name}\n"
+                f"export ENVAULT_ALLOWED_ACCOUNT_IDS={self.account}"
             ),
             description="Copy-paste these env vars to configure the envault CLI",
         )

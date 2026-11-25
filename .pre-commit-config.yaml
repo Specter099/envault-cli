@@ -6,8 +6,9 @@ repos:
         args: ["--baseline", ".secrets.baseline"]
         exclude: code/output\.json
 
+  # Keep rev at the ruff version locked in requirements/dev.txt, which CI uses.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.4
+    rev: v0.17.5
     hooks:
       - id: ruff
         args: ["--fix"]
