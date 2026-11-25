@@ -6,9 +6,9 @@ attrs==26.1.0 \
     # via
     #   cattrs
     #   jsii
-aws-cdk-asset-awscli-v1==2.2.263 \
-    --hash=sha256:185150757d4216ea982d7b35596de5b3d767776be00cd78cacce02eaa08f8851 \
-    --hash=sha256:657605260ace055fac4ae30a6fb84a80504a6e24ce0b1d278913d4db4bafa266
+aws-cdk-asset-awscli-v1==2.2.297 \
+    --hash=sha256:3766e7d9280693db5bf759a0e46033ad9d996c0ccb8e832cee22a6e366e1c85e \
+    --hash=sha256:a8d2d096235233190db9e8a7e4e3575a6624c2c6324a40f4549219354bd3c83d
     # via aws-cdk-lib
 aws-cdk-asset-node-proxy-agent-v6==2.1.3 \
     --hash=sha256:1724285cb3ab50494f4c641c236d0e57d1f2da82bda71d15585a203dc0e75516 \
@@ -18,9 +18,9 @@ aws-cdk-cloud-assembly-schema==52.2.0 \
     --hash=sha256:737309e2c7c7e4b46bd669cb9fe8799a36424c9a174523b54833cf1cd12b5e3f \
     --hash=sha256:87b918589f7d627f45e330726f592ec0b39056e1403558f3a1ba8a2134dacd6f
     # via aws-cdk-lib
-aws-cdk-lib==2.244.0 \
-    --hash=sha256:81d28367acae7c998dbce619e266bc572e5ade69f13fcc5520d5dc4055ce65ac \
-    --hash=sha256:c39ba2fe54b47fae301c0b4d291ab3f7ce8e2254bec8428723dfdee9bac9beac
+aws-cdk-lib==2.278.0 \
+    --hash=sha256:2b2c7c8043cab9ddb7b25733eaefd7fd755247a084a96dc86fb875534b9fd3d0 \
+    --hash=sha256:b96272fd127ecc3f9b9754d33f2d92792034a852054fa102413e026a0a1ae45a
     # via
     #   -r requirements.txt
     #   cdk-nag
@@ -32,9 +32,9 @@ cdk-nag==2.37.55 \
     --hash=sha256:bf83bcdeb98ac20bb813cac291af121d91c5a296fa815e01f93886b4f8b38845 \
     --hash=sha256:e9dc517070ef5a19deef95e79731e5624bd86cd07b56d210380408ea1314e47b
     # via -r requirements.txt
-constructs==10.6.0 \
-    --hash=sha256:ad4ffabdb53c17cde00fb94e441a1ba9fddac57c92ad49d263f8dbd416cec513 \
-    --hash=sha256:bc55d1d390142424861e5ff5c6b8c243c4bae18fe7302e0939c2003f329ba365
+constructs==10.8.1 \
+    --hash=sha256:9f6e4eb1f6b8b1ac8dcbc85457dcbb1e3f9bd93bbeef03154f6cc7fbbba74b06 \
+    --hash=sha256:f71297db64723889147c82de46dcacaa76b120f856d5b5ac5f65abb22ea88355
     # via
     #   -r requirements.txt
     #   aws-cdk-lib
@@ -43,9 +43,9 @@ iniconfig==2.3.1 \
     --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960 \
     --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
     # via pytest
-jsii==1.142.0 \
-    --hash=sha256:16d6b3e25bbaa081dd39eabe910b07f646fe4988302d8aae401690f247baf7df \
-    --hash=sha256:2fe1c5f2a5a405a5fbaaafb8b362cdf6a30171589e508c01682f33c5d529172f
+jsii==1.143.0 \
+    --hash=sha256:63ecd5bbec13e7ac4edd962b6ec834dc70def79c186a973f7c60edd57b7c3849 \
+    --hash=sha256:9d006ebf44ef171595a339bb691e86b4008a45ed454b65b2826a8122d2087278
     # via
     #   aws-cdk-asset-awscli-v1
     #   aws-cdk-asset-node-proxy-agent-v6
