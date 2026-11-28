@@ -28,9 +28,9 @@ cattrs==26.2.1 \
     --hash=sha256:679132bfdc225c5ee40c024fc42519954767c387f950dc6751946c586bccdc6d \
     --hash=sha256:a12aaa3453dc8f633a815293179f08b7421ed18d2575c459c3c736f840beac24
     # via jsii
-cdk-nag==2.37.55 \
-    --hash=sha256:bf83bcdeb98ac20bb813cac291af121d91c5a296fa815e01f93886b4f8b38845 \
-    --hash=sha256:e9dc517070ef5a19deef95e79731e5624bd86cd07b56d210380408ea1314e47b
+cdk-nag==3.1.0 \
+    --hash=sha256:3cbf676d2ff7e2f559d0a6fe92d68470b12252f27017b37ebb7a3097d6f51dbf \
+    --hash=sha256:59ba408fbc345d1cfca2f9be9e1c20bd6b31e9c8cf524bbf4622f9429946bf4a
     # via -r requirements.txt
 constructs==10.8.1 \
     --hash=sha256:9f6e4eb1f6b8b1ac8dcbc85457dcbb1e3f9bd93bbeef03154f6cc7fbbba74b06 \
