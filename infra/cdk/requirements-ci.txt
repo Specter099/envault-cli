@@ -14,9 +14,9 @@ aws-cdk-asset-node-proxy-agent-v6==2.1.3 \
     --hash=sha256:1724285cb3ab50494f4c641c236d0e57d1f2da82bda71d15585a203dc0e75516 \
     --hash=sha256:b8adb536ad19f8a44e94054c712f5ea5ff487cc3c10ecdc158846b29ca2cbbe5
     # via aws-cdk-lib
-aws-cdk-cloud-assembly-schema==52.2.0 \
-    --hash=sha256:737309e2c7c7e4b46bd669cb9fe8799a36424c9a174523b54833cf1cd12b5e3f \
-    --hash=sha256:87b918589f7d627f45e330726f592ec0b39056e1403558f3a1ba8a2134dacd6f
+aws-cdk-cloud-assembly-schema==55.7.0 \
+    --hash=sha256:8d7a0da5611dc223fab440ae9887e6344d9812eb35e1b7a60ae71d35ac68296f \
+    --hash=sha256:f068b382f7d5ce1b0258a03874e79e4f5a38482955cdf0773be110dbdb73bd9c
     # via aws-cdk-lib
 aws-cdk-lib==2.278.0 \
     --hash=sha256:2b2c7c8043cab9ddb7b25733eaefd7fd755247a084a96dc86fb875534b9fd3d0 \
